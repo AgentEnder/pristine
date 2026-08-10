@@ -1,127 +1,177 @@
 # Releasing pristine
 
-One `nx release` versions the crate and every npm package together: one version, one changelog, one
-tag. The crate publishes to crates.io as `pristine-cli`; the npm side is the `@agentender/pristine`
-wrapper plus one package per platform.
+One `nx release` versions the crate and the npm packages together: one tag, one changelog, one
+version number across both registries. The npm wrapper exists to hand you the binary the crate
+built, so a release where the two disagree is a broken release.
 
-## How the config works
+## What ships
 
-Everything lives in `nx.json` under `release`, plus one override in `packages/pristine/project.json`.
+| Nx project                  | Path                        | Published as                        |
+| --------------------------- | --------------------------- | ----------------------------------- |
+| `pristine`                  | `packages/pristine`         | `pristine-cli` on crates.io         |
+| `npm-pristine`              | `npm/pristine`              | `@agentender/pristine`              |
+| `npm-pristine-darwin-arm64` | `npm/pristine-darwin-arm64` | `@agentender/pristine-darwin-arm64` |
+| `npm-pristine-linux-x64-gnu`| `npm/pristine-linux-x64-gnu`| `@agentender/pristine-linux-x64-gnu`|
 
-There is **one release group holding every project**, not one group per ecosystem:
+## Cutting a release
 
-```jsonc
-"groups": { "pristine": { "projects": ["*"] } }
+Once `v0.1.0` exists, every release is:
+
+```sh
+npx nx release --dry-run
+npx nx release
 ```
 
-Two things about that are easy to get wrong.
+Nx reads the conventional-commit subjects since the last tag, picks the bump, writes all four
+manifests, rewrites the wrapper's `optionalDependencies` pins, regenerates `Cargo.lock`, writes
+`CHANGELOG.md`, commits, and tags `vX.Y.Z`.
 
-`projectsRelationship: "fixed"` is a **within-group** relationship. Splitting the crate and the npm
-packages into two groups does not keep them in lockstep — it guarantees they drift, and it does so
-silently. A crate-only `feat:` bumps the crate and leaves the npm packages behind, which is the exact
-failure the single version exists to prevent.
+Run the dry run first and mean it. A full `nx release` does not stop at the commit and tag: it
+**pushes to `origin` and creates a GitHub Release**, with no confirmation step between deciding and
+publishing.
 
-The group has to be declared even though it selects everything. Nx's implicit default group only picks
-up `lib` projects that have a non-private `package.json` in their own root, so a Rust crate never
-lands in it. Omit `groups` and Nx releases the npm packages alone, without complaint.
+To exercise the config without any git or GitHub side effects, run the version step on its own.
+`npx nx release version --dry-run` writes nothing at all, and `npx nx release version` writes the
+manifests and `Cargo.lock` but does not commit, tag, or push.
 
-The two ecosystems are bridged by `versionActions`, which is settable per project. The group inherits
-the `@nx/js` default, and the crate overrides it for itself:
+Publishing is a separate step, `npx nx release publish`. `@monodon/rust` gives the crate an
+`nx-release-publish` target for crates.io and `@nx/js` gives each npm project one for npm.
 
-```jsonc
-// packages/pristine/project.json
-"release": { "version": { "versionActions": "@monodon/rust/src/release/version-actions" } }
-```
+### The first release
 
-Note the nesting: it is `release.version.versionActions`, **not** `release.versionActions`. The
-shallower spelling is not rejected — it is ignored. The crate then falls back to Nx's
-`NOOP_VERSION_ACTIONS`, and the release runs to completion having versioned every npm package while
-leaving `Cargo.toml` untouched.
-
-## The first release is different
-
-`nx release` resolves the current version from the `v{version}` tags, so before one exists it fails
-with `No git tags matching pattern "v{version}" were found` and does nothing. The bootstrap names its
-version explicitly:
+`nx release` resolves the current version from the `v{version}` tags. Until one exists it fails with
+`No git tags matching pattern "v{version}" were found` and does nothing. The bootstrap has to name
+its version:
 
 ```sh
 npx nx release 0.1.0 --first-release --dry-run
 npx nx release 0.1.0 --first-release
 ```
 
-`--first-release` falls back to the manifest version instead of the missing tag, and the explicit
-specifier bypasses conventional commits for that run. Afterwards `v0.1.0` exists and every later
-release is a plain `npx nx release`.
+`--first-release` falls back to the manifest version instead of the missing tag. The explicit
+specifier sets the version, bypassing conventional commits for that run only. Afterwards `v0.1.0`
+exists and the plain form works.
 
-Do not reach for `version.fallbackCurrentVersionResolver: "disk"` to avoid the flag. It makes the
-bootstrap work without `--first-release`, but it also makes a *later* release quietly fall back to the
-manifests when the tag it expects is missing, republishing a version that already shipped. Failing
-loudly on a missing tag is the behaviour worth keeping.
+Do not replace the flag with `version.fallbackCurrentVersionResolver: "disk"`. It makes the bootstrap
+work without `--first-release`, but it also makes a later release fall back to the manifests when the
+tag it expects is missing, republishing a version that already shipped. A missing tag should fail
+loudly.
 
-## Run the dry run first, always
+## How the config holds the two ecosystems together
 
-A full `nx release` does not stop at versioning. It commits, tags, **pushes to `origin`, and creates a
-GitHub Release**. There is no confirmation step. `--dry-run` prints the whole plan and changes
-nothing, so it is the default way to look at a release.
+`nx.json` declares a single release group covering every project:
 
-To version without any of the git or GitHub side effects — which is what you want when checking the
-config — run the version step alone:
-
-```sh
-npx nx release version --dry-run   # no writes at all
-npx nx release version             # writes manifests and Cargo.lock, no commit/tag/push
+```jsonc
+"release": {
+  "projectsRelationship": "fixed",
+  "releaseTag": { "pattern": "v{version}" },
+  "version": { "conventionalCommits": true },
+  "changelog": {
+    "workspaceChangelog": { "createRelease": "github" },
+    "projectChangelogs": false
+  },
+  "groups": { "pristine": { "projects": ["*"] } }
+}
 ```
+
+and `packages/pristine/project.json` overrides the version actions for itself alone:
+
+```jsonc
+"release": { "version": { "versionActions": "@monodon/rust/src/release/version-actions" } }
+```
+
+Three things about that shape are load-bearing.
+
+**One group, not two.** `projectsRelationship: "fixed"` is a within-group relationship. Splitting the
+crate and the npm packages into separate groups does not keep them in lockstep, it does the opposite:
+a crate-only `feat:` bumps `pristine-cli` and leaves the npm packages behind. Because
+`versionActions` is settable per project, one group can span both ecosystems. The group inherits the
+`@nx/js` default and the crate overrides it.
+
+**The group must be declared** even though it covers the whole workspace. Nx's implicit default group
+only takes `lib` projects that have a non-private `package.json` in their own root, so a Rust crate
+is never in it. Omit `groups` and the release silently covers the npm packages alone.
+
+**The override key is `release.version.versionActions`,** nested under `version`. A bare
+`release.versionActions` in `project.json` is ignored, and the crate falls back to the `@nx/js`
+actions, which cannot read a `Cargo.toml`.
 
 ## Things that bite
 
-**A `feat:` is a patch bump while the version is 0.x.** Nx shifts bump types down below 1.0 by the
-usual convention: breaking becomes minor, feat becomes patch. So `feat:` on 0.1.0 gives 0.1.1, not
-0.2.0. The log reports the pre-shift specifier ("Resolved the specifier as minor") and then the
-shifted result, which reads like a contradiction until you know about the rule.
+### The crate's version must be a literal
 
-**Commit scopes are matched against project names.** A scope that matches no project in the release
-group does not get attributed by file path — it is dropped. `feat(cli): …` touching the crate resolves
-to a *patch*, while a plain `feat: …` touching the same file resolves to a *minor*. Either leave the
-scope off or use a real project name (`pristine`, `npm-pristine`, …).
+`packages/pristine/Cargo.toml` carries `version = "0.1.0"` rather than `version.workspace = true`,
+and the root `Cargo.toml` has no `[workspace.package] version` at all. This is not a style choice.
+`@monodon/rust` reads `[package].version` and requires a plain string; an inherited version parses to
+`{ workspace: true }`, an object. Its writer also assigns straight to `[package].version` in the
+member manifest, which is not where an inherited version lives. Restore the inheritance and the crate
+silently skips versioning while the npm packages bump.
 
-**The crate's version must be a literal.** `version.workspace = true` in
-`packages/pristine/Cargo.toml` does not work: `@monodon/rust` requires `[package].version` to be a
-plain string, and inheriting it makes the crate skip versioning while the npm packages bump — the same
-split as the two-group mistake, just quieter. The crate carries its own `version = "…"` and the root
-`[workspace.package]` deliberately has no `version` key, so there is only one source of truth.
+### A `feat:` is a patch bump below 1.0
 
-**Versioning rewrites `Cargo.toml` and drops its comments.** The plugin round-trips the manifest
-through a TOML parser that reserializes every string with single quotes, adds a leading blank line,
-and **discards every comment in the file**. Any comment in `packages/pristine/Cargo.toml` is gone
-after the first real release. Comments that need to survive belong in the root `Cargo.toml`, which is
-not rewritten, or in this document.
+Nx shifts bump types down while the major is 0, by the usual convention: breaking becomes minor, a
+feature becomes patch. So `feat:` against 0.1.0 gives 0.1.1, not 0.2.0. The log reports the
+pre-shift specifier and then the shifted result, which reads as a contradiction until you know the
+rule is there:
 
-**Platform dependency specs must be exact pins, never carets.**
-`preserveMatchingDependencyRanges` defaults to `true`, so `"^0.1.0"` still matches 0.1.1 and is left
-alone, while `"0.1.0"` is rewritten. A caret range on a platform package lets npm resolve a binary
-from a different release than the wrapper — the exact failure the shared version exists to prevent.
-
-**`--dry-run` cannot prove the `Cargo.lock` step.** `@monodon/rust`'s `afterAllProjectsVersioned` hook
-returns early under `dryRun`, so the lockfile only moves on a real run. It shells out to
-`cargo update --workspace`, so cargo must be on `PATH` wherever the release runs, and it **swallows
-the failure if it is not**, leaving the lockfile silently stale while everything else reports success.
-
-**The npm packages are not workspace members.** They live under `npm/`, outside the `packages/*` glob
-in `pnpm-workspace.yaml`. A platform package declares `os` and `cpu`, so a package manager refuses to
-link it on any host it does not match, which breaks `install` for everyone. They are registered as Nx
-projects with a `project.json` instead, which costs nothing because they have no dependencies.
-
-## Verifying a change to the release config
-
-A crate-only conventional commit is the case worth testing, because it is the one that silently split
-under the old two-group design:
-
-```sh
-git tag v0.1.0                                    # baseline, if not already tagged
-git commit -m "feat: …"                           # touching only packages/pristine/
-npx nx release version                            # real run: dry-run cannot move Cargo.lock
+```
+📄 Resolved the specifier as "minor" using git history and the conventional commits standard
+❓ Applied semver relative bump "minor", ... to get new version 0.1.1
 ```
 
-All five artifacts must land on the same version: `packages/pristine/Cargo.toml`, `Cargo.lock`, and
-the three `package.json` files under `npm/` — with the wrapper's `optionalDependencies` pins rewritten
-to match. If the crate stayed behind, check the `versionActions` nesting first.
+### Commit scopes are matched against project names
+
+A scope is not decoration. Nx matches it against the project names in the release group, and a scope
+matching none of them is dropped rather than falling back to attribution by file path. `feat(cli):`
+touching the crate resolves to a *patch*; a plain `feat:` touching the same file resolves to a
+*minor*. Leave the scope off, or use a real project name (`pristine`, `npm-pristine`, and so on).
+
+### Platform pins must be exact, never carets
+
+`preserveMatchingDependencyRanges` defaults to `true` in Nx 22 and later, so `"^0.1.0"` still matches
+`0.1.1` and is left untouched, while `"0.1.0"` is rewritten. A caret range on a platform package lets
+npm resolve a binary from a different release than the wrapper, which is the failure the lockstep
+version exists to prevent. Keep `optionalDependencies` in `npm/pristine/package.json` bare.
+
+### `--dry-run` cannot prove the `Cargo.lock` step
+
+`@monodon/rust`'s `afterAllProjectsVersioned` hook returns early under `dryRun`, so the lockfile only
+moves on a real run. The hook shells out to `cargo update --workspace`, so cargo must be on `PATH`
+wherever the release runs. If it is not, the hook catches the failure and reports no changed files,
+leaving `Cargo.lock` stale and the release commit failing CI. When a release runs somewhere new,
+check that `Cargo.lock` is in the commit.
+
+### Versioning reformats `Cargo.toml`
+
+The plugin round-trips the manifest through `@ltd/j-toml`, which reserializes strings with single
+quotes, adds a leading blank line, and **discards every comment in the file**. Cargo does not care,
+but the release commit touches more lines than it changed. Do not try to revert the noise by hand;
+the next release reintroduces it.
+
+The comment loss is the part worth planning around: the first real release deletes the explanatory
+comments at the top of `packages/pristine/Cargo.toml`, including the one recording why the crate is
+named `pristine-cli` and why its version is a literal. Anything that must survive belongs in the root
+`Cargo.toml`, which is not rewritten, or in this file.
+
+### The npm packages are not workspace members
+
+`pnpm-workspace.yaml` lists `packages/*` only. A platform package declares `os` and `cpu`, so a
+package manager refuses to link it on any host it does not match and the install dies with
+`EBADPLATFORM` everywhere. The npm packages are registered as Nx projects with `project.json`
+instead, which costs nothing because they have no dependencies to install. Adding `npm/*` to
+`pnpm-workspace.yaml` breaks `pnpm install --frozen-lockfile` in CI.
+
+### Nx 22 moved two defaults
+
+`updateDependents` now defaults to `"always"`, and `releaseTagPattern` moved under
+`releaseTag.pattern`. A `releaseTagPattern` at the top of the `release` block is ignored, and the tag
+falls back to Nx's default of `v{version}` for the whole workspace, which happens to be the same
+string. Guides written against Nx 21 or earlier will disagree with this file.
+
+## Verifying a config change
+
+The check that matters is the lockstep one, and it needs a real run rather than a dry run. On a
+scratch branch, make a crate-only conventional commit, run `npx nx release version` (the version step
+alone, so nothing is committed, tagged, or pushed), and confirm that
+`packages/pristine/Cargo.toml`, all three `npm/*/package.json` versions, the wrapper's
+`optionalDependencies` pins, and `Cargo.lock` all moved to the same version. Then reset the branch.
