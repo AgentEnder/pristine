@@ -1,16 +1,22 @@
 //! What the command line promises, run as the binary rather than as the library.
 //!
-//! Three of these are properties of the *output* rather than of the scan, and the library
-//! cannot hold them on its own: `--min-size` has to be a flag a person can type, a tier-two hit
-//! has to say out loud that it does not know how to regenerate what it found, and a tier that
-//! could not run has to say so instead of looking like a clean result.
+//! Some of these are properties of the *output* and the library cannot hold them on its own:
+//! `--min-size` has to be a flag a person can type, a tier-two hit has to say out loud that it
+//! does not know how to regenerate what it found, and a tier that could not run has to say so
+//! instead of looking like a clean result.
+//!
+//! The rest are properties of the *run*, and no library test can hold them either: `--dry-run`
+//! has to be inert, the confirmation has to default to no, and a run that could not do
+//! everything it was asked has to exit non-zero. These drive the real binary because that is
+//! the only place any of it is true or false.
 
 // `allow-unwrap-in-tests` in clippy.toml only reaches code inside a `#[test]` function, and the
 // fixture helpers below sit outside one. An unwrap in a fixture is an assertion.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use tempfile::TempDir;
@@ -41,40 +47,6 @@ fn init_repo(path: &Path) {
     assert!(output.status.success(), "git init in {}", path.display());
 }
 
-/// Runs the binary and returns its stdout, asserting it exited cleanly.
-fn run(args: &[&str]) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_pristine"))
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .expect("the pristine binary should be runnable");
-    assert!(
-        output.status.success(),
-        "pristine {args:?} exited with {:?}: {}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).expect("output should be utf-8")
-}
-
-/// Runs the binary expecting it to fail, and returns its stdout and stderr.
-fn run_expecting_failure(args: &[&str]) -> (String, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_pristine"))
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .expect("the pristine binary should be runnable");
-    assert!(
-        !output.status.success(),
-        "pristine {args:?} succeeded:\n{}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    (
-        String::from_utf8(output.stdout).expect("output should be utf-8"),
-        String::from_utf8(output.stderr).expect("output should be utf-8"),
-    )
-}
-
 /// A repository with one gitignored directory of `OVER` bytes and nothing tracked in it.
 fn repo_with_reclaimable_sediment() -> TempDir {
     let tmp = TempDir::new().unwrap();
@@ -84,20 +56,90 @@ fn repo_with_reclaimable_sediment() -> TempDir {
     tmp
 }
 
+/// A node project with a `node_modules` the ruleset will claim.
+fn project(root: &Path, name: &str) -> PathBuf {
+    let project = root.join(name);
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("package.json"), "{}").unwrap();
+    let modules = project.join("node_modules");
+    fs::create_dir_all(modules.join("left-pad")).unwrap();
+    fs::write(modules.join("left-pad/index.js"), vec![b'x'; 4096]).unwrap();
+    modules
+}
+
+/// A scan root that is already resolved, so a test can compare against what a plan holds.
+fn fixture() -> (TempDir, PathBuf) {
+    let tmp = TempDir::new().unwrap();
+    let base = fs::canonicalize(tmp.path()).unwrap();
+    (tmp, base)
+}
+
+struct Run {
+    stdout: String,
+    stderr: String,
+    ok: bool,
+}
+
+/// Runs the real binary with `answer` on its standard input.
+fn run(root: &Path, args: &[&str], answer: &str) -> Run {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pristine"))
+        .arg(root)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(answer.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    Run {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        ok: output.status.success(),
+    }
+}
+
+/// Runs the binary with nothing on its input and returns its stdout, asserting it exited
+/// cleanly.
+fn succeeds(root: &Path, args: &[&str]) -> String {
+    let run = run(root, args, "");
+    assert!(
+        run.ok,
+        "pristine {args:?} failed:\n{}\n{}",
+        run.stdout, run.stderr
+    );
+    run.stdout
+}
+
+/// Runs the binary expecting it to fail, and returns its stdout and stderr.
+fn fails(root: &Path, args: &[&str]) -> (String, String) {
+    let run = run(root, args, "");
+    assert!(!run.ok, "pristine {args:?} succeeded:\n{}", run.stdout);
+    (run.stdout, run.stderr)
+}
+
+// ---------------------------------------------------------------------------------------
+// The floor, and what a listing says about each tier.
+// ---------------------------------------------------------------------------------------
+
 #[test]
 fn min_size_defaults_to_ten_mebibytes_and_the_flag_moves_it() {
     let tmp = repo_with_reclaimable_sediment();
-    let root = tmp.path().to_string_lossy().into_owned();
 
     // A quarter of a mebibyte does not clear the shipped floor.
-    let defaulted = run(&[&root]);
+    let defaulted = succeeds(tmp.path(), &[]);
     assert!(
         !defaulted.contains("sediment"),
         "the default floor let it through:\n{defaulted}"
     );
 
     // ...and clears one the user lowers.
-    let lowered = run(&[&root, "--min-size", "128K"]);
+    let lowered = succeeds(tmp.path(), &["--min-size", "128K"]);
     assert!(
         lowered.contains("sediment"),
         "--min-size did not reach the scan:\n{lowered}"
@@ -107,14 +149,10 @@ fn min_size_defaults_to_ten_mebibytes_and_the_flag_moves_it() {
 #[test]
 fn a_size_the_flag_cannot_read_is_refused_rather_than_guessed_at() {
     let tmp = repo_with_reclaimable_sediment();
-    let output = Command::new(env!("CARGO_BIN_EXE_pristine"))
-        .args([&tmp.path().to_string_lossy(), "--min-size", "1 potato"])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+    let run = run(tmp.path(), &["--min-size", "1 potato"], "");
 
     assert!(
-        !output.status.success(),
+        !run.ok,
         "a floor nobody can read must not be silently replaced with one they did not ask for"
     );
 }
@@ -127,7 +165,7 @@ fn the_output_says_which_deletions_are_cheap_and_which_are_not() {
     write(&tmp.path().join("app/pnpm-lock.yaml"), 0);
     write(&tmp.path().join("app/node_modules/dep/index.js"), OVER);
 
-    let printed = run(&[&tmp.path().to_string_lossy(), "--min-size", "128K"]);
+    let printed = succeeds(tmp.path(), &["--min-size", "128K"]);
 
     // Tier one knows the price of getting it back. Tier two knows only that it is safe to
     // remove, and the asymmetry has to survive all the way into what the user reads.
@@ -148,17 +186,232 @@ fn the_output_says_which_deletions_are_cheap_and_which_are_not() {
 }
 
 #[test]
+fn outside_a_work_tree_the_output_reports_inertness_rather_than_an_empty_result() {
+    let tmp = TempDir::new().unwrap();
+    // A `.gitignore` and no repository, so the tier cannot run — which is a different thing
+    // from running and finding nothing, and the two must not read the same.
+    fs::write(tmp.path().join(".gitignore"), "sediment/\n").unwrap();
+    write(&tmp.path().join("sediment/blob.bin"), OVER);
+
+    let printed = succeeds(tmp.path(), &["--min-size", "128K"]);
+
+    assert!(!printed.contains("sediment"), "{printed}");
+    assert!(printed.contains("inert"), "{printed}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Both tiers reach one plan. This is the property the #588/#594 merge creates, and neither
+// side could have had a test for it.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn one_plan_covers_both_tiers() {
+    let (_tmp, base) = fixture();
+    init_repo(&base);
+    // Only the tier-two candidate is gitignored. `node_modules` is claimed by a rule, which
+    // runs first and prunes, so the two rows below cannot have come from the same tier.
+    fs::write(base.join(".gitignore"), "sediment/\n").unwrap();
+    write(&base.join("sediment/blob.bin"), OVER);
+    project(&base, "app");
+
+    let printed = succeeds(&base, &["--dry-run", "--min-size", "128K"]);
+
+    let rows: Vec<&str> = printed.lines().collect();
+    assert!(
+        rows.iter().any(|line| line.ends_with("  sediment")),
+        "the fallback tier's claim never reached the plan:\n{printed}"
+    );
+    assert!(
+        rows.iter().any(|line| line.ends_with("  app/node_modules")),
+        "the ruleset's claim never reached the plan:\n{printed}"
+    );
+    // ...and the plan says the second tier ran, rather than leaving the reader to infer it
+    // from a row that a rule could equally have produced.
+    assert!(
+        printed.contains("fallback tier: 1 directory found in 1 work tree"),
+        "{printed}"
+    );
+}
+
+#[test]
+fn a_removal_takes_what_either_tier_claimed() {
+    let (_tmp, base) = fixture();
+    init_repo(&base);
+    fs::write(base.join(".gitignore"), "sediment/\n").unwrap();
+    write(&base.join("sediment/blob.bin"), OVER);
+    let modules = project(&base, "app");
+
+    let run = run(&base, &["--delete", "--yes", "--min-size", "128K"], "");
+
+    assert!(run.ok, "{}", run.stderr);
+    assert!(
+        !base.join("sediment").exists(),
+        "a tier-two claim survived the removal:\n{}",
+        run.stdout
+    );
+    assert!(!modules.exists(), "{}", run.stdout);
+    // The evidence each tier used is untouched: the deleter removes what the plan named and
+    // nothing that named it.
+    assert!(base.join(".gitignore").exists(), "{}", run.stdout);
+    assert!(base.join("app/package.json").exists(), "{}", run.stdout);
+}
+
+// ---------------------------------------------------------------------------------------
+// `--dry-run` prints the resolved plan and deletes nothing.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_dry_run_prints_the_plan_and_removes_nothing() {
+    let (_tmp, base) = fixture();
+    let modules = project(&base, "app");
+
+    let run = run(&base, &["--dry-run"], "");
+
+    assert!(run.ok, "{}", run.stderr);
+    assert!(
+        modules.join("left-pad/index.js").exists(),
+        "a dry run deleted something"
+    );
+    // The resolved plan, not a summary of it: the path it would unlink, and the fact that
+    // it did not.
+    assert!(
+        run.stdout
+            .lines()
+            .any(|line| line.ends_with("  app/node_modules")),
+        "{}",
+        run.stdout
+    );
+    // Relative to the scan root. A plan holds resolved paths, so printing them as they are
+    // held means every row is prefixed with a home directory nobody needs to read.
+    assert!(
+        !run.stdout.contains(base.to_str().unwrap()),
+        "{}",
+        run.stdout
+    );
+    assert!(run.stdout.contains("dry run"), "{}", run.stdout);
+}
+
+#[test]
+fn a_dry_run_names_what_it_would_refuse_as_well_as_what_it_would_remove() {
+    let (_tmp, base) = fixture();
+    let modules = project(&base, "app");
+    fs::create_dir_all(modules.join("vendored/.git")).unwrap();
+
+    let run = run(&base, &["--dry-run", "--older-than", "60d"], "");
+
+    assert!(run.ok, "{}", run.stderr);
+    // Everything here was touched seconds ago, so the age floor keeps all of it — and a
+    // plan that silently listed nothing would look identical to a clean machine.
+    assert!(run.stdout.contains("touched"), "{}", run.stdout);
+    assert!(run.stdout.contains("kept"), "{}", run.stdout);
+}
+
+// ---------------------------------------------------------------------------------------
+// The final confirmation defaults to no.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_bare_enter_at_the_confirmation_removes_nothing() {
+    let (_tmp, base) = fixture();
+    let modules = project(&base, "app");
+
+    let run = run(&base, &["--delete"], "\n");
+
+    assert!(run.ok, "{}", run.stderr);
+    assert!(modules.exists(), "enter was read as consent");
+    assert!(run.stdout.contains("[y/N]"), "{}", run.stdout);
+    assert!(run.stdout.contains("nothing was removed"), "{}", run.stdout);
+}
+
+#[test]
+fn a_closed_standard_input_removes_nothing() {
+    let (_tmp, base) = fixture();
+    let modules = project(&base, "app");
+
+    // A script that pipes nothing at an irreversible prompt did not expect one.
+    let run = run(&base, &["--delete"], "");
+
+    assert!(run.ok, "{}", run.stderr);
+    assert!(modules.exists(), "end of input was read as consent");
+}
+
+#[test]
+fn saying_yes_removes_what_the_plan_listed() {
+    let (_tmp, base) = fixture();
+    let modules = project(&base, "app");
+
+    let run = run(&base, &["--delete"], "y\n");
+
+    assert!(run.ok, "{}", run.stderr);
+    assert!(!modules.exists(), "{}", run.stdout);
+    assert!(base.join("app/package.json").exists(), "the project went");
+    assert!(run.stdout.contains("removed"), "{}", run.stdout);
+}
+
+#[test]
+fn the_yes_flag_is_how_a_script_consents() {
+    let (_tmp, base) = fixture();
+    let modules = project(&base, "app");
+
+    let run = run(&base, &["--delete", "--yes"], "");
+
+    assert!(run.ok, "{}", run.stderr);
+    assert!(!modules.exists(), "{}", run.stdout);
+    assert!(!run.stdout.contains("[y/N]"), "it asked anyway");
+}
+
+// ---------------------------------------------------------------------------------------
+// `--older-than` keeps what was touched recently.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn an_age_floor_keeps_a_directory_that_was_used_today() {
+    let (_tmp, base) = fixture();
+    let modules = project(&base, "app");
+
+    let run = run(&base, &["--delete", "--yes", "--older-than", "7d"], "");
+
+    assert!(run.ok, "{}", run.stderr);
+    assert!(modules.exists(), "a directory made seconds ago was removed");
+}
+
+#[test]
+fn a_duration_that_cannot_be_read_is_refused_rather_than_guessed_at() {
+    let (_tmp, base) = fixture();
+
+    for bad in ["", "7", "d", "1.5d", "-1d", "7 potatoes", "7s"] {
+        let run = run(&base, &["--older-than", bad], "");
+        assert!(!run.ok, "`{bad}` was accepted");
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Failures set a non-zero exit.
+// ---------------------------------------------------------------------------------------
+
+#[test]
 fn a_root_that_is_not_there_fails_instead_of_reporting_an_empty_tree() {
     // Nothing was scanned, so "0 directories reclaimable" is not a finding — but it reads
     // exactly like one, and a script cannot tell the difference from the text. The exit status
     // is where that difference has to live.
-    let (printed, complaints) = run_expecting_failure(&["/pristine/does/not/exist"]);
+    let (printed, complaints) = fails(Path::new("/pristine/does/not/exist"), &[]);
 
     assert!(printed.contains("scan incomplete"), "{printed}");
     assert!(
         complaints.contains("/pristine/does/not/exist"),
         "{complaints}"
     );
+}
+
+#[test]
+fn a_root_that_cannot_be_read_fails_a_dry_run_too() {
+    // The same promise on the planning path: a plan built over a scan that saw nothing is not
+    // an empty plan, and only the status says so.
+    let (_tmp, base) = fixture();
+
+    let run = run(&base.join("does-not-exist"), &["--dry-run"], "");
+
+    assert!(!run.ok, "{}", run.stdout);
 }
 
 #[test]
@@ -170,8 +423,7 @@ fn a_repository_that_will_not_answer_makes_the_scan_incomplete() {
     fs::write(tmp.path().join(".gitignore"), "sediment/\n").unwrap();
     write(&tmp.path().join("sediment/blob.bin"), OVER);
 
-    let (printed, complaints) =
-        run_expecting_failure(&[&tmp.path().to_string_lossy(), "--min-size", "128K"]);
+    let (printed, complaints) = fails(tmp.path(), &["--min-size", "128K"]);
 
     assert!(printed.contains("scan incomplete"), "{printed}");
     assert!(
@@ -185,28 +437,47 @@ fn a_scan_that_covered_everything_it_was_pointed_at_succeeds() {
     // The other half of the pair above: a clean scan has to stay clean, or the exit status
     // stops carrying information.
     let tmp = repo_with_reclaimable_sediment();
-    let output = Command::new(env!("CARGO_BIN_EXE_pristine"))
-        .args([&tmp.path().to_string_lossy(), "--min-size", "128K"])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
 
-    assert!(output.status.success(), "{:?}", output.status.code());
-    let printed = String::from_utf8(output.stdout).unwrap();
+    let printed = succeeds(tmp.path(), &["--min-size", "128K"]);
+
     assert!(printed.contains("sediment"), "{printed}");
     assert!(!printed.contains("scan incomplete"), "{printed}");
 }
 
+#[cfg(unix)]
 #[test]
-fn outside_a_work_tree_the_output_reports_inertness_rather_than_an_empty_result() {
-    let tmp = TempDir::new().unwrap();
-    // A `.gitignore` and no repository, so the tier cannot run — which is a different thing
-    // from running and finding nothing, and the two must not read the same.
-    fs::write(tmp.path().join(".gitignore"), "sediment/\n").unwrap();
-    write(&tmp.path().join("sediment/blob.bin"), OVER);
+fn a_removal_that_could_not_finish_exits_non_zero() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_tmp, base) = fixture();
+    let modules = project(&base, "app");
+    let sealed = modules.join("left-pad");
+    fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&sealed).is_ok() {
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755)).unwrap();
+        return; // running as root, where permissions prove nothing
+    }
 
-    let printed = run(&[&tmp.path().to_string_lossy(), "--min-size", "128K"]);
+    let run = run(&base, &["--delete", "--yes"], "");
+    fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755)).unwrap();
 
-    assert!(!printed.contains("sediment"), "{printed}");
-    assert!(printed.contains("inert"), "{printed}");
+    assert!(!run.ok, "a batch that failed reported success");
+    assert!(!run.stderr.is_empty(), "the failure was not reported");
+}
+
+#[test]
+fn a_checkout_under_a_claim_is_reported_rather_than_silently_skipped() {
+    let (_tmp, base) = fixture();
+    let modules = project(&base, "app");
+    let checkout = modules.join("vendored");
+    fs::create_dir_all(checkout.join(".git")).unwrap();
+    fs::write(checkout.join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+
+    let run = run(&base, &["--delete", "--yes"], "");
+
+    assert!(run.ok, "{}", run.stderr);
+    assert!(
+        checkout.join(".git/HEAD").exists(),
+        "a checkout was removed"
+    );
+    assert!(run.stdout.contains("checkout"), "{}", run.stdout);
 }

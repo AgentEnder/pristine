@@ -1,30 +1,53 @@
 //! `pristine` finds reclaimable build artifacts and vendored dependency directories across
 //! every ecosystem on a machine, and tells you what regenerates each one before you delete it.
 //!
-//! The command line here is deliberately thin. The rollup tree TUI (#602) is the real front
-//! end and the deleter (#594) is what makes this a cleaner rather than a finder; what follows
-//! is enough to point the library at a directory and read what it found, and it exists mainly
-//! so `--min-size` is a flag a person can type rather than a builder method.
+//! The command line here is deliberately thin — the rollup tree TUI (#602) is the real front
+//! end — but several of the promises made elsewhere are properties of the *program* rather
+//! than of the library, and no library test can hold them.
 //!
-//! Three things it does have to get right, because they are properties of the *output* rather
-//! than of the scan: a tier-two hit says it does not know how to regenerate what it found; a
-//! tier that could not run says so instead of looking like a clean result; and a scan that
-//! could not read everything it was pointed at exits non-zero. The last one is the safety
-//! model's "failures are collected, reported, and set a non-zero exit", and it matters because
-//! prose cannot carry it — `pristine /does/not/exist` prints "0 directories reclaimable" and no
-//! script can tell that from an empty tree except by the status.
+//! Properties of the output:
+//!
+//! - A tier-two hit says out loud that it does not know how to regenerate what it found. The
+//!   asymmetry against tier one is information rather than an omission.
+//! - A tier that could not run says `inert` rather than printing nothing, because silence is
+//!   indistinguishable from a clean result and the two mean opposite things.
+//! - `--min-size` is a flag a person can type rather than a builder method.
+//!
+//! Properties of the run:
+//!
+//! - `--dry-run` prints the resolved plan and is inert. It prints the same [`Plan`] a real run
+//!   executes, so a preview cannot disagree with the run it previews.
+//! - The confirmation defaults to **no**, and so does end of input. A script that means to
+//!   delete says so with `--yes` rather than by being silent.
+//! - A run that could not do everything it was asked exits non-zero. Without that,
+//!   `pristine /does/not/exist` prints "0 directories reclaimable" and no script can tell that
+//!   from a clean machine except by the status.
+//!
+//! Selecting *which* directories to remove is the TUI's job. Until it exists `--delete` means
+//! all of them — from both tiers — which is why every guard above matters more here than it
+//! eventually will.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
-use clap::Parser;
-use pristine::{DEFAULT_MIN_SIZE, Hit, Ruleset, Size, Walker};
+use clap::{ArgAction, Parser};
+use pristine::delete::confirm;
+use pristine::{
+    DEFAULT_MIN_SIZE, Deleter, FallbackReport, Hit, Plan, Planner, Removal, Ruleset, Size, Target,
+    WalkOutcome, Walker,
+};
 
 /// A language-agnostic reclaimable-space finder and cleaner.
 #[derive(Debug, Parser)]
 #[command(name = "pristine", version)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "these are command line flags, and the lint's advice — fold them into a state \
+              machine — would take the flags off the command line"
+)]
 struct Cli {
     /// The directory to scan.
     #[arg(default_value = ".", value_name = "PATH")]
@@ -42,16 +65,42 @@ struct Cli {
         value_parser = parse_size,
     )]
     min_size: u64,
+
+    /// Remove everything the scan found, after showing the plan and asking.
+    #[arg(long)]
+    delete: bool,
+
+    /// Print the plan and stop. Nothing is removed, whatever else is passed.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Answer the confirmation with yes. The only way a script gets to delete anything.
+    #[arg(long, short = 'y')]
+    yes: bool,
+
+    /// Keep anything touched more recently than this.
+    ///
+    /// A whole number and a unit: `h` hours, `d` days, `w` weeks, `m` months (30 days), `y`
+    /// years (365 days). There are no minutes, which is what lets `m` mean months without
+    /// the `m`/`M` ambiguity that would otherwise need a case-sensitive flag.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    older_than: Option<Duration>,
+
+    /// Whether to stay on the filesystem the scan root is on. Pass `--one-file-system=false`
+    /// to follow a mount, which is how a sweep of one project reaches a network share or a
+    /// backup volume that happens to be mounted inside it.
+    #[arg(long, value_name = "BOOL", default_value_t = true, action = ArgAction::Set)]
+    one_file_system: bool,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match scan(&cli) {
-        Ok(Scanned::Whole) => ExitCode::SUCCESS,
-        // A listing that is a lower bound must not look, to a script, like a listing that is
-        // the whole truth. `pristine /does/not/exist` otherwise prints "0 directories
-        // reclaimable" and succeeds.
-        Ok(Scanned::Partly) => ExitCode::FAILURE,
+    match run(&cli) {
+        // Anything the run could not do — a path it could not read, a directory it could not
+        // remove — is a lower bound reported as a total unless the status says otherwise. A
+        // listing that is a lower bound must not look, to a script, like the whole truth.
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
         Err(err) => {
             eprintln!("pristine: {err}");
             ExitCode::FAILURE
@@ -59,17 +108,17 @@ fn main() -> ExitCode {
     }
 }
 
-/// How much of the tree the scan actually got through.
-#[derive(Debug, PartialEq, Eq)]
-enum Scanned {
-    Whole,
-    Partly,
-}
-
-fn scan(cli: &Cli) -> Result<Scanned, Box<dyn std::error::Error>> {
+/// Returns whether everything asked for actually happened — both halves of it. A scan that
+/// could not read everything and a removal that could not finish are different failures with
+/// the same consequence, and the exit status is the only place a script reads either.
+fn run(cli: &Cli) -> Result<bool, Box<dyn std::error::Error>> {
     let ruleset = Arc::new(Ruleset::load(None)?);
     let hits = Mutex::new(Vec::new());
+    // The mount rule has to reach the walk as well as the plan. Setting it on only one of them
+    // makes `--one-file-system=false` a flag that permits crossing a mount the scan never
+    // looked across, which reads as "there was nothing over there".
     let outcome = Walker::new(&cli.root, ruleset)
+        .same_file_system(cli.one_file_system)
         .min_size(cli.min_size)
         .run(|hit| lock(&hits).push(hit));
 
@@ -85,73 +134,101 @@ fn scan(cli: &Cli) -> Result<Scanned, Box<dyn std::error::Error>> {
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    for hit in &hits {
-        writeln!(out, "{}", row(hit, &cli.root))?;
-    }
-    writeln!(out, "{}", summary(&hits, &outcome))?;
-    if !outcome.errors.is_empty() {
-        // On stdout, beside the numbers it qualifies, because someone reading only the listing
-        // would otherwise take an undercount for a total. The detail goes to stderr below.
-        writeln!(
-            out,
-            "scan incomplete: {} could not be read, so everything above is a lower bound",
-            plural(outcome.errors.len(), "path", "paths"),
-        )?;
+    let whole = outcome.errors.is_empty();
+
+    if !cli.delete && !cli.dry_run {
+        for hit in &hits {
+            writeln!(out, "{}", row(hit, &cli.root))?;
+        }
+        writeln!(out, "{}", summary(&hits))?;
+        report_fallback(&mut out, &outcome.fallback)?;
+        report_scan(&mut out, &outcome)?;
+        return Ok(whole);
     }
 
-    for error in &outcome.errors {
-        match &error.path {
-            Some(path) => eprintln!("pristine: {}: {}", path.display(), error.message),
-            None => eprintln!("pristine: {}", error.message),
+    // Both tiers' hits go into one plan. Tier two is not a second pass and not a second
+    // planner: by the time the walk has returned, which tier claimed a directory is a fact
+    // about how it was found and no longer a fact about how it is removed.
+    let plan = Planner::new(&cli.root)
+        .one_file_system(cli.one_file_system)
+        .older_than(cli.older_than)
+        .plan(hits.iter().map(Target::from));
+    write_plan(&mut out, &plan)?;
+    // Beside the plan for the same reason it sits beside the listing, and with more at stake:
+    // a tier that went inert is a tier whose findings are missing from what is about to be
+    // removed, and a plan that did not say so would read as the whole of what is reclaimable.
+    report_fallback(&mut out, &outcome.fallback)?;
+    report_scan(&mut out, &outcome)?;
+
+    if cli.dry_run {
+        writeln!(out, "\ndry run: nothing was removed")?;
+        return Ok(whole);
+    }
+    if plan.is_empty() {
+        writeln!(out, "\nnothing was removed")?;
+        return Ok(whole);
+    }
+    if !cli.yes {
+        let question = format!(
+            "\nRemove {}?",
+            plural(plan.targets().len(), "directory", "directories")
+        );
+        let stdin = std::io::stdin();
+        if !confirm(&question, &mut stdin.lock(), &mut out)? {
+            writeln!(out, "nothing was removed")?;
+            return Ok(whole);
         }
     }
 
-    Ok(if outcome.errors.is_empty() {
-        Scanned::Whole
-    } else {
-        Scanned::Partly
-    })
+    let removal = Deleter::new().remove(&plan);
+    write_removal(&mut out, &removal, plan.root())?;
+    for failure in &removal.failures {
+        eprintln!("pristine: {}: {}", failure.path.display(), failure.message);
+    }
+    Ok(whole && removal.is_clean())
 }
 
 /// One reclaimable directory, with what is known about getting it back.
 fn row(hit: &Hit, root: &Path) -> String {
     let path = hit.path.strip_prefix(root).unwrap_or(&hit.path);
-    let size = match hit.size {
-        Size::Measured(bytes) => human(bytes),
-        // Not zero and not an error. Nothing has looked inside a tier-one claim, because
-        // looking is the cost the whole design exists to avoid.
-        Size::Unmeasured => "—".to_owned(),
-    };
     let regenerate = hit.regenerate().unwrap_or(
         // The asymmetry is the point: this tier knows the directory is safe to remove and
         // knows nothing about what put it there, which tells you the deletion is not cheap.
         "no known way to regenerate this",
     );
-    format!("{size:>10}  {:<60}  {regenerate}", path.display())
+    format!(
+        "{:>10}  {:<60}  {regenerate}",
+        size(hit.size),
+        path.display()
+    )
 }
 
-fn summary(hits: &[Hit], outcome: &pristine::WalkOutcome) -> String {
+/// What the scan found, across both tiers.
+fn summary(hits: &[Hit]) -> String {
     let priced: u64 = hits.iter().filter_map(|hit| hit.size.bytes()).sum();
     let unpriced = hits.iter().filter(|hit| hit.size.bytes().is_none()).count();
-    let mut lines = vec![format!(
+    format!(
         "\n{} reclaimable, {} priced, {unpriced} not priced",
         plural(hits.len(), "directory", "directories"),
         human(priced),
-    )];
+    )
+}
 
-    let fallback = &outcome.fallback;
+/// What tier two managed, whenever it was asked at all.
+///
+/// Silence here would be indistinguishable from a clean scan, and the two mean opposite
+/// things: a tier that found nothing has looked, and an inert one has not.
+fn report_fallback(out: &mut impl Write, fallback: &FallbackReport) -> std::io::Result<()> {
     if !fallback.enabled {
-        return lines.join("\n");
+        return Ok(());
     }
     if fallback.is_inert() {
-        // The honest report. Silence here would be indistinguishable from a clean scan, and
-        // the two mean opposite things.
-        lines.push(format!(
+        return writeln!(
+            out,
             "fallback tier: inert — nothing scanned is in a git work tree, so nothing could be \
              judged reclaimable by inference (floor was {})",
             human(fallback.min_size)
-        ));
-        return lines.join("\n");
+        );
     }
     let held_back = if fallback.holding_a_checkout == 0 {
         String::new()
@@ -161,17 +238,119 @@ fn summary(hits: &[Hit], outcome: &pristine::WalkOutcome) -> String {
             plural(fallback.holding_a_checkout, "directory", "directories")
         )
     };
-    lines.push(format!(
+    writeln!(
+        out,
         "fallback tier: {} found in {} above a {} floor{held_back}",
         plural(fallback.hits, "directory", "directories"),
         plural(fallback.work_trees, "work tree", "work trees"),
         human(fallback.min_size),
-    ));
-    lines.join("\n")
+    )
+}
+
+/// The plan, in full. This is what `--dry-run` exists to show, so it lists what would be
+/// removed AND what would not: a plan that printed only the first half would be
+/// indistinguishable from a clean machine when an age floor or a checkout kept everything.
+fn write_plan(out: &mut impl Write, plan: &Plan) -> std::io::Result<()> {
+    // The plan's own root, not the one the user typed: a plan holds RESOLVED paths, so
+    // stripping `.` off `/Users/me/repo/node_modules` takes nothing off at all.
+    let root = plan.root();
+    for target in plan.targets() {
+        let path = target.path.strip_prefix(root).unwrap_or(&target.path);
+        writeln!(out, "{:>10}  {}", size(target.size), path.display())?;
+    }
+    writeln!(
+        out,
+        "\nplan: {}, {} priced, {} not priced",
+        plural(plan.targets().len(), "directory", "directories"),
+        human(plan.measured_bytes()),
+        plan.unpriced(),
+    )?;
+
+    if plan.kept().is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "kept: {}",
+        plural(plan.kept().len(), "directory", "directories")
+    )?;
+    for refused in plan.kept() {
+        let path = refused.path.strip_prefix(root).unwrap_or(&refused.path);
+        writeln!(out, "  {}  —  {}", path.display(), refused.reason)?;
+    }
+    Ok(())
+}
+
+fn write_removal(out: &mut impl Write, removal: &Removal, root: &Path) -> std::io::Result<()> {
+    let complete = removal
+        .removed
+        .iter()
+        .filter(|removed| removed.complete)
+        .count();
+    writeln!(
+        out,
+        "\nremoved {}, {} freed",
+        plural(complete, "directory", "directories"),
+        human(removal.bytes_freed()),
+    )?;
+
+    // A subtree the deleter declined to enter is the safety model working rather than a
+    // fault, so it is reported here and not as a failure — but it IS reported, because a
+    // directory the user selected and did not get is something they need to know about.
+    if !removal.kept.is_empty() {
+        writeln!(
+            out,
+            "kept {}:",
+            plural(removal.kept.len(), "directory", "directories")
+        )?;
+        for refused in &removal.kept {
+            let path = refused.path.strip_prefix(root).unwrap_or(&refused.path);
+            writeln!(out, "  {}  —  {}", path.display(), refused.reason)?;
+        }
+    }
+    if !removal.failures.is_empty() {
+        writeln!(
+            out,
+            "failed on {}, listed on standard error",
+            plural(removal.failures.len(), "path", "paths")
+        )?;
+    }
+    Ok(())
+}
+
+/// Qualifies the numbers above when the scan could not read everything it was pointed at.
+///
+/// On stdout, beside the numbers it qualifies, because someone reading only the listing would
+/// otherwise take an undercount for a total. The detail goes to standard error.
+fn report_scan(out: &mut impl Write, outcome: &WalkOutcome) -> std::io::Result<()> {
+    if outcome.errors.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "scan incomplete: {} could not be read, so everything above is a lower bound",
+        plural(outcome.errors.len(), "path", "paths"),
+    )?;
+    for error in &outcome.errors {
+        match &error.path {
+            Some(path) => eprintln!("pristine: {}: {}", path.display(), error.message),
+            None => eprintln!("pristine: {}", error.message),
+        }
+    }
+    Ok(())
 }
 
 fn plural(count: usize, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
+}
+
+/// A claim's size, or a dash when nothing has looked. Not zero and not an error: measuring a
+/// tier-one claim means enumerating the subtree the scan deliberately pruned at.
+fn size(size: Size) -> String {
+    match size {
+        Size::Measured(bytes) => human(bytes),
+        Size::Unmeasured => "—".to_owned(),
+    }
 }
 
 /// Bytes in the units a person reads, binary because that is what the sizes are.
@@ -232,19 +411,74 @@ fn parse_size(text: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("`{text}` does not fit in a size"))
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+/// An age as a person writes one.
+///
+/// A unit is mandatory, because a bare number is the one input where guessing is worst: read
+/// as seconds it keeps nothing, read as days it keeps almost everything, and both are
+/// plausible readings of `--older-than 7`. There are deliberately no minutes or seconds — a
+/// cleaner does not filter by them — which is what frees `m` to mean months without the
+/// `m`-versus-`M` trap that would make the flag silently case-sensitive.
+fn parse_duration(text: &str) -> Result<Duration, String> {
+    const HOUR: u64 = 60 * 60;
+    const DAY: u64 = 24 * HOUR;
+
+    let text = text.trim();
+    let digits = text
+        .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+        .trim();
+    let suffix = text[digits.len()..].trim();
+    let value: u64 = digits
+        .parse()
+        .map_err(|_| format!("`{text}` is not a whole number of time units"))?;
+
+    let unit = match suffix.to_ascii_lowercase().as_str() {
+        "h" => HOUR,
+        "d" => DAY,
+        "w" => 7 * DAY,
+        "m" => 30 * DAY,
+        "y" => 365 * DAY,
+        "" => return Err(format!("`{text}` needs a unit: h, d, w, m or y")),
+        other => {
+            return Err(format!(
+                "`{other}` is not a unit of time; use h, d, w, m or y"
+            ));
+        }
+    };
+    value
+        .checked_mul(unit)
+        .map(Duration::from_secs)
+        .ok_or_else(|| format!("`{text}` does not fit in a duration"))
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, human, parse_size};
+    use super::{Cli, human, parse_duration, parse_size};
     use clap::{CommandFactory, Parser};
     use pristine::DEFAULT_MIN_SIZE;
+    use std::time::Duration;
 
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn the_safe_defaults_are_the_defaults() {
+        let cli = Cli::parse_from(["pristine"]);
+        assert!(!cli.delete, "a bare run must not delete");
+        assert!(!cli.yes, "consent is never assumed");
+        assert!(cli.older_than.is_none(), "the age floor is opt-in");
+        assert!(cli.one_file_system, "a mount is not crossed by default");
+    }
+
+    #[test]
+    fn a_mount_is_only_crossed_when_the_flag_says_so() {
+        assert!(!Cli::parse_from(["pristine", "--one-file-system=false"]).one_file_system);
+        assert!(Cli::parse_from(["pristine", "--one-file-system", "true"]).one_file_system);
     }
 
     #[test]
@@ -281,6 +515,27 @@ mod tests {
         // the user typed, and a floor that drifts claims directories they meant to keep.
         for bad in ["", "MiB", "1.5G", "-1", "1 potato", "18446744073709551615K"] {
             assert!(parse_size(bad).is_err(), "`{bad}` was accepted");
+        }
+    }
+
+    #[test]
+    fn an_age_is_read_in_the_units_it_was_written_in() {
+        const DAY: u64 = 24 * 60 * 60;
+        assert_eq!(parse_duration("12h"), Ok(Duration::from_secs(12 * 60 * 60)));
+        assert_eq!(parse_duration("7d"), Ok(Duration::from_secs(7 * DAY)));
+        assert_eq!(parse_duration("2w"), Ok(Duration::from_secs(14 * DAY)));
+        assert_eq!(parse_duration("3m"), Ok(Duration::from_secs(90 * DAY)));
+        assert_eq!(parse_duration("3M"), Ok(Duration::from_secs(90 * DAY)));
+        assert_eq!(parse_duration("1y"), Ok(Duration::from_secs(365 * DAY)));
+        assert_eq!(parse_duration(" 30 d "), Ok(Duration::from_secs(30 * DAY)));
+    }
+
+    #[test]
+    fn an_age_that_cannot_be_read_is_refused_rather_than_guessed_at() {
+        // A bare number is the worst one to guess at: as seconds it keeps nothing, as days
+        // it keeps nearly everything, and `--older-than 7` reads as either.
+        for bad in ["", "7", "d", "1.5d", "-7d", "7 potatoes", "7s", "7min"] {
+            assert!(parse_duration(bad).is_err(), "`{bad}` was accepted");
         }
     }
 

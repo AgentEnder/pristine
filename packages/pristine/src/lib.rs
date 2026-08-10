@@ -32,7 +32,13 @@
 //! inference even when no rule names it. It reports honestly that it does not know how to
 //! regenerate what it found, and outside a work tree it is inert rather than guessing from
 //! directory names. See [`fallback`].
+//!
+//! Removing what either tier found is [`delete`], and it is split in two on purpose. A
+//! [`Planner`] resolves every path and applies every check in the safety model; a [`Deleter`]
+//! executes the resulting [`Plan`] and decides nothing. That split is what makes a dry run
+//! honest: the plan a preview prints is the same object the removal consumes.
 
+pub mod delete;
 mod detect;
 pub mod fallback;
 pub mod git;
@@ -41,6 +47,9 @@ pub mod size;
 pub mod tree;
 pub mod walk;
 
+pub use delete::{
+    Deleter, Failure, Plan, PlanTarget, Planner, Refusal, Refused, Removal, Removed, Target,
+};
 pub use fallback::{DEFAULT_MIN_SIZE, FallbackReport};
 pub use git::{GitError, WorkTree};
 pub use rules::{Anchor, MarkersRequired, RegenerateWhen, Rule, RuleError, Ruleset};
