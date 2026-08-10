@@ -138,6 +138,27 @@ the ignored one. `node_modules` costs minutes and a network to get back, and not
 regenerates a `.env` — least of all one that is untracked rather than ignored, which is the copy
 git is not even hiding.
 
+**That applies to what an entry hides as well as to what it is.** `git clean` offers a whole
+directory whenever everything inside it is removable, so a row is not a description of its own
+contents: `docker/` arrives as one line and may hold `docker/.env`. A directory that hides
+something you did not ask to remove is held back whole, and named:
+
+```console
+$ pristine repo --untracked --ignored --yes
+         —  scratch.txt
+
+plan: 1 path, 0 B priced, 1 not priced
+held back: 3 paths, because git offered them whole and they hold something you did not ask to remove
+  docker  —  holds docker/.env, which is an env file (--env includes it)
+  pkg  —  holds pkg/node_modules, which is vendored (--node-modules includes it)
+  build  —  holds build/.env, which is an env file (--env includes it)
+```
+
+Held back whole rather than cleaned around, because cleaning around it would mean deciding for
+ourselves what inside it is removable — the reimplementation of `git clean` this mode exists to
+avoid. A directory that cannot be read is held back on the same rule: "I could not look" is not
+"there was nothing there".
+
 Both modes share one deleter and the whole of the safety model below.
 
 ## Safety
