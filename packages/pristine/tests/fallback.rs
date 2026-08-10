@@ -469,6 +469,77 @@ fn a_subtree_that_cannot_be_read_through_is_not_claimed() {
 }
 
 #[test]
+fn a_tracked_file_under_a_non_ascii_path_still_bars_the_claim() {
+    let tmp = TempDir::new().unwrap();
+    init_repo(tmp.path());
+    fs::write(tmp.path().join(".gitignore"), "build/\n").unwrap();
+    // `café` with a combining accent, which is what `readdir` hands back on macOS. git's
+    // `core.precomposeunicode` is on there by default, so `git add` stores the *composed*
+    // form and a raw byte comparison misses the tracked file below — leaving a directory that
+    // demonstrably holds one looking free to delete. Only one component has to be non-ASCII,
+    // and the ignore rule matching it is an ordinary ASCII `build/`.
+    let cafe = "cafe\u{301}";
+    write(&tmp.path().join(cafe).join("build/blob.bin"), OVER);
+    touch(&tmp.path().join(cafe).join("build/keep.txt"));
+    git(
+        tmp.path(),
+        &["add", "-f", &format!("{cafe}/build/keep.txt")],
+    );
+
+    assert!(
+        claimed(tmp.path()).is_empty(),
+        "a tracked file went missing behind a normalization mismatch"
+    );
+}
+
+#[test]
+fn a_decoy_git_dir_in_the_environment_cannot_redirect_the_index_lookup() {
+    // `GIT_DIR` and `GIT_INDEX_FILE` beat `git -C <root>`, and anything running inside a hook,
+    // a rebase or a filter-branch has them set. The environment has to be poisoned before the
+    // process starts and cargo runs every test in one process, so the actual scan happens in a
+    // child — this half only sets the trap.
+    let decoy = TempDir::new().unwrap();
+    init_repo(decoy.path());
+    touch(&decoy.path().join("decoy.txt"));
+    git(decoy.path(), &["add", "decoy.txt"]);
+
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "the_scan_that_runs_under_a_decoy_git_dir",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("GIT_DIR", decoy.path().join(".git"))
+        .env("GIT_INDEX_FILE", decoy.path().join(".git/index"))
+        .env("GIT_WORK_TREE", decoy.path())
+        .status()
+        .unwrap();
+
+    assert!(
+        status.success(),
+        "the scan read the decoy repository's index instead of the one it was pointed at"
+    );
+}
+
+/// The child half of [`a_decoy_git_dir_in_the_environment_cannot_redirect_the_index_lookup`].
+/// Ignored so it only ever runs from that parent, with the trap already set.
+#[test]
+#[ignore = "run by its parent with a decoy GIT_DIR in the environment"]
+fn the_scan_that_runs_under_a_decoy_git_dir() {
+    let tmp = TempDir::new().unwrap();
+    init_repo(tmp.path());
+    fs::write(tmp.path().join(".gitignore"), "sediment/\n").unwrap();
+    write(&tmp.path().join("sediment/blob.bin"), OVER);
+    touch(&tmp.path().join("sediment/keep.txt"));
+    git(tmp.path(), &["add", "-f", "sediment/keep.txt"]);
+
+    // Honour the decoy and this repository's index looks empty, so `sediment` looks untracked
+    // and is claimed. Everything the tier promises rests on reading the right index.
+    assert!(claimed(tmp.path()).is_empty());
+}
+
+#[test]
 fn the_fallback_can_be_switched_off() {
     let tmp = TempDir::new().unwrap();
     init_repo(tmp.path());

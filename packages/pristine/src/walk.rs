@@ -420,15 +420,23 @@ where
         let size = match &claim {
             Claim::Rule(_) => {
                 let measured = self.measurer.measure(entry.path(), &metadata);
-                self.report_unreadable(measured.unreadable, "this size is a lower bound");
+                self.report_blind_spots(
+                    measured.unreadable,
+                    "unreadable, so this size is a lower bound",
+                );
                 measured.size
             }
             Claim::Ignored(_) => {
                 let surveyed = self.measurer.survey(entry.path(), &metadata);
-                let blind_spots = !surveyed.unreadable.is_empty();
-                self.report_unreadable(
+                let blind_spots =
+                    !surveyed.unreadable.is_empty() || !surveyed.not_crossed.is_empty();
+                self.report_blind_spots(
                     surveyed.unreadable,
-                    "this subtree could not be judged reclaimable",
+                    "unreadable, so this subtree could not be judged reclaimable",
+                );
+                self.report_blind_spots(
+                    surveyed.not_crossed,
+                    "on another filesystem, so this subtree could not be judged reclaimable",
                 );
                 if blind_spots {
                     // Part of the subtree could not be read, so neither "holds no checkout" nor
@@ -488,18 +496,18 @@ where
         lock(&self.errors).push(WalkError { path, message });
     }
 
-    /// Reports what a traversal could not read. `consequence` differs by tier and is the point
-    /// of the message: a tier-one claim survives an unreadable corner with a size that is a
-    /// lower bound, and a tier-two claim does not survive it at all.
-    fn report_unreadable(&self, unreadable: Vec<PathBuf>, consequence: &str) {
-        if unreadable.is_empty() {
+    /// Reports the corners of a subtree a traversal did not see. The message differs by tier
+    /// and is the point of the report: a tier-one claim survives a blind spot with a size that
+    /// is a lower bound, and a tier-two claim does not survive one at all.
+    fn report_blind_spots(&self, paths: Vec<PathBuf>, message: &str) {
+        if paths.is_empty() {
             return;
         }
         let mut errors = lock(&self.errors);
-        for path in unreadable {
+        for path in paths {
             errors.push(WalkError {
                 path: Some(path),
-                message: format!("unreadable, so {consequence}"),
+                message: message.to_owned(),
             });
         }
     }

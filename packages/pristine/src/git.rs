@@ -16,7 +16,9 @@
 
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::{fmt, io};
+use std::{fmt, io, str};
+
+use unicode_normalization::UnicodeNormalization;
 
 /// Environment variables that redirect git at a repository other than the one it was pointed
 /// at, cleared before every invocation.
@@ -110,7 +112,8 @@ impl WorkTree {
             .stdout
             .split(|byte| *byte == 0)
             .filter(|path| !path.is_empty())
-            .map(Box::from)
+            // Composed here as well as on the query side, so the two agree. See `comparable`.
+            .map(|path| Box::from(comparable(path.to_vec())))
             .collect();
         tracked.sort_unstable();
         tracked.dedup();
@@ -180,7 +183,35 @@ fn as_index_path(relative: &Path) -> Option<Vec<u8>> {
         }
         out.extend_from_slice(segment.as_encoded_bytes());
     }
-    Some(out)
+    Some(comparable(out))
+}
+
+/// The form both sides of the tracked-path comparison have to be in.
+///
+/// The two sides disagree about Unicode normalization, and on macOS they disagree *by default*.
+/// `readdir` on APFS hands back the bytes a name was created with, which for anything touched by
+/// an HFS-era tool is decomposed; git sets `core.precomposeunicode` on macOS, so `git add`
+/// composes the name before storing it. A directory called `café` is then `cafe\xcc\x81` on disk
+/// and `caf\xc3\xa9` in the index — measured, not assumed — and a raw byte comparison misses.
+///
+/// That miss is the dangerous direction: a directory that *does* hold a tracked file looks
+/// untracked, and looking untracked is what makes it eligible for deletion. It is reachable
+/// without anyone doing anything exotic, since only one component of the path has to be
+/// non-ASCII: `docs/café/build` matched by an ordinary `build/` ignore rule is enough.
+///
+/// So both sides are composed before they are compared. Where two names on the same filesystem
+/// differ only by normalization — possible on Linux, which normalizes nothing — this conflates
+/// them, and conflating errs toward "tracked", which is the side to err on. Anything that is not
+/// UTF-8 cannot be normalized and is compared as it stands, which is correct: nothing converts
+/// it on either side either.
+fn comparable(path: Vec<u8>) -> Vec<u8> {
+    if path.is_ascii() {
+        return path;
+    }
+    match str::from_utf8(&path) {
+        Ok(text) => text.nfc().collect::<String>().into_bytes(),
+        Err(_) => path,
+    }
 }
 
 /// Why a work tree could not be consulted.
@@ -222,13 +253,15 @@ impl std::error::Error for GitError {
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkTree, as_index_path};
+    use super::{WorkTree, as_index_path, comparable};
     use std::path::{Path, PathBuf};
 
+    /// Mirrors what [`WorkTree::open`] does to `git ls-files` output, so a fixture and a real
+    /// index are the same shape.
     fn work_tree(root: &str, tracked: &[&str]) -> WorkTree {
         let mut tracked: Vec<Box<[u8]>> = tracked
             .iter()
-            .map(|path| Box::from(path.as_bytes()))
+            .map(|path| Box::from(comparable(path.as_bytes().to_vec())))
             .collect();
         tracked.sort_unstable();
         WorkTree {
@@ -274,6 +307,17 @@ mod tests {
         let tree = work_tree("/repo", &[]);
         assert!(!tree.holds_tracked_path(Path::new("/repo")));
         assert!(!tree.holds_tracked_path(Path::new("/repo/out")));
+    }
+
+    #[test]
+    fn a_decomposed_path_matches_the_composed_one_git_stored() {
+        // `café` as git records it on macOS against `café` as `readdir` hands it back. Without
+        // composing both sides these are different byte strings, the search misses, and a
+        // directory holding a tracked file is reported as free to delete.
+        let tree = work_tree("/repo", &["caf\u{e9}/build/keep.txt"]);
+        assert!(tree.holds_tracked_path(Path::new("/repo/cafe\u{301}/build")));
+        assert!(tree.holds_tracked_path(Path::new("/repo/caf\u{e9}/build")));
+        assert!(!tree.holds_tracked_path(Path::new("/repo/cafe\u{301}/other")));
     }
 
     #[test]

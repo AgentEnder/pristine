@@ -101,6 +101,13 @@ pub struct Survey {
     /// could not see all of the subtree has not established `nested_repo` either, so the
     /// caller has no grounds to claim the directory at all.
     pub unreadable: Vec<PathBuf>,
+    /// Subtrees on another filesystem, which the survey does not enter.
+    ///
+    /// Reported for the same reason as `unreadable` and not silently skipped, which is what an
+    /// earlier version did. A mount point inside a candidate hides everything under it,
+    /// including a checkout — so "holds no repository", which is a claim about the whole
+    /// subtree, is not established when one is present.
+    pub not_crossed: Vec<PathBuf>,
 }
 
 /// Measures directories under a fixed policy.
@@ -176,6 +183,7 @@ impl Measurer {
                 size: Size::Measured(allocated(metadata)),
                 nested_repo: None,
                 unreadable: Vec::new(),
+                not_crossed: Vec::new(),
             };
         }
         let walked = self.walk(dir, metadata, true);
@@ -187,6 +195,7 @@ impl Measurer {
             },
             nested_repo: walked.nested_repo,
             unreadable: walked.unreadable,
+            not_crossed: walked.not_crossed,
         }
     }
 
@@ -197,6 +206,7 @@ impl Measurer {
     fn walk(self, dir: &Path, metadata: &fs::Metadata, watch_for_repos: bool) -> Walked {
         let mut bytes = allocated(metadata);
         let mut unreadable = Vec::new();
+        let mut not_crossed = Vec::new();
         let boundary = device(metadata);
         // Multiply-linked files, so a hard-linked artefact is counted once per claim rather
         // than once per link. Only populated by files that actually carry more than one
@@ -218,6 +228,7 @@ impl Measurer {
                         bytes,
                         nested_repo: Some(current),
                         unreadable,
+                        not_crossed,
                     };
                 }
                 // `symlink_metadata`, never `metadata`: following a link would count bytes
@@ -227,6 +238,13 @@ impl Measurer {
                     continue;
                 };
                 if self.same_file_system && device(&metadata) != boundary {
+                    // A mount point. `measure` may pass over one silently, because there it
+                    // only makes a size a lower bound. A survey may not: everything under the
+                    // mount is unseen, including a `.git`, so passing over it silently would
+                    // let "holds no repository" be asserted about ground nobody looked at.
+                    if watch_for_repos && metadata.is_dir() {
+                        not_crossed.push(path);
+                    }
                     continue;
                 }
                 if let Some(identity) = multiply_linked(&metadata) {
@@ -244,6 +262,7 @@ impl Measurer {
             bytes,
             nested_repo: None,
             unreadable,
+            not_crossed,
         }
     }
 }
@@ -255,6 +274,7 @@ struct Walked {
     /// lower bound rather than a total.
     nested_repo: Option<PathBuf>,
     unreadable: Vec<PathBuf>,
+    not_crossed: Vec<PathBuf>,
 }
 
 /// Bytes actually allocated on disk, which is what deleting gives back.
@@ -302,6 +322,7 @@ fn multiply_linked(_metadata: &fs::Metadata) -> Option<(u64, u64)> {
 mod tests {
     use super::{Measurer, Size, SizeMode};
     use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn write(dir: &TempDir, name: &str, bytes: usize) {
@@ -424,6 +445,31 @@ mod tests {
         // The total is meaningless once the answer is "not removable", and reporting a lower
         // bound as if it were a size would be worse than reporting nothing.
         assert_eq!(surveyed.size, Size::Unmeasured);
+    }
+
+    #[test]
+    fn a_survey_reports_a_subtree_it_will_not_cross_rather_than_passing_over_it() {
+        let tmp = TempDir::new().unwrap();
+        // A checkout two levels down, behind what will look like a mount point.
+        fs::create_dir_all(tmp.path().join("mounted/checkout/.git")).unwrap();
+
+        // `survey` takes the caller's metadata for `dir`, and the boundary it will not cross
+        // comes from that. Handing it metadata from another device is therefore the same
+        // situation the walker meets when a mount point sits inside a candidate — without
+        // needing a real mount, which no portable test can arrange.
+        let here = tmp.path().symlink_metadata().unwrap();
+        let elsewhere = Path::new("/dev").symlink_metadata().unwrap();
+        if super::device(&here) == super::device(&elsewhere) {
+            return; // one filesystem on this machine, so there is no boundary to prove
+        }
+
+        let surveyed = Measurer::new(SizeMode::Skip).survey(tmp.path(), &elsewhere);
+
+        // The checkout is on the far side, so the survey genuinely did not see it. Saying so is
+        // the whole point: silence here would let "holds no repository" be asserted about
+        // ground nobody looked at, and the caller would claim the directory.
+        assert!(surveyed.nested_repo.is_none());
+        assert_eq!(surveyed.not_crossed, [tmp.path().join("mounted")]);
     }
 
     #[test]
