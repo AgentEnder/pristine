@@ -20,6 +20,26 @@
       "sharedGlobals"
     ]
   },
+  "release": {
+    "projectsRelationship": "fixed",
+    "releaseTag": {
+      "pattern": "v{version}"
+    },
+    "version": {
+      "conventionalCommits": true
+    },
+    "changelog": {
+      "workspaceChangelog": {
+        "createRelease": "github"
+      },
+      "projectChangelogs": false
+    },
+    "groups": {
+      "pristine": {
+        "projects": ["*"]
+      }
+    }
+  },
   "targetDefaults": {
     "build": {
       "cache": true,

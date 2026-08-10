@@ -1,0 +1,26 @@
+{
+  "name": "@agentender/pristine",
+  "version": "0.1.0",
+  "description": "A language-agnostic reclaimable-space finder and cleaner. Wrapper over the prebuilt pristine binaries.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AgentEnder/pristine.git"
+  },
+  "keywords": [
+    "disk",
+    "cleanup",
+    "node_modules",
+    "cli"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "optionalDependencies": {
+    "@agentender/pristine-darwin-arm64": "0.1.0",
+    "@agentender/pristine-linux-x64-gnu": "0.1.0"
+  }
+}

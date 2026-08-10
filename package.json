@@ -13,6 +13,8 @@
     "node": ">=22"
   },
   "devDependencies": {
+    "@monodon/rust": "3.0.0",
+    "@nx/js": "23.1.1",
     "nx": "23.1.1"
   }
 }

@@ -1,0 +1,22 @@
+{
+  "name": "@agentender/pristine-linux-x64-gnu",
+  "version": "0.1.0",
+  "description": "The pristine binary for linux-x64-gnu.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AgentEnder/pristine.git"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
