@@ -17,12 +17,29 @@ categories = ["command-line-utilities", "filesystem"]
 # Nx wiring is workspace machinery; it has no business inside the published crate.
 exclude = ["project.json"]
 
+# The library is `pristine` even though the package is `pristine-cli`, so `use pristine::…`
+# reads the same in the integration tests as it will in any downstream consumer.
+[lib]
+name = "pristine"
+path = "src/lib.rs"
+
 [[bin]]
 name = "pristine"
 path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
+# ripgrep's walker. It brings the parallel walk and the full gitignore stack in one
+# dependency; tier one uses the first half and tier two (#588) gets the second half free.
+ignore = "0.4.33"
+# Already in the tree via `ignore`, so the marker/target globs (`*.csproj`, `bazel-*`) cost
+# no new compilation.
+globset = "0.4.20"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.4"
+
+[dev-dependencies]
+tempfile = "3.27.0"
 
 [lints]
 workspace = true
