@@ -7,7 +7,7 @@
 
 // `allow-unwrap-in-tests` in clippy.toml only reaches code inside a `#[test]` function, and
 // the fixture helpers below sit outside one. An unwrap in a fixture is an assertion.
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
 use std::path::Path;
@@ -15,8 +15,25 @@ use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use pristine::{Hit, Ruleset, Size, SizeMode, Walker};
+use pristine::{Claim, Hit, Rule, Ruleset, Size, SizeMode, Walker};
 use tempfile::TempDir;
+
+/// Every fixture in this file is tier one, so a hit that carries no rule is a failure rather
+/// than a case to handle. Tier two has its own file.
+fn rule(hit: &Hit) -> &Rule {
+    hit.rule().expect("a tier-one hit carries its rule")
+}
+
+fn project_root(hit: &Hit) -> &Path {
+    match &hit.claim {
+        Claim::Rule(claim) => &claim.project_root,
+        Claim::Ignored(_) => panic!("expected a tier-one hit, got {:?}", hit.claim),
+    }
+}
+
+fn regenerate(hit: &Hit) -> &str {
+    hit.regenerate().expect("a tier-one hit names a command")
+}
 
 /// Creates `path` and every parent, then writes `bytes` bytes of filler into it.
 fn write(path: &Path, bytes: usize) {
@@ -91,7 +108,7 @@ fn scan_with(walker: &Walker) -> Vec<Hit> {
 
 /// The rule ids of every hit, in path order.
 fn rule_ids(root: &Path) -> Vec<String> {
-    scan(root).iter().map(|hit| hit.rule.id.clone()).collect()
+    scan(root).iter().map(|hit| rule(hit).id.clone()).collect()
 }
 
 #[test]
@@ -104,8 +121,8 @@ fn node_modules_beside_a_package_json_is_reclaimable() {
 
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].path, tmp.path().join("app/node_modules"));
-    assert_eq!(hits[0].project_root, tmp.path().join("app"));
-    assert_eq!(hits[0].rule.id, "node");
+    assert_eq!(project_root(&hits[0]), tmp.path().join("app"));
+    assert_eq!(rule(&hits[0]).id, "node");
 }
 
 #[test]
@@ -150,10 +167,10 @@ fn target_is_rust_or_maven_according_to_the_marker() {
     let hits = scan(tmp.path());
 
     assert_eq!(hits.len(), 2);
-    assert_eq!(hits[0].rule.id, "cargo");
-    assert_eq!(hits[0].regenerate, "cargo build");
-    assert_eq!(hits[1].rule.id, "maven");
-    assert_eq!(hits[1].regenerate, "mvn package");
+    assert_eq!(rule(&hits[0]).id, "cargo");
+    assert_eq!(regenerate(&hits[0]), "cargo build");
+    assert_eq!(rule(&hits[1]).id, "maven");
+    assert_eq!(regenerate(&hits[1]), "mvn package");
 }
 
 #[test]
@@ -189,9 +206,9 @@ fn a_cmake_build_directory_is_claimed_only_when_cmake_generated_it() {
 
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].path, tmp.path().join("engine/cmake-build-debug"));
-    assert_eq!(hits[0].rule.id, "cmake");
+    assert_eq!(rule(&hits[0]).id, "cmake");
     // Self-anchored, so the project root is the matched directory itself.
-    assert_eq!(hits[0].project_root, hits[0].path);
+    assert_eq!(project_root(&hits[0]), hits[0].path);
 }
 
 #[test]
@@ -217,8 +234,8 @@ fn a_multi_segment_target_matches_its_whole_path() {
 
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].path, tmp.path().join("api/vendor/bundle"));
-    assert_eq!(hits[0].rule.id, "bundler");
-    assert_eq!(hits[0].project_root, tmp.path().join("api"));
+    assert_eq!(rule(&hits[0]).id, "bundler");
+    assert_eq!(project_root(&hits[0]), tmp.path().join("api"));
 }
 
 #[test]
@@ -235,8 +252,8 @@ fn an_ancestor_anchored_rule_finds_caches_scattered_through_a_project() {
     let hits = scan(tmp.path());
 
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].rule.id, "python-caches");
-    assert_eq!(hits[0].project_root, tmp.path().join("lib"));
+    assert_eq!(rule(&hits[0]).id, "python-caches");
+    assert_eq!(project_root(&hits[0]), tmp.path().join("lib"));
 }
 
 #[test]
@@ -259,7 +276,7 @@ fn a_glob_marker_identifies_a_dotnet_project() {
     let hits = scan(tmp.path());
 
     assert_eq!(hits.len(), 2);
-    assert!(hits.iter().all(|hit| hit.rule.id == "dotnet"));
+    assert!(hits.iter().all(|hit| rule(hit).id == "dotnet"));
     assert!(
         hits.iter()
             .all(|hit| hit.path.starts_with(tmp.path().join("Svc")))
@@ -281,9 +298,9 @@ fn markers_required_all_needs_every_marker() {
 
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].path, tmp.path().join("whole/Library"));
-    assert_eq!(hits[0].rule.ecosystem, "Unity");
+    assert_eq!(rule(&hits[0]).ecosystem, "Unity");
     assert!(
-        hits[0].rule.note.is_some(),
+        rule(&hits[0]).note.is_some(),
         "the slow-reimport warning should survive"
     );
 }
@@ -329,7 +346,9 @@ fn the_git_directory_is_never_walked() {
             .join("repo/.git/modules/sub/node_modules/dep/index.js"),
     );
 
-    assert!(scan(tmp.path()).is_empty());
+    // Tier two off: this `.git` is a fixture rather than a repository, and tier two would
+    // rightly report that git refuses to answer for it. That report is its own test.
+    assert!(scan_with(&Walker::new(tmp.path(), ruleset()).fallback(false)).is_empty());
 }
 
 #[test]
@@ -342,7 +361,7 @@ fn every_hit_carries_its_regeneration_command_and_its_age() {
     let hit = &hits[0];
 
     // No lockfile at all, so the fallback — but still a command, not a menu.
-    assert_eq!(hit.regenerate, "npm install");
+    assert_eq!(regenerate(hit), "npm install");
     let modified = hit
         .modified
         .expect("a directory we just created has an mtime");
@@ -370,7 +389,7 @@ fn the_lockfile_decides_which_package_manager_a_node_hit_names() {
         let hits = scan(tmp.path());
 
         assert_eq!(hits.len(), 1, "{lockfile}");
-        assert_eq!(hits[0].regenerate, expected, "for {lockfile}");
+        assert_eq!(regenerate(&hits[0]), expected, "for {lockfile}");
     }
 }
 
@@ -395,8 +414,8 @@ fn a_workspace_lockfile_above_the_package_still_names_the_package_manager() {
         tmp.path().join("repo/packages/ui/node_modules")
     );
     // The claim still belongs to the package, but the command comes from the workspace.
-    assert_eq!(hits[0].project_root, tmp.path().join("repo/packages/ui"));
-    assert_eq!(hits[0].regenerate, "pnpm install");
+    assert_eq!(project_root(&hits[0]), tmp.path().join("repo/packages/ui"));
+    assert_eq!(regenerate(&hits[0]), "pnpm install");
 }
 
 #[test]
@@ -411,7 +430,7 @@ fn a_lockfile_above_the_scan_root_is_not_consulted() {
     let hits = scan(&tmp.path().join("repo"));
 
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].regenerate, "npm install");
+    assert_eq!(regenerate(&hits[0]), "npm install");
 }
 
 #[test]
@@ -541,7 +560,7 @@ fn a_hit_node_is_a_leaf_and_carries_its_rule() {
     let node = tree.node(id);
 
     assert!(node.children.is_empty());
-    assert_eq!(node.hit.as_ref().unwrap().rule.id, "node");
+    assert_eq!(rule(node.hit.as_ref().unwrap()).id, "node");
     assert_eq!(
         node.reclaimable,
         node.hit.as_ref().unwrap().size.bytes().unwrap()
@@ -634,5 +653,5 @@ fn a_user_rule_extends_the_built_in_set() {
     let hits = hits.into_inner().unwrap();
 
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].rule.id, "myecosystem");
+    assert_eq!(rule(&hits[0]).id, "myecosystem");
 }

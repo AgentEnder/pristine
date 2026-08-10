@@ -25,8 +25,23 @@
 //! evaluation, no path bookkeeping, one pass, on the walker thread that found the claim.
 //! Bytes are *allocated* blocks rather than apparent length, because allocated is what
 //! deleting gives back.
+//!
+//! ## The one thing a default scan does have to look at
+//!
+//! Tier two cannot claim a directory without walking it. Its size floor cannot be inferred, and
+//! neither can "holds no git repository" — which is a negative, and a negative is only proved
+//! by covering everything. So [`Measurer::survey`] walks in every mode, and tier-two claims
+//! carry a real size even on a default scan while tier-one claims do not.
+//!
+//! That is a smaller dent in the performance thesis than it sounds. For a candidate that is
+//! *claimed*, the survey replaces work the walk would have done anyway — the walker would have
+//! descended into all of it — with the same tight loop and no ignore stack or rule evaluation
+//! per entry. The cost is in the candidates that are refused, which get surveyed and then
+//! walked. Over `~/repos`: 2.9 s with tier two off, 4.1 s with it on, for 75 tier-two claims
+//! that arrive priced.
 
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -73,6 +88,21 @@ pub struct Measurement {
     pub unreadable: Vec<PathBuf>,
 }
 
+/// Everything one pass over a tier-two candidate found.
+#[derive(Debug, Clone, Default)]
+pub struct Survey {
+    /// The total. [`Size::Unmeasured`] only when the survey gave up early, which it does only
+    /// once `nested_repo` is set and the candidate is dead anyway.
+    pub size: Size,
+    /// A git repository living inside the candidate, if there is one. Its presence is what
+    /// stops the directory above it being removed wholesale.
+    pub nested_repo: Option<PathBuf>,
+    /// Entries that could not be read. Not merely a caveat on the total here: a survey that
+    /// could not see all of the subtree has not established `nested_repo` either, so the
+    /// caller has no grounds to claim the directory at all.
+    pub unreadable: Vec<PathBuf>,
+}
+
 /// Measures directories under a fixed policy.
 #[derive(Debug, Clone, Copy)]
 pub struct Measurer {
@@ -116,6 +146,55 @@ impl Measurer {
             return Measurement::default();
         }
 
+        let walked = self.walk(dir, metadata, false);
+        Measurement {
+            size: Size::Measured(walked.bytes),
+            unreadable: walked.unreadable,
+        }
+    }
+
+    /// One pass over a tier-two candidate, answering both questions the tier has left: how big
+    /// it is, and whether it holds a git repository.
+    ///
+    /// This walks whatever the mode is, because neither answer can be inferred, and it walks
+    /// the *whole* subtree. An earlier version stopped as soon as it had enough bytes to clear
+    /// the floor, which is much cheaper — and useless here, because "holds no repository" is a
+    /// negative and a negative is only proved by covering everything. The consolation is that
+    /// this pass is still cheaper than what the walker would have done had tier two not
+    /// claimed the directory at all: a tight `read_dir` + `lstat` loop with no ignore stack and
+    /// no rule evaluation, and then a prune.
+    ///
+    /// Because it always covers everything, a tier-two claim arrives with a real size even on a
+    /// default scan. Tier one's claims stay [`Size::Unmeasured`]: nothing forces the walk to
+    /// look inside those.
+    #[must_use]
+    pub fn survey(&self, dir: &Path, metadata: &fs::Metadata) -> Survey {
+        // A link is worth its own inode and nothing more, and one `lstat` — already done — is
+        // the whole truth about it.
+        if !metadata.is_dir() {
+            return Survey {
+                size: Size::Measured(allocated(metadata)),
+                nested_repo: None,
+                unreadable: Vec::new(),
+            };
+        }
+        let walked = self.walk(dir, metadata, true);
+        Survey {
+            size: if walked.nested_repo.is_some() {
+                Size::Unmeasured
+            } else {
+                Size::Measured(walked.bytes)
+            },
+            nested_repo: walked.nested_repo,
+            unreadable: walked.unreadable,
+        }
+    }
+
+    /// The one traversal, summing allocated blocks below `dir`.
+    ///
+    /// With `watch_for_repos` it also stops the moment it finds a `.git`, because whatever
+    /// asked for that has no further use for the total.
+    fn walk(self, dir: &Path, metadata: &fs::Metadata, watch_for_repos: bool) -> Walked {
         let mut bytes = allocated(metadata);
         let mut unreadable = Vec::new();
         let boundary = device(metadata);
@@ -132,6 +211,15 @@ impl Measurer {
             for entry in entries {
                 let Ok(entry) = entry else { continue };
                 let path = entry.path();
+                // A `.git` marks a checkout, and it counts whether it is a directory or the
+                // file a linked work tree and a submodule use.
+                if watch_for_repos && entry.file_name() == OsStr::new(".git") {
+                    return Walked {
+                        bytes,
+                        nested_repo: Some(current),
+                        unreadable,
+                    };
+                }
                 // `symlink_metadata`, never `metadata`: following a link would count bytes
                 // that live somewhere else and, if it pointed upward, would not terminate.
                 let Ok(metadata) = entry.path().symlink_metadata() else {
@@ -152,11 +240,21 @@ impl Measurer {
                 }
             }
         }
-        Measurement {
-            size: Size::Measured(bytes),
+        Walked {
+            bytes,
+            nested_repo: None,
             unreadable,
         }
     }
+}
+
+/// What one traversal came back with.
+struct Walked {
+    bytes: u64,
+    /// The directory holding the `.git` that stopped the walk, when one did. `bytes` is then a
+    /// lower bound rather than a total.
+    nested_repo: Option<PathBuf>,
+    unreadable: Vec<PathBuf>,
 }
 
 /// Bytes actually allocated on disk, which is what deleting gives back.
@@ -293,6 +391,54 @@ mod tests {
         let measured = Measurer::new(SizeMode::Skip).measure(&link, &metadata);
 
         assert!(measured.size.bytes().unwrap() < 1024 * 1024, "{measured:?}");
+    }
+
+    #[test]
+    fn a_survey_prices_the_whole_subtree_whatever_the_mode() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp, "a/one.bin", 256 * 1024);
+        write(&tmp, "a/b/two.bin", 256 * 1024);
+
+        let metadata = tmp.path().symlink_metadata().unwrap();
+        for mode in [SizeMode::Skip, SizeMode::Breakdown] {
+            let surveyed = Measurer::new(mode).survey(tmp.path(), &metadata);
+            assert!(surveyed.nested_repo.is_none());
+            assert!(
+                surveyed.size.bytes().unwrap() >= 512 * 1024,
+                "{mode:?}: {surveyed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_survey_stops_at_the_first_checkout_it_finds() {
+        let tmp = TempDir::new().unwrap();
+        let checkout = tmp.path().join("deep/checkout");
+        fs::create_dir_all(checkout.join(".git")).unwrap();
+        write(&tmp, "deep/checkout/src/main.rs", 1024);
+
+        let metadata = tmp.path().symlink_metadata().unwrap();
+        let surveyed = Measurer::new(SizeMode::Breakdown).survey(tmp.path(), &metadata);
+
+        assert_eq!(surveyed.nested_repo.as_deref(), Some(checkout.as_path()));
+        // The total is meaningless once the answer is "not removable", and reporting a lower
+        // bound as if it were a size would be worse than reporting nothing.
+        assert_eq!(surveyed.size, Size::Unmeasured);
+    }
+
+    #[test]
+    fn a_dot_git_file_marks_a_checkout_just_as_a_directory_does() {
+        // A linked work tree and a submodule both keep a `.git` *file* naming the real gitdir.
+        let tmp = TempDir::new().unwrap();
+        write(&tmp, "worktree/.git", 64);
+
+        let metadata = tmp.path().symlink_metadata().unwrap();
+        let surveyed = Measurer::new(SizeMode::Skip).survey(tmp.path(), &metadata);
+
+        assert_eq!(
+            surveyed.nested_repo.as_deref(),
+            Some(tmp.path().join("worktree").as_path())
+        );
     }
 
     /// Makes a directory unreadable, so that any traversal of it has to report a failure.

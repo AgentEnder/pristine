@@ -11,9 +11,10 @@ regenerates it before you decide.
 carrying `target/`, `.venv/`, `bin/`, `obj/`, `_build/`, `.gradle/` and `vendor/`, all equally
 reclaimable and all invisible to a tool that only knows about npm.
 
-> **Status: scaffold only.** `pristine --version` is the whole of the behaviour. The workspace,
-> toolchain and CI are in place; the walker, the ruleset and the TUI are not. The design is settled
-> and lives outside this repo.
+> **Status: a library, not yet a tool.** `pristine --version` is still the whole of the command
+> line. Behind it the parallel walker, both detection tiers and the rollup tree work and are
+> tested; the CLI, the deleter and the TUI are not written. The design is settled and lives
+> outside this repo.
 
 ## How it finds things
 
@@ -27,10 +28,20 @@ directory name plus a marker file that has to be present in its parent. `node_mo
 `package.json` is reclaimable. A `build` directory next to nothing in particular is not.
 
 **A gitignore fallback.** Inside a git work tree, a directory that is ignored, contains no tracked
-file at any depth, and exceeds a size floor is reclaimable by inference even when no rule names it.
-This is what makes the tool genuinely language-agnostic rather than agnostic across whichever
-ecosystems happened to get a rule written. The "no tracked files" condition is the safety property,
-and it is exactly the guarantee `git clean` enforces.
+file at any depth, holds no git checkout, and exceeds a size floor (10 MiB, `--min-size`) is
+reclaimable by inference even when no rule names it. This is what makes the tool genuinely
+language-agnostic rather than agnostic across whichever ecosystems happened to get a rule written.
+On one real machine it is what turns up `dist/`, `tmp/`, `artifacts/`, `playwright-report/`,
+`.angular/cache` and a downloaded `Godot.app` — none of which any ruleset names.
+
+The last two conditions are the safety properties, and both are guarantees `git clean` enforces:
+it will not remove a directory holding a tracked file, and it skips rather than collapses one
+holding a checkout. Outside a git work tree the tier is **inert**, and says so rather than
+reporting an empty result. With no repository the only signal left would be the directory's name,
+and a name is not evidence — guessing from one is how a cleaner deletes somebody's source.
+
+A tier-two hit reports that it does not know how to regenerate what it found. That asymmetry
+against tier one is the point: it tells you which deletions are cheap.
 
 ## Two modes
 

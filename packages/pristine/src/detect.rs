@@ -14,20 +14,12 @@ use std::sync::Arc;
 use globset::{Glob, GlobMatcher, GlobSet, GlobSetBuilder};
 
 use crate::rules::{Anchor, MarkersRequired, Rule, RuleError};
+use crate::walk::RuleClaim;
 
 /// How far up an `anchor = "ancestor"` rule will look before giving up. Deep enough for any
 /// real project layout, shallow enough that a pathological tree cannot make the search
 /// quadratic.
 const MAX_ANCESTOR_SEARCH: usize = 32;
-
-/// A directory the ruleset claims, the project that owns it, and the concrete command that
-/// brings it back.
-#[derive(Debug, Clone)]
-pub(crate) struct Detection {
-    pub(crate) rule: Arc<Rule>,
-    pub(crate) project_root: PathBuf,
-    pub(crate) regenerate: String,
-}
 
 /// The compiled ruleset.
 #[derive(Debug)]
@@ -137,7 +129,7 @@ impl Detector {
     ///
     /// Rules are evaluated in ruleset order and the first match wins, so a directory is
     /// claimed once even when two ecosystems could both explain it.
-    pub(crate) fn detect(&self, dir: &Path, scan_root: &Path, depth: usize) -> Option<Detection> {
+    pub(crate) fn detect(&self, dir: &Path, scan_root: &Path, depth: usize) -> Option<RuleClaim> {
         // A name that is not valid UTF-8 cannot equal any target we ship, all of which are
         // ASCII, so skipping it loses nothing.
         let name = dir.file_name()?.to_str()?;
@@ -171,7 +163,7 @@ impl Detector {
                 Anchor::Ancestor => compiled.nearest_marked_ancestor(parent_anchor, scan_root),
             };
             if let Some(project_root) = anchor {
-                return Some(Detection {
+                return Some(RuleClaim {
                     regenerate: compiled.regeneration_command(&project_root, scan_root),
                     rule: Arc::clone(&compiled.rule),
                     project_root,
