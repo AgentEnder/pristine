@@ -42,8 +42,8 @@
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::fs;
 use std::path::{Path, PathBuf};
+use std::{fs, io};
 
 /// What is known about a claim's size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -204,65 +204,114 @@ impl Measurer {
     /// With `watch_for_repos` it also stops the moment it finds a `.git`, because whatever
     /// asked for that has no further use for the total.
     fn walk(self, dir: &Path, metadata: &fs::Metadata, watch_for_repos: bool) -> Walked {
-        let mut bytes = allocated(metadata);
-        let mut unreadable = Vec::new();
-        let mut not_crossed = Vec::new();
-        let boundary = device(metadata);
-        // Multiply-linked files, so a hard-linked artefact is counted once per claim rather
-        // than once per link. Only populated by files that actually carry more than one
-        // link, which on an ordinary tree is none of them.
-        let mut linked = HashSet::new();
-        let mut stack = vec![dir.to_path_buf()];
-        while let Some(current) = stack.pop() {
-            let Ok(entries) = fs::read_dir(&current) else {
-                unreadable.push(current);
-                continue;
-            };
-            for entry in entries {
-                let Ok(entry) = entry else { continue };
-                let path = entry.path();
-                // A `.git` marks a checkout, and it counts whether it is a directory or the
-                // file a linked work tree and a submodule use.
-                if watch_for_repos && entry.file_name() == OsStr::new(".git") {
-                    return Walked {
-                        bytes,
-                        nested_repo: Some(current),
-                        unreadable,
-                        not_crossed,
-                    };
-                }
-                // `symlink_metadata`, never `metadata`: following a link would count bytes
-                // that live somewhere else and, if it pointed upward, would not terminate.
-                let Ok(metadata) = entry.path().symlink_metadata() else {
-                    unreadable.push(path);
-                    continue;
-                };
-                if self.same_file_system && device(&metadata) != boundary {
-                    // A mount point. `measure` may pass over one silently, because there it
-                    // only makes a size a lower bound. A survey may not: everything under the
-                    // mount is unseen, including a `.git`, so passing over it silently would
-                    // let "holds no repository" be asserted about ground nobody looked at.
-                    if watch_for_repos && metadata.is_dir() {
-                        not_crossed.push(path);
-                    }
-                    continue;
-                }
-                if let Some(identity) = multiply_linked(&metadata) {
-                    if !linked.insert(identity) {
-                        continue;
+        let mut pass = Pass {
+            bytes: allocated(metadata),
+            boundary: device(metadata),
+            watch_for_repos,
+            ..Pass::default()
+        };
+        pass.stack.push(dir.to_path_buf());
+
+        while let Some(current) = pass.stack.pop() {
+            match fs::read_dir(&current) {
+                Ok(entries) => {
+                    if let Some(repo) = self.absorb(&current, entries, &mut pass) {
+                        return pass.stopped_at(repo);
                     }
                 }
-                bytes += allocated(&metadata);
-                if metadata.is_dir() {
-                    stack.push(path);
-                }
+                Err(_) => pass.unreadable.push(current),
             }
         }
+        pass.finished()
+    }
+
+    /// Folds one directory's entries into `pass`, returning the directory when a `.git` among
+    /// them ends the walk.
+    ///
+    /// Split out of [`Measurer::walk`] so its error branch can be driven by a hand-made
+    /// iterator. `readdir` failing part-way through a directory it had already opened is not
+    /// something a test can arrange on a real filesystem, and it is the branch that most needs
+    /// one.
+    fn absorb<I>(self, current: &Path, entries: I, pass: &mut Pass) -> Option<PathBuf>
+    where
+        I: IntoIterator<Item = io::Result<fs::DirEntry>>,
+    {
+        for entry in entries {
+            // `readdir` gave up part-way through a directory it had opened, so this listing
+            // is short by an unknown amount. An earlier version skipped the entry, which left
+            // the survey looking complete and let a caller claim a directory nobody had
+            // finished reading.
+            let Ok(entry) = entry else {
+                pass.unreadable.push(current.to_path_buf());
+                continue;
+            };
+            let path = entry.path();
+            // A `.git` marks a checkout, and it counts whether it is a directory or the
+            // file a linked work tree and a submodule use.
+            if pass.watch_for_repos && entry.file_name() == OsStr::new(".git") {
+                return Some(current.to_path_buf());
+            }
+            // `symlink_metadata`, never `metadata`: following a link would count bytes
+            // that live somewhere else and, if it pointed upward, would not terminate.
+            let Ok(metadata) = path.symlink_metadata() else {
+                pass.unreadable.push(path);
+                continue;
+            };
+            if self.same_file_system && device(&metadata) != pass.boundary {
+                // A mount point. `measure` may pass over one silently, because there it
+                // only makes a size a lower bound. A survey may not: everything under the
+                // mount is unseen, including a `.git`, so passing over it silently would
+                // let "holds no repository" be asserted about ground nobody looked at.
+                if pass.watch_for_repos && metadata.is_dir() {
+                    pass.not_crossed.push(path);
+                }
+                continue;
+            }
+            if let Some(identity) = multiply_linked(&metadata) {
+                if !pass.linked.insert(identity) {
+                    continue;
+                }
+            }
+            pass.bytes += allocated(&metadata);
+            if metadata.is_dir() {
+                pass.stack.push(path);
+            }
+        }
+        None
+    }
+}
+
+/// The running state of one traversal.
+#[derive(Debug, Default)]
+struct Pass {
+    bytes: u64,
+    boundary: u64,
+    watch_for_repos: bool,
+    unreadable: Vec<PathBuf>,
+    not_crossed: Vec<PathBuf>,
+    /// Multiply-linked files, so a hard-linked artefact is counted once per claim rather than
+    /// once per link. Only populated by files that actually carry more than one link, which on
+    /// an ordinary tree is none of them.
+    linked: HashSet<(u64, u64)>,
+    stack: Vec<PathBuf>,
+}
+
+impl Pass {
+    fn stopped_at(self, nested_repo: PathBuf) -> Walked {
         Walked {
-            bytes,
+            bytes: self.bytes,
+            nested_repo: Some(nested_repo),
+            unreadable: self.unreadable,
+            not_crossed: self.not_crossed,
+        }
+    }
+
+    fn finished(self) -> Walked {
+        Walked {
+            bytes: self.bytes,
             nested_repo: None,
-            unreadable,
-            not_crossed,
+            unreadable: self.unreadable,
+            not_crossed: self.not_crossed,
         }
     }
 }
@@ -321,8 +370,8 @@ fn multiply_linked(_metadata: &fs::Metadata) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::{Measurer, Size, SizeMode};
-    use std::fs;
     use std::path::Path;
+    use std::{fs, io};
     use tempfile::TempDir;
 
     fn write(dir: &TempDir, name: &str, bytes: usize) {
@@ -445,6 +494,26 @@ mod tests {
         // The total is meaningless once the answer is "not removable", and reporting a lower
         // bound as if it were a size would be worse than reporting nothing.
         assert_eq!(surveyed.size, Size::Unmeasured);
+    }
+
+    #[test]
+    fn a_directory_that_stops_listing_part_way_through_is_reported_as_unread() {
+        // `readdir` can fail after the directory was opened, and the listing is then short by
+        // an unknown amount. Skipping the entry — which an earlier version did — left the
+        // survey looking complete, so a caller would go on to claim a directory nobody had
+        // finished reading. No filesystem can be talked into this on demand, hence the
+        // hand-made iterator.
+        let tmp = TempDir::new().unwrap();
+        let mut pass = super::Pass {
+            watch_for_repos: true,
+            ..super::Pass::default()
+        };
+        let entries = vec![Err(io::Error::other("readdir gave up"))];
+
+        let stopped = Measurer::new(SizeMode::Skip).absorb(tmp.path(), entries, &mut pass);
+
+        assert!(stopped.is_none());
+        assert_eq!(pass.unreadable, [tmp.path().to_path_buf()]);
     }
 
     #[test]

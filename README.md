@@ -11,10 +11,25 @@ regenerates it before you decide.
 carrying `target/`, `.venv/`, `bin/`, `obj/`, `_build/`, `.gradle/` and `vendor/`, all equally
 reclaimable and all invisible to a tool that only knows about npm.
 
-> **Status: a library, not yet a tool.** `pristine --version` is still the whole of the command
-> line. Behind it the parallel walker, both detection tiers and the rollup tree work and are
-> tested; the CLI, the deleter and the TUI are not written. The design is settled and lives
+> **Status: it finds, it does not yet clean.** The parallel walker, both detection tiers and the
+> rollup tree work and are tested. The deleter and the rollup tree TUI are not written, so
+> nothing is deleted and the front end is a plain listing. The design is settled and lives
 > outside this repo.
+
+```console
+$ pristine ~/repos/pua
+  59.1 MiB  .nx                       no known way to regenerate this
+         —  dist                      nx reset, then rebuild
+         —  node_modules              pnpm install
+         —  target                    cargo build
+
+5 directories reclaimable, 59.1 MiB priced, 4 not priced
+fallback tier: 1 directory found in 1 work tree above a 10.0 MiB floor
+```
+
+A dash is not a zero: nothing looked inside, because a matched directory is never enumerated by
+the scan that found it. The fallback tier's rows do carry a size, because that tier cannot claim
+a directory without walking it.
 
 ## How it finds things
 
