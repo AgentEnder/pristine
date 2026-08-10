@@ -66,12 +66,33 @@ pub struct Rule {
     /// Where the markers are looked for.
     #[serde(default)]
     pub anchor: Anchor,
-    /// The command that brings the directory back. Mandatory: it is what turns "is this safe
-    /// to delete" into "am I willing to pay for it".
+    /// The command that brings the directory back when nothing in `regenerate_when` applies.
+    /// Mandatory: it is what turns "is this safe to delete" into "am I willing to pay for it".
     pub regenerate: String,
+    /// Refinements of `regenerate`, chosen by a marker found at or above the project root.
+    /// The first entry whose marker is found wins.
+    #[serde(default)]
+    pub regenerate_when: Vec<RegenerateWhen>,
     /// An optional caveat to surface next to the hit.
     #[serde(default)]
     pub note: Option<String>,
+}
+
+/// A more specific regeneration command, unlocked by the presence of a marker.
+///
+/// `node_modules` is the case this exists for. "npm ci / pnpm install / yarn — whichever
+/// lockfile is present" is a sentence, not a command: it cannot be run, and it leaves the
+/// user to work out something the filesystem already knows. A `pnpm-lock.yaml` beside (or
+/// above) the `package.json` settles it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegenerateWhen {
+    /// The file whose presence selects this command. Searched for at the project root and
+    /// then upward, because a workspace keeps one lockfile at its root while every package
+    /// under it has its own `package.json` and its own `node_modules`.
+    pub marker: String,
+    /// The command to report instead.
+    pub regenerate: String,
 }
 
 /// A parsed, validated and compiled set of rules.
@@ -181,6 +202,18 @@ impl Ruleset {
             }
             if rule.targets.is_empty() {
                 return Err(RuleError::NoTargets(rule.id.clone()));
+            }
+            // Searched for by `stat` rather than by listing, so a glob would silently never
+            // match. Refuse it instead.
+            if let Some(when) = rule
+                .regenerate_when
+                .iter()
+                .find(|when| when.marker.contains(['*', '?', '[', '{']))
+            {
+                return Err(RuleError::Glob(
+                    when.marker.clone(),
+                    "a regenerate_when marker is looked up by name and cannot be a glob".to_owned(),
+                ));
             }
             if let Some(other) = rules.iter().filter(|r| r.id == rule.id).nth(1) {
                 return Err(RuleError::DuplicateId(other.id.clone()));

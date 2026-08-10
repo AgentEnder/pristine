@@ -1,46 +1,72 @@
-//! How many bytes a claimed directory is actually worth.
+//! How many bytes a claimed directory is worth, and why a normal scan does not ask.
 //!
-//! ## Why the default traverses, and what the design doc says
+//! ## The default is not to measure
 //!
-//! The concept doc asks for "sizes from the directory's own block accounting where the
-//! platform offers it; a full walk only when the user asks for a breakdown". No platform
-//! pristine targets offers it. A directory inode's block count on APFS, ext4, btrfs and ZFS
-//! alike describes the directory *entry table*, not the tree beneath it — that is why `du`
-//! walks — so taking it literally would report a 40 GB `node_modules` as about 48 KB and
-//! make the rollup tree's headline number meaningless. [`SizeMode::DirectoryOnly`] exposes
-//! that reading for anyone who wants instant, honest-but-useless numbers; the default is
-//! [`SizeMode::Recursive`].
+//! Prune-on-match is the whole performance thesis, and a recursive measurement would undo it:
+//! sizing `node_modules` means enumerating the tens of thousands of inodes the scan just
+//! declined to walk. So a normal scan records the claim and reports [`Size::Unmeasured`]. The
+//! traversal happens only under [`SizeMode::Breakdown`], which is what "the user asked for a
+//! breakdown" compiles down to.
 //!
-//! The performance thesis survives intact, because it was never really about *whether* the
-//! subtree is visited but about *how*. npkill sizes `node_modules` by running it through the
-//! same scan that found it. pristine prunes there and hands the subtree to the tight
-//! `read_dir` + `lstat` loop below: no ignore stack, no rule evaluation, no path
-//! bookkeeping, one pass, and each claim measured on the walker thread that found it, so the
-//! measurements are already spread across the pool.
+//! ## Why not the directory's own block accounting
 //!
-//! Bytes are *allocated* bytes (`st_blocks * 512`) rather than apparent length, because
-//! allocated is what deleting the tree gives back.
+//! The concept doc asked for "sizes from the directory's own block accounting where the
+//! platform offers it". No platform pristine targets offers a *recursive* one. A directory
+//! inode's block count on APFS, ext4, btrfs and ZFS alike describes the directory's own entry
+//! table, not the tree beneath it — which is why `du` walks. Reporting it as the claim's size
+//! would call a 40 GB `node_modules` about 48 KB, so the honest answer is `Unmeasured` rather
+//! than a number that is wrong by six orders of magnitude.
+//!
+//! A claim that is a *symlink* — Bazel's `bazel-*` — is different: `lstat` is the complete
+//! answer for a link in constant time, so those are measured even in the default mode.
+//!
+//! When a breakdown is asked for, the subtree goes through the tight `read_dir` + `lstat`
+//! loop below rather than back through the scan that found it: no ignore stack, no rule
+//! evaluation, no path bookkeeping, one pass, on the walker thread that found the claim.
+//! Bytes are *allocated* blocks rather than apparent length, because allocated is what
+//! deleting gives back.
 
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// How much work a measurement is allowed to do.
+/// What is known about a claim's size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Size {
+    /// Not measured, because the scan pruned here instead of enumerating the subtree. Not a
+    /// failure and not a zero: ask for a breakdown to turn it into a number.
+    #[default]
+    Unmeasured,
+    /// Allocated bytes, summed over everything beneath the claim.
+    Measured(u64),
+}
+
+impl Size {
+    /// The byte count, or `None` when nothing was measured.
+    #[must_use]
+    pub fn bytes(self) -> Option<u64> {
+        match self {
+            Self::Unmeasured => None,
+            Self::Measured(bytes) => Some(bytes),
+        }
+    }
+}
+
+/// How much work a scan may do to size what it claims.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SizeMode {
-    /// Sum the allocated blocks of everything beneath the directory. One metadata-only pass.
+    /// Record claims without enumerating them. The default, and the performance thesis.
     #[default]
-    Recursive,
-    /// The directory's own inode allocation, with no traversal at all. Constant time, and
-    /// describes the directory entry table rather than its contents.
-    DirectoryOnly,
+    Skip,
+    /// Sum each claim's subtree. What "show me a breakdown" costs.
+    Breakdown,
 }
 
 /// The result of measuring one directory.
 #[derive(Debug, Clone, Default)]
 pub struct Measurement {
-    /// Allocated bytes.
-    pub bytes: u64,
+    /// What is known about the size.
+    pub size: Size,
     /// Entries that could not be read, so the total is a lower bound. Reported rather than
     /// swallowed: a number that silently excludes an unreadable half of the tree is worse
     /// than one labelled incomplete.
@@ -73,18 +99,25 @@ impl Measurer {
     }
 
     /// Measures `dir`, whose metadata the caller already has from the walk.
+    ///
+    /// Returns without touching the filesystem under [`SizeMode::Skip`], which is the point.
     #[must_use]
     pub fn measure(&self, dir: &Path, metadata: &fs::Metadata) -> Measurement {
-        let mut measurement = Measurement {
-            bytes: allocated(metadata),
-            unreadable: Vec::new(),
-        };
-        // A symlinked claim (Bazel's `bazel-*`) is worth its own inode and nothing more: the
-        // bytes are in the output base, which is outside the tree and not ours to delete.
-        if self.mode == SizeMode::DirectoryOnly || !metadata.is_dir() {
-            return measurement;
+        // A symlinked claim is worth its own inode and nothing more: the bytes are wherever
+        // it points, which is outside the tree and not ours to delete. One `lstat` — already
+        // done — is the complete answer, so it needs no traversal and no opt-in.
+        if !metadata.is_dir() {
+            return Measurement {
+                size: Size::Measured(allocated(metadata)),
+                unreadable: Vec::new(),
+            };
+        }
+        if self.mode == SizeMode::Skip {
+            return Measurement::default();
         }
 
+        let mut bytes = allocated(metadata);
+        let mut unreadable = Vec::new();
         let boundary = device(metadata);
         // Multiply-linked files, so a hard-linked artefact is counted once per claim rather
         // than once per link. Only populated by files that actually carry more than one
@@ -93,7 +126,7 @@ impl Measurer {
         let mut stack = vec![dir.to_path_buf()];
         while let Some(current) = stack.pop() {
             let Ok(entries) = fs::read_dir(&current) else {
-                measurement.unreadable.push(current);
+                unreadable.push(current);
                 continue;
             };
             for entry in entries {
@@ -102,7 +135,7 @@ impl Measurer {
                 // `symlink_metadata`, never `metadata`: following a link would count bytes
                 // that live somewhere else and, if it pointed upward, would not terminate.
                 let Ok(metadata) = entry.path().symlink_metadata() else {
-                    measurement.unreadable.push(path);
+                    unreadable.push(path);
                     continue;
                 };
                 if self.same_file_system && device(&metadata) != boundary {
@@ -113,13 +146,16 @@ impl Measurer {
                         continue;
                     }
                 }
-                measurement.bytes += allocated(&metadata);
+                bytes += allocated(&metadata);
                 if metadata.is_dir() {
                     stack.push(path);
                 }
             }
         }
-        measurement
+        Measurement {
+            size: Size::Measured(bytes),
+            unreadable,
+        }
     }
 }
 
@@ -166,7 +202,7 @@ fn multiply_linked(_metadata: &fs::Metadata) -> Option<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Measurer, SizeMode};
+    use super::{Measurer, Size, SizeMode};
     use std::fs;
     use tempfile::TempDir;
 
@@ -177,27 +213,52 @@ mod tests {
     }
 
     #[test]
-    fn a_recursive_measurement_sums_the_whole_subtree() {
+    fn a_breakdown_sums_the_whole_subtree() {
         let tmp = TempDir::new().unwrap();
         write(&tmp, "a/one.bin", 64 * 1024);
         write(&tmp, "a/b/two.bin", 64 * 1024);
 
         let metadata = tmp.path().symlink_metadata().unwrap();
-        let measured = Measurer::new(SizeMode::Recursive).measure(tmp.path(), &metadata);
+        let measured = Measurer::new(SizeMode::Breakdown).measure(tmp.path(), &metadata);
 
-        assert!(measured.bytes >= 128 * 1024, "got {}", measured.bytes);
+        assert!(measured.size.bytes().unwrap() >= 128 * 1024, "{measured:?}");
         assert!(measured.unreadable.is_empty());
     }
 
     #[test]
-    fn a_directory_only_measurement_ignores_the_contents() {
+    fn the_default_mode_reports_unmeasured_without_reading_anything() {
         let tmp = TempDir::new().unwrap();
         write(&tmp, "a/big.bin", 4 * 1024 * 1024);
+        // Unreadable, so any traversal would have to report it. Silence is the proof.
+        let sealed = tmp.path().join("sealed");
+        fs::create_dir(&sealed).unwrap();
+        seal(&sealed);
 
         let metadata = tmp.path().symlink_metadata().unwrap();
-        let measured = Measurer::new(SizeMode::DirectoryOnly).measure(tmp.path(), &metadata);
+        let measured = Measurer::new(SizeMode::Skip).measure(tmp.path(), &metadata);
+        unseal(&sealed);
 
-        assert!(measured.bytes < 1024 * 1024, "got {}", measured.bytes);
+        assert_eq!(measured.size, Size::Unmeasured);
+        assert!(measured.unreadable.is_empty(), "{measured:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_breakdown_reports_what_it_could_not_read() {
+        let tmp = TempDir::new().unwrap();
+        let sealed = tmp.path().join("sealed");
+        fs::create_dir(&sealed).unwrap();
+        seal(&sealed);
+        if fs::read_dir(&sealed).is_ok() {
+            unseal(&sealed);
+            return; // running as root, where permissions prove nothing
+        }
+
+        let metadata = tmp.path().symlink_metadata().unwrap();
+        let measured = Measurer::new(SizeMode::Breakdown).measure(tmp.path(), &metadata);
+        unseal(&sealed);
+
+        assert_eq!(measured.unreadable, [sealed]);
     }
 
     #[cfg(unix)]
@@ -206,20 +267,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write(&tmp, "a/artifact.bin", 512 * 1024);
         let metadata = tmp.path().symlink_metadata().unwrap();
-        let measurer = Measurer::new(SizeMode::Recursive);
-        let once = measurer.measure(tmp.path(), &metadata).bytes;
+        let measurer = Measurer::new(SizeMode::Breakdown);
+        let once = measurer.measure(tmp.path(), &metadata).size;
 
         fs::hard_link(
             tmp.path().join("a/artifact.bin"),
             tmp.path().join("a/copy.bin"),
         )
         .unwrap();
-        let twice = measurer.measure(tmp.path(), &metadata).bytes;
+        let twice = measurer.measure(tmp.path(), &metadata).size;
 
-        assert_eq!(
-            once, twice,
-            "the second link added its target's blocks again"
-        );
+        assert_eq!(once, twice, "the second link added its blocks again");
     }
 
     #[cfg(unix)]
@@ -231,12 +289,29 @@ mod tests {
         std::os::unix::fs::symlink(tmp.path().join("elsewhere"), &link).unwrap();
 
         let metadata = link.symlink_metadata().unwrap();
-        let measured = Measurer::new(SizeMode::Recursive).measure(&link, &metadata);
+        // Even the default mode measures a link: one `lstat` is the whole truth about it.
+        let measured = Measurer::new(SizeMode::Skip).measure(&link, &metadata);
 
-        assert!(
-            measured.bytes < 1024 * 1024,
-            "the link was followed: {}",
-            measured.bytes
-        );
+        assert!(measured.size.bytes().unwrap() < 1024 * 1024, "{measured:?}");
     }
+
+    /// Makes a directory unreadable, so that any traversal of it has to report a failure.
+    #[cfg(unix)]
+    fn seal(dir: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+    }
+
+    /// Puts the permissions back, so the temporary directory can still be cleaned up.
+    #[cfg(unix)]
+    fn unseal(dir: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn seal(_dir: &std::path::Path) {}
+
+    #[cfg(not(unix))]
+    fn unseal(_dir: &std::path::Path) {}
 }

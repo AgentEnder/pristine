@@ -15,7 +15,7 @@ use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use pristine::{Hit, Ruleset, SizeMode, Walker};
+use pristine::{Hit, Ruleset, Size, SizeMode, Walker};
 use tempfile::TempDir;
 
 /// Creates `path` and every parent, then writes `bytes` bytes of filler into it.
@@ -37,10 +37,48 @@ fn ruleset() -> Arc<Ruleset> {
     Arc::new(Ruleset::builtin().unwrap())
 }
 
+/// A walker that measures, for the tests that need real byte counts.
+fn breakdown(root: &Path) -> Walker {
+    Walker::new(root, ruleset()).size_mode(SizeMode::Breakdown)
+}
+
+/// Makes a directory unreadable, so any traversal of it has to report a failure. Returns
+/// false when the process can read it anyway, which means it is running as root.
+#[cfg(unix)]
+fn seal(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+    fs::read_dir(dir).is_err()
+}
+
+/// Puts the permissions back, so the temporary directory can still be cleaned up.
+#[cfg(unix)]
+fn unseal(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(not(unix))]
+fn seal(_dir: &Path) -> bool {
+    false
+}
+
+#[cfg(not(unix))]
+fn unseal(_dir: &Path) {}
+
 /// Runs a default walk and returns the hits in a deterministic order.
 fn scan(root: &Path) -> Vec<Hit> {
+    scan_with(&Walker::new(root, ruleset()))
+}
+
+/// Runs a walk that asks for sizes, which a default one does not.
+fn scan_with_sizes(root: &Path) -> Vec<Hit> {
+    scan_with(&breakdown(root))
+}
+
+fn scan_with(walker: &Walker) -> Vec<Hit> {
     let hits = Mutex::new(Vec::new());
-    let outcome = Walker::new(root, ruleset()).run(|hit| hits.lock().unwrap().push(hit));
+    let outcome = walker.run(|hit| hits.lock().unwrap().push(hit));
     assert!(
         outcome.errors.is_empty(),
         "unexpected: {:?}",
@@ -113,9 +151,9 @@ fn target_is_rust_or_maven_according_to_the_marker() {
 
     assert_eq!(hits.len(), 2);
     assert_eq!(hits[0].rule.id, "cargo");
-    assert_eq!(hits[0].rule.regenerate, "cargo build");
+    assert_eq!(hits[0].regenerate, "cargo build");
     assert_eq!(hits[1].rule.id, "maven");
-    assert_eq!(hits[1].rule.regenerate, "mvn package");
+    assert_eq!(hits[1].regenerate, "mvn package");
 }
 
 #[test]
@@ -251,6 +289,36 @@ fn markers_required_all_needs_every_marker() {
 }
 
 #[test]
+fn an_unreal_build_directory_is_left_alone_because_it_holds_authored_files() {
+    let tmp = TempDir::new().unwrap();
+    touch(&tmp.path().join("game/Game.uproject"));
+    // Authored per-platform build configuration. A `.uproject` beside it proves the project's
+    // type, not that this directory is output — the same mistake as matching a bare `build`.
+    touch(&tmp.path().join("game/Build/IOS/game.entitlements"));
+    touch(&tmp.path().join("game/Build/Android/AndroidManifest.xml"));
+    // Logs, configs and autosaves, likewise not regenerable by rebuilding.
+    touch(&tmp.path().join("game/Saved/Autosaves/level.umap"));
+    // These really are output.
+    touch(&tmp.path().join("game/Intermediate/Build/obj.o"));
+    touch(&tmp.path().join("game/Binaries/Mac/game.dylib"));
+    touch(&tmp.path().join("game/DerivedDataCache/blob"));
+
+    let claimed: Vec<_> = scan(tmp.path())
+        .iter()
+        .map(|hit| hit.path.strip_prefix(tmp.path()).unwrap().to_owned())
+        .collect();
+
+    assert_eq!(
+        claimed,
+        [
+            Path::new("game/Binaries"),
+            Path::new("game/DerivedDataCache"),
+            Path::new("game/Intermediate"),
+        ]
+    );
+}
+
+#[test]
 fn the_git_directory_is_never_walked() {
     let tmp = TempDir::new().unwrap();
     mkdir(&tmp.path().join("repo/.git"));
@@ -273,10 +341,8 @@ fn every_hit_carries_its_regeneration_command_and_its_age() {
     let hits = scan(tmp.path());
     let hit = &hits[0];
 
-    assert_eq!(
-        hit.rule.regenerate,
-        "npm ci / pnpm install / yarn — whichever lockfile is present"
-    );
+    // No lockfile at all, so the fallback — but still a command, not a menu.
+    assert_eq!(hit.regenerate, "npm install");
     let modified = hit
         .modified
         .expect("a directory we just created has an mtime");
@@ -287,7 +353,116 @@ fn every_hit_carries_its_regeneration_command_and_its_age() {
 }
 
 #[test]
-fn a_recursive_measurement_covers_the_whole_claimed_subtree() {
+fn the_lockfile_decides_which_package_manager_a_node_hit_names() {
+    for (lockfile, expected) in [
+        ("pnpm-lock.yaml", "pnpm install"),
+        ("yarn.lock", "yarn install"),
+        ("package-lock.json", "npm ci"),
+        ("npm-shrinkwrap.json", "npm ci"),
+        ("bun.lockb", "bun install"),
+        ("deno.lock", "deno install"),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        touch(&tmp.path().join("app/package.json"));
+        touch(&tmp.path().join("app").join(lockfile));
+        touch(&tmp.path().join("app/node_modules/dep/index.js"));
+
+        let hits = scan(tmp.path());
+
+        assert_eq!(hits.len(), 1, "{lockfile}");
+        assert_eq!(hits[0].regenerate, expected, "for {lockfile}");
+    }
+}
+
+#[test]
+fn a_workspace_lockfile_above_the_package_still_names_the_package_manager() {
+    let tmp = TempDir::new().unwrap();
+    // The shape every pnpm/nx/turbo monorepo has: one lockfile at the root, a package.json
+    // and a node_modules per package. Looking only beside the package.json finds nothing.
+    touch(&tmp.path().join("repo/pnpm-lock.yaml"));
+    touch(&tmp.path().join("repo/package.json"));
+    touch(&tmp.path().join("repo/packages/ui/package.json"));
+    touch(
+        &tmp.path()
+            .join("repo/packages/ui/node_modules/dep/index.js"),
+    );
+
+    let hits = scan(tmp.path());
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].path,
+        tmp.path().join("repo/packages/ui/node_modules")
+    );
+    // The claim still belongs to the package, but the command comes from the workspace.
+    assert_eq!(hits[0].project_root, tmp.path().join("repo/packages/ui"));
+    assert_eq!(hits[0].regenerate, "pnpm install");
+}
+
+#[test]
+fn a_lockfile_above_the_scan_root_is_not_consulted() {
+    let tmp = TempDir::new().unwrap();
+    touch(&tmp.path().join("pnpm-lock.yaml"));
+    touch(&tmp.path().join("repo/package.json"));
+    touch(&tmp.path().join("repo/node_modules/dep/index.js"));
+
+    // Scanning `repo` alone: the lockfile is outside the tree we were pointed at, so it is
+    // not evidence we are entitled to use.
+    let hits = scan(&tmp.path().join("repo"));
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].regenerate, "npm install");
+}
+
+#[test]
+fn a_default_scan_records_claims_without_pricing_them() {
+    let tmp = TempDir::new().unwrap();
+    touch(&tmp.path().join("app/package.json"));
+    write(
+        &tmp.path().join("app/node_modules/a/big.bin"),
+        4 * 1024 * 1024,
+    );
+
+    let (tree, outcome) = Walker::new(tmp.path(), ruleset()).run_to_tree();
+
+    assert_eq!(outcome.hits, 1);
+    assert_eq!(outcome.unmeasured, 1);
+    assert_eq!(outcome.reclaimable_bytes, 0);
+    assert_eq!(tree.unmeasured(), 1);
+    let id = tree.find(&tmp.path().join("app/node_modules")).unwrap();
+    assert_eq!(tree.node(id).hit.as_ref().unwrap().size, Size::Unmeasured);
+}
+
+#[test]
+fn a_default_scan_does_not_read_inside_what_it_claims() {
+    let tmp = TempDir::new().unwrap();
+    touch(&tmp.path().join("app/package.json"));
+    // An unreadable directory inside the claim. Any traversal of the claim has to report it,
+    // so silence is the proof that nothing traversed.
+    let sealed = tmp.path().join("app/node_modules/sealed");
+    fs::create_dir_all(&sealed).unwrap();
+    if !seal(&sealed) {
+        return; // running as root, where permissions prove nothing
+    }
+
+    let outcome = Walker::new(tmp.path(), ruleset()).run(drop);
+    let breakdown = Walker::new(tmp.path(), ruleset())
+        .size_mode(SizeMode::Breakdown)
+        .run(drop);
+    unseal(&sealed);
+
+    assert_eq!(outcome.hits, 1);
+    assert!(
+        outcome.errors.is_empty(),
+        "the claim was read: {:?}",
+        outcome.errors
+    );
+    // And the same fixture under Breakdown does report it, so the fixture is discriminating.
+    assert_eq!(breakdown.errors.len(), 1, "{:?}", breakdown.errors);
+}
+
+#[test]
+fn a_breakdown_covers_the_whole_claimed_subtree_and_nothing_else() {
     let tmp = TempDir::new().unwrap();
     touch(&tmp.path().join("app/package.json"));
     write(&tmp.path().join("app/node_modules/a/big.bin"), 512 * 1024);
@@ -295,10 +470,10 @@ fn a_recursive_measurement_covers_the_whole_claimed_subtree() {
     // Outside the claim, so it must not be counted.
     write(&tmp.path().join("app/src/big.bin"), 4 * 1024 * 1024);
 
-    let hits = scan(tmp.path());
+    let hits = scan_with_sizes(tmp.path());
 
     assert_eq!(hits.len(), 1);
-    let size = hits[0].size;
+    let size = hits[0].size.bytes().unwrap();
     assert!(
         size >= 1024 * 1024,
         "expected at least the 1 MiB written, got {size}"
@@ -310,29 +485,6 @@ fn a_recursive_measurement_covers_the_whole_claimed_subtree() {
 }
 
 #[test]
-fn directory_only_measurement_does_not_traverse_the_claim() {
-    let tmp = TempDir::new().unwrap();
-    touch(&tmp.path().join("app/package.json"));
-    write(
-        &tmp.path().join("app/node_modules/a/big.bin"),
-        4 * 1024 * 1024,
-    );
-
-    let hits = Mutex::new(Vec::new());
-    Walker::new(tmp.path(), ruleset())
-        .size_mode(SizeMode::DirectoryOnly)
-        .run(|hit| hits.lock().unwrap().push(hit));
-    let hits = hits.into_inner().unwrap();
-
-    assert_eq!(hits.len(), 1);
-    assert!(
-        hits[0].size < 4 * 1024 * 1024,
-        "DirectoryOnly reported {} bytes, so it walked the subtree",
-        hits[0].size
-    );
-}
-
-#[test]
 fn the_tree_rolls_reclaimable_bytes_up_into_every_ancestor() {
     let tmp = TempDir::new().unwrap();
     touch(&tmp.path().join("repos/a/package.json"));
@@ -340,7 +492,7 @@ fn the_tree_rolls_reclaimable_bytes_up_into_every_ancestor() {
     touch(&tmp.path().join("repos/b/Cargo.toml"));
     write(&tmp.path().join("repos/b/target/big.bin"), 256 * 1024);
 
-    let (tree, outcome) = Walker::new(tmp.path(), ruleset()).run_to_tree();
+    let (tree, outcome) = breakdown(tmp.path()).run_to_tree();
 
     assert_eq!(outcome.hits, 2);
     assert_eq!(tree.reclaimable(), outcome.reclaimable_bytes);
@@ -367,7 +519,7 @@ fn the_tree_holds_only_paths_that_lead_to_something_reclaimable() {
     // An ordinary source tree with nothing to reclaim anywhere beneath it.
     touch(&tmp.path().join("repos/docs/guide/intro.md"));
 
-    let (tree, _) = Walker::new(tmp.path(), ruleset()).run_to_tree();
+    let (tree, _) = breakdown(tmp.path()).run_to_tree();
 
     assert!(tree.find(&tmp.path().join("repos/docs")).is_none());
     assert!(
@@ -384,13 +536,16 @@ fn a_hit_node_is_a_leaf_and_carries_its_rule() {
     touch(&tmp.path().join("a/package.json"));
     write(&tmp.path().join("a/node_modules/big.bin"), 4096);
 
-    let (tree, _) = Walker::new(tmp.path(), ruleset()).run_to_tree();
+    let (tree, _) = breakdown(tmp.path()).run_to_tree();
     let id = tree.find(&tmp.path().join("a/node_modules")).unwrap();
     let node = tree.node(id);
 
     assert!(node.children.is_empty());
     assert_eq!(node.hit.as_ref().unwrap().rule.id, "node");
-    assert_eq!(node.reclaimable, node.hit.as_ref().unwrap().size);
+    assert_eq!(
+        node.reclaimable,
+        node.hit.as_ref().unwrap().size.bytes().unwrap()
+    );
 }
 
 #[test]
@@ -404,7 +559,7 @@ fn children_sort_within_their_own_level() {
         2 * 1024 * 1024,
     );
 
-    let (mut tree, _) = Walker::new(tmp.path(), ruleset()).run_to_tree();
+    let (mut tree, _) = breakdown(tmp.path()).run_to_tree();
     tree.sort_by_reclaimable();
 
     let top: Vec<_> = tree

@@ -11,10 +11,15 @@
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let ruleset = Arc::new(Ruleset::load(None)?);
 //! let (tree, outcome) = Walker::new("/Users/me/repos", ruleset).run_to_tree();
-//! println!("{} reclaimable in {} directories", tree.reclaimable(), outcome.hits);
+//! println!("{} directories, {} not yet priced", outcome.hits, tree.unmeasured());
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! A scan does not measure what it claims. Pruning at `node_modules` and then walking it to
+//! size it would give back the cost the pruning saved, so sizes arrive as
+//! [`Size::Unmeasured`] until a caller asks for a breakdown with
+//! [`SizeMode::Breakdown`](size::SizeMode::Breakdown).
 //!
 //! Detection is marker-anchored and never name-anchored: a rule is "a directory named
 //! `target` whose parent holds a `Cargo.toml`", never "a directory named `target`".
@@ -27,7 +32,7 @@ pub mod size;
 pub mod tree;
 pub mod walk;
 
-pub use rules::{Anchor, MarkersRequired, Rule, RuleError, Ruleset};
-pub use size::{Measurement, Measurer, SizeMode};
+pub use rules::{Anchor, MarkersRequired, RegenerateWhen, Rule, RuleError, Ruleset};
+pub use size::{Measurement, Measurer, Size, SizeMode};
 pub use tree::{Node, NodeId, Tree};
 pub use walk::{Hit, WalkError, WalkOutcome, Walker};

@@ -33,12 +33,25 @@
 # Rules are evaluated in order and the first match wins, so put the more specific rule first
 # where two could claim the same directory.
 
+# The lockfile picks the command. "whichever lockfile is present" is a sentence, not
+# something a user can run, and the filesystem already knows the answer. The search runs from
+# the project root upward so a workspace — one lockfile at the root, a `package.json` and a
+# `node_modules` per package — still names the right package manager for every package.
 [[rules]]
 id = "node"
 ecosystem = "Node"
 markers = ["package.json"]
 targets = ["node_modules"]
-regenerate = "npm ci / pnpm install / yarn — whichever lockfile is present"
+regenerate = "npm install"
+regenerate_when = [
+    { marker = "pnpm-lock.yaml", regenerate = "pnpm install" },
+    { marker = "yarn.lock", regenerate = "yarn install" },
+    { marker = "bun.lock", regenerate = "bun install" },
+    { marker = "bun.lockb", regenerate = "bun install" },
+    { marker = "package-lock.json", regenerate = "npm ci" },
+    { marker = "npm-shrinkwrap.json", regenerate = "npm ci" },
+    { marker = "deno.lock", regenerate = "deno install" },
+]
 
 [[rules]]
 id = "cargo"
@@ -214,13 +227,18 @@ targets = ["Library", "Temp", "Obj"]
 regenerate = "Unity reimports on the next open"
 note = "a Unity reimport is slow — minutes to hours on a large project"
 
+# `Build/` is NOT claimed, though kondo claims it. An Unreal project keeps authored
+# per-platform build configuration under it — `Build/IOS/` provisioning and icons,
+# `Build/Android/` manifests and resources — so a `.uproject` beside it proves the project's
+# type and not that the directory is generated. That is the same mistake as matching a bare
+# `build`, one rule further in. `Saved/` is out for the same reason: logs, configs, autosaves.
 [[rules]]
 id = "unreal"
 ecosystem = "Unreal Engine"
 markers = ["*.uproject"]
-targets = ["Binaries", "Build", "Intermediate", "DerivedDataCache"]
+targets = ["Binaries", "Intermediate", "DerivedDataCache"]
 regenerate = "regenerate project files, then rebuild from the editor or UnrealBuildTool"
-note = "`Saved/` is deliberately not claimed: it holds logs, configs and autosaves"
+note = "`Build/` and `Saved/` are not claimed: both hold authored files alongside output"
 
 [[rules]]
 id = "godot"

@@ -26,7 +26,7 @@ use std::time::SystemTime;
 use ignore::{WalkBuilder, WalkState};
 
 use crate::rules::{Rule, Ruleset};
-use crate::size::{Measurer, SizeMode};
+use crate::size::{Measurer, Size, SizeMode};
 use crate::tree::Tree;
 
 /// One reclaimable directory.
@@ -36,10 +36,15 @@ pub struct Hit {
     pub path: PathBuf,
     /// The project whose markers justified the claim.
     pub project_root: PathBuf,
-    /// The rule that matched, carrying the regeneration command and any caveat.
+    /// The rule that matched, carrying its ecosystem label and any caveat.
     pub rule: Arc<Rule>,
-    /// Reclaimable bytes, per the walk's [`SizeMode`].
-    pub size: u64,
+    /// The concrete command that brings this directory back, resolved for this project — so
+    /// `pnpm install` rather than the rule's "npm ci / pnpm install / yarn" when a
+    /// `pnpm-lock.yaml` is what the project actually has.
+    pub regenerate: String,
+    /// What is known about the size. [`Size::Unmeasured`] unless a breakdown was asked for,
+    /// because measuring means enumerating the subtree the scan deliberately pruned at.
+    pub size: Size,
     /// The directory's own mtime. The best single proxy for "do I still need this".
     pub modified: Option<SystemTime>,
 }
@@ -68,8 +73,11 @@ pub struct WalkError {
 pub struct WalkOutcome {
     /// How many directories were claimed.
     pub hits: usize,
-    /// Their total size.
+    /// The total size of the claims that were measured. Zero on a default scan, which
+    /// measures nothing — read it alongside `unmeasured` rather than on its own.
     pub reclaimable_bytes: u64,
+    /// How many claims were recorded without being measured, because the scan pruned there.
+    pub unmeasured: usize,
     /// Everything that could not be read.
     pub errors: Vec<WalkError>,
 }
@@ -150,6 +158,7 @@ impl Walker {
         let errors = Mutex::new(Vec::new());
         let hits = AtomicUsize::new(0);
         let reclaimed = AtomicU64::new(0);
+        let unmeasured = AtomicUsize::new(0);
         let measurer = Measurer::new(self.size_mode).same_file_system(self.same_file_system);
         let detector = self.ruleset.detector();
         let root = self.root.as_path();
@@ -215,10 +224,10 @@ impl Walker {
                     }
                 };
 
-                let size = measurer.measure(entry.path(), &metadata);
-                if !size.unreadable.is_empty() {
+                let sized = measurer.measure(entry.path(), &metadata);
+                if !sized.unreadable.is_empty() {
                     let mut collected = lock(&errors);
-                    for path in size.unreadable {
+                    for path in sized.unreadable {
                         collected.push(WalkError {
                             path: Some(path),
                             message: "unreadable, so this size is a lower bound".to_owned(),
@@ -227,12 +236,20 @@ impl Walker {
                 }
 
                 hits.fetch_add(1, Ordering::Relaxed);
-                reclaimed.fetch_add(size.bytes, Ordering::Relaxed);
+                match sized.size.bytes() {
+                    Some(bytes) => {
+                        reclaimed.fetch_add(bytes, Ordering::Relaxed);
+                    }
+                    None => {
+                        unmeasured.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 on_hit(Hit {
                     path: entry.into_path(),
                     project_root: detection.project_root,
                     rule: detection.rule,
-                    size: size.bytes,
+                    regenerate: detection.regenerate,
+                    size: sized.size,
                     modified: metadata.modified().ok(),
                 });
 
@@ -244,6 +261,7 @@ impl Walker {
         WalkOutcome {
             hits: hits.load(Ordering::Relaxed),
             reclaimable_bytes: reclaimed.load(Ordering::Relaxed),
+            unmeasured: unmeasured.load(Ordering::Relaxed),
             errors: std::mem::take(&mut lock(&errors)),
         }
     }

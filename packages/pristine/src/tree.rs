@@ -26,8 +26,12 @@ pub struct Node {
     pub name: OsString,
     /// The full path.
     pub path: PathBuf,
-    /// Bytes reclaimable in this subtree, this node included.
+    /// Measured reclaimable bytes in this subtree, this node included.
     pub reclaimable: u64,
+    /// How many claims in this subtree were recorded but not measured, because the scan
+    /// pruned at them. A node with `reclaimable == 0` and `unmeasured > 0` is not empty; it
+    /// is unpriced, and a breakdown is what puts a number on it.
+    pub unmeasured: usize,
     /// Set when this node is itself a claimed directory, in which case it has no children.
     pub hit: Option<Hit>,
     /// Children, in insertion order until [`Tree::sort_by_reclaimable`] is called.
@@ -53,6 +57,7 @@ impl Tree {
             name: root.as_os_str().to_os_string(),
             path: root.clone(),
             reclaimable: 0,
+            unmeasured: 0,
             hit: None,
             children: Vec::new(),
         };
@@ -69,11 +74,13 @@ impl Tree {
     /// walker turns that into a reported error rather than dropping the hit silently.
     pub fn insert(&mut self, hit: Hit) -> Option<NodeId> {
         let relative = hit.path.strip_prefix(&self.root).ok()?;
-        let bytes = hit.size;
+        let bytes = hit.size.bytes().unwrap_or(0);
+        let unmeasured = usize::from(hit.size.bytes().is_none());
 
         let mut parent = self.root();
         let mut path = self.root.clone();
         self.nodes[parent].reclaimable += bytes;
+        self.nodes[parent].unmeasured += unmeasured;
 
         for component in relative.components() {
             let name = component.as_os_str().to_os_string();
@@ -86,6 +93,7 @@ impl Tree {
                     name: name.clone(),
                     path: path.clone(),
                     reclaimable: 0,
+                    unmeasured: 0,
                     hit: None,
                     children: Vec::new(),
                 });
@@ -94,6 +102,7 @@ impl Tree {
                 id
             };
             self.nodes[id].reclaimable += bytes;
+            self.nodes[id].unmeasured += unmeasured;
             parent = id;
         }
 
@@ -140,10 +149,16 @@ impl Tree {
         Some(current)
     }
 
-    /// Total bytes reclaimable anywhere under the root.
+    /// Total measured bytes reclaimable anywhere under the root.
     #[must_use]
     pub fn reclaimable(&self) -> u64 {
         self.nodes[self.root()].reclaimable
+    }
+
+    /// How many claims in the whole tree have no size yet.
+    #[must_use]
+    pub fn unmeasured(&self) -> usize {
+        self.nodes[self.root()].unmeasured
     }
 
     /// The number of nodes, the root included.
@@ -180,17 +195,20 @@ impl Tree {
 mod tests {
     use super::Tree;
     use crate::rules::Ruleset;
+    use crate::size::Size;
     use crate::walk::Hit;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     fn hit(path: &str, size: u64) -> Hit {
         let ruleset = Ruleset::builtin().unwrap();
+        let rule = Arc::clone(&ruleset.rules()[0]);
         Hit {
             path: PathBuf::from(path),
             project_root: PathBuf::from("/scan"),
-            rule: Arc::clone(&ruleset.rules()[0]),
-            size,
+            regenerate: rule.regenerate.clone(),
+            rule,
+            size: Size::Measured(size),
             modified: None,
         }
     }
