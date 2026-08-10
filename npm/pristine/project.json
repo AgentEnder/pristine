@@ -2,5 +2,13 @@
   "$schema": "../../node_modules/nx/schemas/project-schema.json",
   "name": "npm-pristine",
   "projectType": "library",
-  "targets": {}
+  "targets": {
+    "test": {
+      "// command": "Bare `node --test` from the package root, using its own default discovery. A directory argument is not recursed: node tries to run the directory itself and dies with MODULE_NOT_FOUND.",
+      "command": "node --test",
+      "options": { "cwd": "npm/pristine" },
+      "// inputs": "Overrides the workspace default, which is the rust file set. Left inherited, this target's cache key would ignore every file it actually tests and a shim change would replay a stale pass. The sibling manifests are here because manifests.test.cjs asserts against them.",
+      "inputs": ["js", "{workspaceRoot}/npm/*/package.json"]
+    }
+  }
 }

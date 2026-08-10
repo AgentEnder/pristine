@@ -2,6 +2,12 @@
 # artifacts there, so there is nothing to ignore under `packages/`.
 /target
 
+# The prebuilt binaries staged into the platform packages before they are packed. They are
+# release artifacts built from the crate, not source: the release job puts one here, and
+# `nx run npm-pristine:verify-pack` puts this host's there. Committing one would ship a stale
+# binary at the next release.
+/npm/pristine-*/pristine
+
 # Node dependencies and the Nx scaffold
 node_modules/
 .nx/
