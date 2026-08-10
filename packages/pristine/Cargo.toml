@@ -5,7 +5,10 @@
 [package]
 name = "pristine-cli"
 description = "A language-agnostic reclaimable-space finder and cleaner."
-version.workspace = true
+# Deliberately a literal, not `version.workspace = true`: `nx release` owns this line, and
+# @monodon/rust's version actions require `[package].version` to be a plain string. Inheriting
+# it from the workspace makes the crate silently skip versioning while the npm packages bump.
+version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

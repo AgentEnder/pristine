@@ -3,7 +3,9 @@ resolver = "3"
 members = ["packages/pristine"]
 
 [workspace.package]
-version = "0.1.0"
+# No `version` here on purpose. Each crate carries its own literal version because that is the
+# line `nx release` rewrites; a workspace-level copy would be a second source of truth that
+# drifts out of lockstep with the npm packages.
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"

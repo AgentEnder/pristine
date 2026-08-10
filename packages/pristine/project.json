@@ -3,6 +3,11 @@
   "name": "pristine",
   "projectType": "application",
   "sourceRoot": "packages/pristine/src",
+  "release": {
+    "version": {
+      "versionActions": "@monodon/rust/src/release/version-actions"
+    }
+  },
   "targets": {
     "build": {
       "command": "cargo build --release -p pristine-cli",
