@@ -89,9 +89,19 @@ function binaryPath(packageName, resolve = require.resolve) {
   return path.join(path.dirname(manifest), BINARY);
 }
 
-/** The binary this host should run. Throws, with a reason, when there is not one. */
+/**
+ * The binary this host should run. Throws, with a reason, when there is not one.
+ *
+ * The three properties are read out by name rather than spread: `host` is `process` in the shim,
+ * and copying the whole of it on every invocation to reach three values would be silly.
+ */
 function resolveBinary(host = process, resolve = require.resolve) {
-  return binaryPath(packageForHost({ ...host, libc: hostLibc(host) }), resolve);
+  const target = packageForHost({
+    platform: host.platform,
+    arch: host.arch,
+    libc: hostLibc(host),
+  });
+  return binaryPath(target, resolve);
 }
 
 module.exports = { BINARY, TARGETS, binaryPath, hostLibc, packageForHost, resolveBinary };

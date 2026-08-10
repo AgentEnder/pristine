@@ -8,7 +8,7 @@ const assert = require('node:assert/strict');
 const path = require('node:path');
 const { test } = require('node:test');
 
-const { TARGETS, binaryPath, hostLibc, packageForHost } = require('../lib/platform.cjs');
+const { TARGETS, binaryPath, hostLibc, packageForHost, resolveBinary } = require('../lib/platform.cjs');
 
 test('darwin arm64 resolves to the darwin-arm64 package', () => {
   assert.equal(
@@ -119,6 +119,29 @@ test('a platform package that was never installed explains why it might be missi
       assert.match(error.message, /--no-optional|optional/);
       return true;
     },
+  );
+});
+
+// The composition the shim actually calls. It reads only these three properties off the host,
+// so a plain object is a complete stand-in for `process` and nothing else about it is copied.
+test('a host is taken all the way to a binary path', () => {
+  const resolved = resolveBinary(
+    { platform: 'linux', arch: 'x64', report: { getReport: () => ({ header: { glibcVersionRuntime: '2.39' } }) } },
+    (request) => {
+      assert.equal(request, '@agentender/pristine-linux-x64-gnu/package.json');
+      return path.join('/n', '@agentender', 'pristine-linux-x64-gnu', 'package.json');
+    },
+  );
+  assert.equal(resolved, path.join('/n', '@agentender', 'pristine-linux-x64-gnu', 'pristine'));
+});
+
+test('a host with no prebuilt binary fails before any resolution is attempted', () => {
+  assert.throws(
+    () =>
+      resolveBinary({ platform: 'linux', arch: 'x64', report: { getReport: () => ({ header: {} }) } }, () =>
+        assert.fail('resolution must not be attempted for an unsupported host'),
+      ),
+    /linux-x64-musl/,
   );
 });
 
