@@ -29,6 +29,25 @@ fn mkdir(path: &Path) {
     fs::create_dir_all(path).unwrap();
 }
 
+/// Every file under `dir`, so a test can assert that a whole tree is still there rather than
+/// naming its members one at a time.
+fn walk_files(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        for entry in fs::read_dir(&current).unwrap() {
+            let path = entry.unwrap().path();
+            if path.symlink_metadata().unwrap().is_dir() {
+                stack.push(path);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
 /// A temporary tree, and its path with every symlink already resolved.
 ///
 /// On macOS `/var` is a symlink to `/private/var`, so `TempDir::path()` is not canonical. The
@@ -188,21 +207,16 @@ fn a_target_that_is_no_longer_there_is_reported_rather_than_silently_dropped() {
     );
 }
 
-/// The window between validating a path and acting on it, which is deterministic here
-/// because planning and removal are two calls a caller makes in order.
+/// The window between validating a path and acting on it, at its widest: planning and removal
+/// are two calls a caller makes in order, and between them sit a printed plan and a person
+/// answering a prompt.
 ///
 /// A check is only worth what it is worth at the moment of the `unlink`. Everything the plan
-/// proved was proved about a path, and a path is a name that something else can re-point —
-/// and between the two calls sits the part of the gap that is not measured in syscalls: the
-/// plan is printed and a person answers a prompt. So the removal proves the way down to the
-/// target a second time before it descends.
+/// proved was proved about a path, and a path is a name that something else can re-point, so
+/// the removal cannot start from the name — it descends from a descriptor on the scan root.
 ///
-/// This is not the same as being race-free, and the test is written so it cannot be mistaken
-/// for it: the swap happens between two calls rather than concurrently with one. Closing the
-/// remaining gap needs an `openat` descent holding a directory descriptor, so that "under the
-/// root" is a property of how the syscall was issued rather than a claim checked just before
-/// it — and that needs `unsafe`, which the crate forbids. What is tested here is the window
-/// that can actually be closed without it.
+/// This is the cheapest of the three statements of that property, and the only one that needs
+/// no second thread. The two tests after it close the concurrent case.
 #[cfg(unix)]
 #[test]
 fn an_ancestor_swapped_for_a_link_after_planning_cannot_take_the_removal_out_of_the_root() {
@@ -233,6 +247,218 @@ fn an_ancestor_swapped_for_a_link_after_planning_cannot_take_the_removal_out_of_
     );
     assert!(removal.removed.is_empty(), "{:?}", removal.removed);
     assert!(!removal.failures.is_empty(), "the swap was not reported");
+}
+
+/// The escape attempted at the one instant it is guaranteed to matter: after the removal has
+/// demonstrably begun descending into the target, and held there for the rest of the run.
+///
+/// Racing blind and hoping to land in the window makes a test that only sometimes notices the
+/// bug, which is no guard at all. So the attacker synchronises on state anyone can observe —
+/// it waits until entries start disappearing from the target, which proves the sweep is inside
+/// its removal loop, and only then swaps the ancestor. A victim that resolves each child from
+/// its path deletes the mirror image outside the root from that moment on.
+///
+/// The deleter is immune for a structural reason rather than a lucky one: by the time the
+/// first entry disappears it already holds descriptors for the root, for `app` and for the
+/// target, and a rename changes no descriptor. So the swap is not merely survived — the
+/// removal goes on to finish correctly, on the real tree, which is what the last assertions
+/// pin down.
+#[cfg(unix)]
+#[test]
+fn an_ancestor_swapped_while_the_sweep_is_inside_the_target_cannot_redirect_it() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const FILES: usize = 400;
+    const ROUNDS: usize = 6;
+
+    for round in 0..ROUNDS {
+        let (_tmp, base) = fixture();
+        let root = base.join("root");
+        let outside = base.join("precious");
+        let target = root.join("app/nm");
+
+        for file in 0..FILES {
+            let name = format!("f{file:04}.js");
+            write(&target.join(&name), 256);
+            // Name for name, so every unlink the victim issues after the swap lands on a
+            // real file out here rather than harmlessly on `ENOENT`.
+            write(&outside.join("nm").join(&name), 256);
+        }
+        let bait = walk_files(&outside);
+        assert_eq!(bait.len(), FILES);
+
+        let plan = plan_for(&root, std::slice::from_ref(&target));
+        assert_eq!(targets(&plan), std::slice::from_ref(&target));
+
+        let decoy = root.join("decoy");
+        let parked = root.join("parked");
+        std::os::unix::fs::symlink(&outside, &decoy).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let swapped = Arc::new(AtomicBool::new(false));
+        let attacker = {
+            let stop = Arc::clone(&stop);
+            let swapped = Arc::clone(&swapped);
+            let app = root.join("app");
+            let target = target.clone();
+            std::thread::spawn(move || {
+                // Entries vanishing is the observable proof that the sweep has opened the
+                // target and is working through it.
+                while !stop.load(Ordering::Relaxed) {
+                    let remaining = fs::read_dir(&target).map_or(0, Iterator::count);
+                    if remaining < FILES {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                if fs::rename(&app, &parked).is_ok() && fs::rename(&decoy, &app).is_ok() {
+                    swapped.store(true, Ordering::Relaxed);
+                }
+                // Held for the rest of the removal, so there is no window to be lucky in.
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::yield_now();
+                }
+                let _ = fs::rename(&app, &decoy);
+                let _ = fs::rename(&parked, &app);
+            })
+        };
+
+        let removal = Deleter::new().remove(&plan);
+        stop.store(true, Ordering::Relaxed);
+        attacker.join().expect("the attacker thread must not panic");
+        assert!(
+            swapped.load(Ordering::Relaxed),
+            "round {round}: the ancestor was never swapped, so nothing was exercised"
+        );
+
+        assert_eq!(
+            walk_files(&outside),
+            bait,
+            "round {round}: the removal was redirected out of the scan root"
+        );
+        // Not merely survived: a rename changes no descriptor, so the sweep finished the job
+        // it had already opened.
+        assert!(removal.is_clean(), "round {round}: {:?}", removal.failures);
+        assert!(
+            !target.exists(),
+            "round {round}: the target was left behind"
+        );
+    }
+}
+
+/// The same escape attempted by hammering rather than by synchronising, which explores
+/// interleavings the test above pins down one of.
+///
+/// A second attacker thread renames an ancestor away and drops a symlink to an outside tree in
+/// its place, over and over, for as long as the removal runs. Any implementation that resolves
+/// a target from its name — however recently it re-validated that name — eventually issues one
+/// syscall on the far side of a swap and deletes something it was never offered.
+///
+/// The deleter survives this because it does not resolve names: it opens the scan root once
+/// and reaches every entry by `openat` from an already-open parent, with `O_NOFOLLOW`, then
+/// removes by `unlinkat` against that same descriptor. A swap can therefore make the removal
+/// *fail* — an `ELOOP`, an `ENOENT`, a target left standing — and those are all fine and all
+/// reported. What it cannot do is redirect one.
+///
+/// The bait outside the root deliberately mirrors the names inside it, so a descent that did
+/// follow the swap would find real files to unlink rather than harmlessly hitting `ENOENT`.
+#[cfg(unix)]
+#[test]
+fn hammering_an_ancestor_throughout_a_removal_never_reaches_outside_the_root() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const TARGETS: usize = 16;
+    const ROUNDS: usize = 12;
+
+    let mut total_swaps = 0_u64;
+    for round in 0..ROUNDS {
+        let (_tmp, base) = fixture();
+        let root = base.join("root");
+        let outside = base.join("precious");
+
+        let mut targets = Vec::new();
+        for i in 0..TARGETS {
+            let target = root.join(format!("app/nm{i}"));
+            for pkg in 0..8 {
+                write(&target.join(format!("pkg{pkg}/index.js")), 512);
+                write(&target.join(format!("pkg{pkg}/readme.md")), 512);
+                // The bait mirrors the real tree name for name, which is what an attacker
+                // would actually arrange: the victim collects child names from the real
+                // directory and then removes them by path, so a swap only costs anything if
+                // those same names resolve to something on the far side.
+                write(&outside.join(format!("nm{i}/pkg{pkg}/index.js")), 512);
+                write(&outside.join(format!("nm{i}/pkg{pkg}/readme.md")), 512);
+            }
+            targets.push(target);
+        }
+        let bait: Vec<PathBuf> = walk_files(&outside);
+        assert!(!bait.is_empty());
+
+        // Built while the ancestry is honest, exactly as a real run would be.
+        let plan = plan_for(&root, &targets);
+        assert_eq!(plan.targets().len(), TARGETS, "{:?}", refusals(&plan));
+
+        let parked = root.join("parked");
+        let decoy = root.join("decoy");
+        std::os::unix::fs::symlink(&outside, &decoy).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let attacker = {
+            let stop = Arc::clone(&stop);
+            let app = root.join("app");
+            std::thread::spawn(move || {
+                let mut swaps = 0_u64;
+                while !stop.load(Ordering::Relaxed) {
+                    // Two renames rather than one: a symlink cannot be renamed over a
+                    // non-empty directory, so the real exploit is move-the-real-one-away then
+                    // move-the-link-in. That is what makes the window narrow but genuine.
+                    if fs::rename(&app, &parked).is_ok() {
+                        if fs::rename(&decoy, &app).is_ok() {
+                            swaps += 1;
+                            // Held, rather than reversed immediately. A victim that resolves
+                            // by name is caught between its check and its `unlink`, and that
+                            // gap is microseconds — so the link has to be *in place* for a
+                            // meaningful share of the wall clock, not merely flickered.
+                            std::thread::sleep(Duration::from_micros(200));
+                            let _ = fs::rename(&app, &decoy);
+                        }
+                        let _ = fs::rename(&parked, &app);
+                    }
+                    std::thread::yield_now();
+                }
+                swaps
+            })
+        };
+
+        let removal = Deleter::new().remove(&plan);
+        stop.store(true, Ordering::Relaxed);
+        total_swaps += attacker.join().expect("the attacker thread must not panic");
+
+        for file in &bait {
+            assert!(
+                file.exists(),
+                "round {round}: a swapped ancestor took the removal out of the root and \
+                 deleted {}",
+                file.display()
+            );
+        }
+        // Nothing outside the root may be reported either, since nothing outside was touched.
+        for removed in &removal.removed {
+            assert!(
+                removed.path.starts_with(&root),
+                "round {round}: removed {} from outside the root",
+                removed.path.display()
+            );
+        }
+    }
+
+    // Without this the test could pass by never racing at all, which would make it decoration.
+    assert!(
+        total_swaps > 0,
+        "the attacker never completed a swap in {ROUNDS} rounds, so nothing was exercised"
+    );
 }
 
 // ---------------------------------------------------------------------------------------

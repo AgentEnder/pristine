@@ -40,6 +40,12 @@ ignore = "0.4.33"
 globset = "0.4.20"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.4"
+# The deleter's descriptor-relative syscalls: `openat` with `O_NOFOLLOW`, `fstatat`,
+# `unlinkat`. This is the layer `cap-std` is built from, taken directly because the deleter
+# wants the primitives rather than the capability wrapper. It is what lets the removal descend
+# without resolving a path — the property the safety model rests on — while keeping the
+# crate's `unsafe_code = "forbid"`, which a hand-rolled `libc` descent could not.
+cap-primitives = "4.0.2"
 
 [dev-dependencies]
 tempfile = "3.27.0"

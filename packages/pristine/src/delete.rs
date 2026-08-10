@@ -24,24 +24,30 @@
 //! subtree it refused to enter leaves every ancestor standing, because the `rmdir` is only
 //! attempted when every child is known to be gone.
 //!
-//! ## What the under-root check is and is not
+//! ## The under-root check is not enough on its own, and why nothing is removed by name
 //!
-//! It is defence in depth against a malformed, stale or hostile path arriving from a caller,
-//! a config file or a scan of a tree someone else can write to.
+//! The plan's check is defence in depth against a malformed, stale or hostile path arriving
+//! from a caller, a config file or a scan of a tree someone else can write to. But what it
+//! proves, it proves about a *path*, and a path is a name that something else can re-point.
+//! A check like that is worth what it is worth at the moment of the `unlink`, not at the
+//! moment it ran — and in between sit a printed plan and a confirmation prompt.
 //!
-//! What it proves, though, it proves about a *path*, and a path is a name something else can
-//! re-point. The longest gap between the proof and the `unlink` is the one a person spends
-//! reading the plan and answering the confirmation, so the ancestry is proved a second time
-//! when the removal starts — see `Sweep::ancestry_intact`. A component swapped for a symlink
-//! while the prompt was on screen is therefore reported, rather than followed out of the root
-//! under the very name it was cleared under.
+//! So the removal never re-walks a target by name. It opens the scan root once and then
+//! **descends by descriptor**: every component is opened from its already-open parent with
+//! `openat(fd, name, O_DIRECTORY | O_NOFOLLOW)`, and every removal is an `unlinkat` against
+//! the descriptor of the directory that holds the entry. A component swapped for a symlink
+//! fails the open with `ELOOP` rather than redirecting it, because the kernel resolves one
+//! name against one held descriptor and there is no path left for anything to re-point.
+//! "Under the root" becomes a property of how the syscall was issued.
 //!
-//! It is still **not** a defence against an attacker racing the removal itself: the recheck
-//! is a `stat` and the removal is a later `unlink`, and no number of stats closes the gap
-//! between two syscalls. Closing it needs an `openat`-based descent holding a directory
-//! descriptor, which needs `libc` and therefore `unsafe`, which this crate forbids. Saying so
-//! is better than implying a guarantee that is not here; on the disk of the person running
-//! the cleaner, what is left of the window is not the threat.
+//! `cap-primitives` supplies those calls. It is the same machinery `cap-std` is built from,
+//! and it is why this does not need `libc` and therefore does not need the `unsafe` this
+//! crate forbids: the descent this module always wanted turns out to be reachable in safe
+//! Rust. The root is opened once per batch rather than once per target, so the root itself
+//! cannot be swapped mid-run either.
+//!
+//! One ambient, path-based call survives, and it has to: opening the scan root. That is the
+//! directory the user named, and every descriptor below it descends from that one handle.
 //!
 //! ## Fan-out
 //!
@@ -53,15 +59,22 @@
 //! `rm -rf` is.
 
 use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use crate::size::{Size, allocated, device, multiply_linked};
+use cap_primitives::ambient_authority;
+use cap_primitives::fs::{
+    FollowSymlinks, Metadata, open_ambient_dir, open_dir_nofollow, read_base_dir, remove_dir,
+    remove_file, stat,
+};
+
+use crate::size::{Size, Stat, allocated, device, multiply_linked};
 use crate::walk::Hit;
 
 /// How far the pool is oversubscribed past the machine's parallelism, because the work is
@@ -400,6 +413,20 @@ impl Deleter {
             return removal;
         }
 
+        // The one ambient, path-based call in the whole removal, and the anchor for every
+        // descriptor below it. Opening it once per batch rather than once per target means
+        // the root cannot be swapped between two targets either.
+        let root = match open_ambient_dir(&plan.root, ambient_authority()) {
+            Ok(root) => root,
+            Err(err) => {
+                removal.failures.push(Failure {
+                    path: plan.root.clone(),
+                    message: err.to_string(),
+                });
+                return removal;
+            }
+        };
+
         let threads = self
             .threads
             .unwrap_or_else(default_threads)
@@ -416,7 +443,7 @@ impl Deleter {
                         let Some(target) = plan.targets.get(at) else {
                             break;
                         };
-                        mine.push(Sweep::new(plan).run(target));
+                        mine.push(Sweep::new(plan, &root).run(target));
                     }
                     lock(&collected).append(&mut mine);
                 });
@@ -508,8 +535,15 @@ impl Removal {
 
 /// One target's removal. Per-target rather than shared, so the pool contends for the
 /// filesystem and not for a mutex.
+///
+/// Every method below takes the *descriptor* of the directory holding the entry it acts on,
+/// plus the entry's name. The `path` alongside them is for reporting only — it is what the
+/// user reads in a refusal, and it is never resolved.
 struct Sweep<'a> {
     plan: &'a Plan,
+    /// The scan root, opened once by [`Deleter::remove`] and shared across the pool. Every
+    /// descriptor this sweep holds is descended from it.
+    root: &'a fs::File,
     path: PathBuf,
     bytes: u64,
     entries: u64,
@@ -523,9 +557,10 @@ struct Sweep<'a> {
 }
 
 impl<'a> Sweep<'a> {
-    fn new(plan: &'a Plan) -> Self {
+    fn new(plan: &'a Plan, root: &'a fs::File) -> Self {
         Self {
             plan,
+            root,
             path: PathBuf::new(),
             bytes: 0,
             entries: 0,
@@ -538,86 +573,69 @@ impl<'a> Sweep<'a> {
 
     fn run(mut self, target: &PlanTarget) -> Self {
         self.path.clone_from(&target.path);
-        if !self.ancestry_intact(&target.path) {
+        let Some((parent, name)) = self.parent_of(&target.path) else {
             return self;
-        }
-        self.complete = match target.path.symlink_metadata() {
-            Ok(metadata) => self.entry(&target.path, &metadata),
-            Err(err) => {
-                self.failed(&target.path, &err);
-                false
-            }
         };
+        self.complete = self.entry(&parent, &name, &target.path);
         self
     }
 
-    /// Re-proves, at the moment of removal, that the way down to the target is still the way
-    /// the plan cleared.
+    /// Opens the directory that holds the target, by walking down from the root's descriptor
+    /// one component at a time.
     ///
-    /// Everything [`Planner::judge`] proved, it proved about a *path*, and a path is a name
-    /// that something else can re-point. The plan is then printed and a confirmation is
-    /// answered, so the gap between the proof and the `unlink` is human-scale rather than
-    /// instantaneous — long enough for a component to be swapped for a symlink, after which
-    /// the descent leaves the root under the very name it was cleared under. Each component
-    /// from the root down to the target's *parent* is therefore stat-ed again and required to
-    /// still be a directory in its own right.
-    ///
-    /// `symlink_metadata().is_dir()` is false for a symlink to a directory, which is the
-    /// whole point: the check is that the name still *is* the directory, not that it still
-    /// leads to one. The target itself is deliberately not included, because a claim may
-    /// legitimately be a symlink — Bazel's `bazel-*` — and unlinking it as a link is correct.
-    ///
-    /// This shortens the window; it does not close it. What remains is a race against these
-    /// syscalls rather than against a person reading a prompt, and closing that needs an
-    /// `openat` descent holding a directory descriptor, which needs `unsafe`.
-    fn ancestry_intact(&mut self, target: &Path) -> bool {
-        let Some(inside) = target
-            .parent()
-            .and_then(|parent| parent.strip_prefix(&self.plan.root).ok())
-        else {
-            // Unreachable for a planned target, which the planner proved is under the root.
-            // Refusing beats descending from a root this path has nothing to do with.
+    /// Each step is `openat(fd, name, O_DIRECTORY | O_NOFOLLOW)` against the descriptor the
+    /// previous step returned, so no part of the path is ever re-resolved from a name and a
+    /// component swapped for a symlink is an `ELOOP` rather than a redirect. The final
+    /// component is *not* opened: a claim may legitimately be a symlink — Bazel's `bazel-*` —
+    /// and it has to be unlinked as a link rather than followed.
+    fn parent_of(&mut self, target: &Path) -> Option<(fs::File, OsString)> {
+        // Unreachable for a planned target, which the planner proved is under the root.
+        // Refusing beats descending from a root this path has nothing to do with.
+        let Ok(relative) = target.strip_prefix(&self.plan.root) else {
             self.failures.push(Failure {
                 path: target.to_path_buf(),
                 message: format!("is not under {}", self.plan.root.display()),
             });
-            return false;
+            return None;
         };
 
-        // One `lstat` per component per target, repeated across targets that share ancestry.
-        // Cheap, warm-cached, and the alternative — caching it across the pool — would be a
-        // cache of exactly the answer that has to be fresh.
+        let mut names: Vec<&OsStr> = relative.components().map(Component::as_os_str).collect();
+        let name = names.pop()?;
         let mut walked = self.plan.root.clone();
-        let mut components = inside.components();
-        loop {
-            match walked.symlink_metadata() {
-                Ok(metadata) if metadata.is_dir() => {}
-                Ok(_) => {
-                    self.failures.push(Failure {
-                        path: walked,
-                        message: "is no longer a directory: the way to the target changed \
-                                  after the plan was built, and following it could leave the \
-                                  scan root"
-                            .to_owned(),
-                    });
-                    return false;
-                }
+        // `dup`, so the loop can own each handle in turn without consuming the shared root.
+        let mut dir = match self.root.try_clone() {
+            Ok(dir) => dir,
+            Err(err) => {
+                self.failed(&walked, &err);
+                return None;
+            }
+        };
+        for component in names {
+            walked.push(component);
+            dir = match open_dir_nofollow(&dir, Path::new(component)) {
+                Ok(next) => next,
                 Err(err) => {
                     self.failed(&walked, &err);
-                    return false;
+                    return None;
                 }
-            }
-            match components.next() {
-                Some(component) => walked.push(component),
-                None => return true,
-            }
+            };
         }
+        Some((dir, name.to_owned()))
     }
 
-    /// One filesystem entry, whatever kind it is. The metadata is always from
-    /// `symlink_metadata`, so a symlink is a symlink here and never the thing it points at.
-    fn entry(&mut self, path: &Path, metadata: &fs::Metadata) -> bool {
-        if crosses_boundary(self.plan.one_file_system, self.plan.boundary, metadata) {
+    /// One filesystem entry, whatever kind it is, named relative to `parent`'s descriptor.
+    ///
+    /// The metadata is always `fstatat` with `AT_SYMLINK_NOFOLLOW`, so a symlink is a symlink
+    /// here and never the thing it points at.
+    fn entry(&mut self, parent: &fs::File, name: &OsStr, path: &Path) -> bool {
+        let metadata = match stat(parent, Path::new(name), FollowSymlinks::No) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                self.failed(path, &err);
+                return false;
+            }
+        };
+        if crosses_boundary(self.plan.one_file_system, self.plan.boundary, &metadata) {
             self.kept.push(Refused {
                 path: path.to_path_buf(),
                 reason: Refusal::OtherFileSystem,
@@ -625,14 +643,30 @@ impl<'a> Sweep<'a> {
             return false;
         }
         if metadata.is_dir() {
-            self.directory(path, metadata)
+            self.directory(parent, name, path, &metadata)
         } else {
-            self.unlink(path, metadata)
+            self.unlink(parent, name, path, &metadata)
         }
     }
 
-    fn directory(&mut self, path: &Path, metadata: &fs::Metadata) -> bool {
-        let listing = match fs::read_dir(path) {
+    fn directory(
+        &mut self,
+        parent: &fs::File,
+        name: &OsStr,
+        path: &Path,
+        metadata: &Metadata,
+    ) -> bool {
+        // The same `O_NOFOLLOW` open as the descent. If the directory just seen by `fstatat`
+        // has become a symlink in the meantime, this fails rather than following it — which
+        // is the whole reason the traversal is written against descriptors.
+        let dir = match open_dir_nofollow(parent, Path::new(name)) {
+            Ok(dir) => dir,
+            Err(err) => {
+                self.failed(path, &err);
+                return false;
+            }
+        };
+        let listing = match read_base_dir(&dir) {
             Ok(listing) => listing,
             Err(err) => {
                 // Not an empty directory. A cleaner that treats "I could not look" as "there
@@ -646,7 +680,7 @@ impl<'a> Sweep<'a> {
         let mut complete = true;
         for child in listing {
             match child {
-                Ok(child) => children.push(child),
+                Ok(child) => children.push(child.file_name()),
                 // `readdir` gave up part-way through a directory it had already opened, so
                 // the listing is short by an unknown amount. Anything below is unaccounted
                 // for, which is exactly the state in which nothing may be removed.
@@ -659,7 +693,7 @@ impl<'a> Sweep<'a> {
 
         // Before anything in this directory is touched: a checkout under here may hold work
         // that exists nowhere else, and half-removing it is worse than not starting.
-        if children.iter().any(|child| child.file_name() == ".git") {
+        if children.iter().any(|child| child == ".git") {
             self.kept.push(Refused {
                 path: path.to_path_buf(),
                 reason: Refusal::HoldsCheckout,
@@ -668,14 +702,7 @@ impl<'a> Sweep<'a> {
         }
 
         for child in children {
-            let child = child.path();
-            match child.symlink_metadata() {
-                Ok(metadata) => complete &= self.entry(&child, &metadata),
-                Err(err) => {
-                    self.failed(&child, &err);
-                    complete = false;
-                }
-            }
+            complete &= self.entry(&dir, &child, &path.join(&child));
         }
 
         // Only once every child is known to be gone. An `rmdir` attempted over a refusal
@@ -684,7 +711,9 @@ impl<'a> Sweep<'a> {
         if !complete {
             return false;
         }
-        match fs::remove_dir(path) {
+        // `unlinkat(parent_fd, name, AT_REMOVEDIR)`, so what is removed is the entry we just
+        // walked and not whatever the name resolves to now.
+        match remove_dir(parent, Path::new(name)) {
             Ok(()) => {
                 self.count(metadata);
                 true
@@ -698,8 +727,14 @@ impl<'a> Sweep<'a> {
 
     /// Unlinks a file or a symlink. A symlink is removed as a link: what it points at is
     /// somewhere else, is very likely outside the root, and is not ours.
-    fn unlink(&mut self, path: &Path, metadata: &fs::Metadata) -> bool {
-        match fs::remove_file(path) {
+    fn unlink(
+        &mut self,
+        parent: &fs::File,
+        name: &OsStr,
+        path: &Path,
+        metadata: &Metadata,
+    ) -> bool {
+        match remove_file(parent, Path::new(name)) {
             Ok(()) => {
                 self.count(metadata);
                 true
@@ -711,7 +746,7 @@ impl<'a> Sweep<'a> {
         }
     }
 
-    fn count(&mut self, metadata: &fs::Metadata) {
+    fn count(&mut self, metadata: &Metadata) {
         self.entries += 1;
         if let Some(identity) = multiply_linked(metadata) {
             if !self.linked.insert(identity) {
@@ -789,7 +824,10 @@ fn resolve(path: &Path, root: &Path) -> Result<PathBuf, Refusal> {
 /// One expression, called from both the plan and the sweep, so "a mount is not crossed" is
 /// one decision rather than two that can drift apart. A mount is where a scan of one project
 /// reaches a network share, a Time Machine volume or another user's disk.
-fn crosses_boundary(one_file_system: bool, boundary: u64, metadata: &fs::Metadata) -> bool {
+///
+/// Generic because the plan stats by path and the sweep stats by descriptor, which produce
+/// two different metadata types for the same `st_dev`.
+fn crosses_boundary(one_file_system: bool, boundary: u64, metadata: &impl Stat) -> bool {
     one_file_system && device(metadata) != boundary
 }
 

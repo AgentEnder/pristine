@@ -159,26 +159,105 @@ impl Measurer {
     }
 }
 
+/// The stat fields the byte accounting needs, from whichever `stat` produced them.
+///
+/// There are two, and they are not interchangeable types. The measurer walks by *path* and so
+/// holds [`std::fs::Metadata`]; the deleter walks by *descriptor* and so holds
+/// `cap_primitives`' metadata, which is what an `fstatat` against an open directory returns.
+/// The rules below — allocated blocks, a hard link counted once — have to be the same for
+/// both, or a plan's estimate and the bytes it reports freeing would be measured differently.
+#[cfg(unix)]
+pub(crate) trait Stat {
+    fn is_dir(&self) -> bool;
+    fn dev(&self) -> u64;
+    fn ino(&self) -> u64;
+    fn nlink(&self) -> u64;
+    fn blocks(&self) -> u64;
+}
+
+#[cfg(unix)]
+impl Stat for fs::Metadata {
+    fn is_dir(&self) -> bool {
+        Self::is_dir(self)
+    }
+    fn dev(&self) -> u64 {
+        std::os::unix::fs::MetadataExt::dev(self)
+    }
+    fn ino(&self) -> u64 {
+        std::os::unix::fs::MetadataExt::ino(self)
+    }
+    fn nlink(&self) -> u64 {
+        std::os::unix::fs::MetadataExt::nlink(self)
+    }
+    fn blocks(&self) -> u64 {
+        std::os::unix::fs::MetadataExt::blocks(self)
+    }
+}
+
+#[cfg(unix)]
+impl Stat for cap_primitives::fs::Metadata {
+    fn is_dir(&self) -> bool {
+        Self::is_dir(self)
+    }
+    fn dev(&self) -> u64 {
+        cap_primitives::fs::MetadataExt::dev(self)
+    }
+    fn ino(&self) -> u64 {
+        cap_primitives::fs::MetadataExt::ino(self)
+    }
+    fn nlink(&self) -> u64 {
+        cap_primitives::fs::MetadataExt::nlink(self)
+    }
+    fn blocks(&self) -> u64 {
+        cap_primitives::fs::MetadataExt::blocks(self)
+    }
+}
+
+/// The same two sources, where there are no block or link counts to be had.
+#[cfg(not(unix))]
+pub(crate) trait Stat {
+    fn is_dir(&self) -> bool;
+    fn apparent_len(&self) -> u64;
+}
+
+#[cfg(not(unix))]
+impl Stat for fs::Metadata {
+    fn is_dir(&self) -> bool {
+        Self::is_dir(self)
+    }
+    fn apparent_len(&self) -> u64 {
+        self.len()
+    }
+}
+
+#[cfg(not(unix))]
+impl Stat for cap_primitives::fs::Metadata {
+    fn is_dir(&self) -> bool {
+        Self::is_dir(self)
+    }
+    fn apparent_len(&self) -> u64 {
+        self.len()
+    }
+}
+
 /// Bytes actually allocated on disk, which is what deleting gives back.
 #[cfg(unix)]
-pub(crate) fn allocated(metadata: &fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.blocks() * 512
+pub(crate) fn allocated(stat: &impl Stat) -> u64 {
+    stat.blocks() * 512
 }
 
 #[cfg(not(unix))]
-pub(crate) fn allocated(metadata: &fs::Metadata) -> u64 {
-    metadata.len()
+pub(crate) fn allocated(stat: &impl Stat) -> u64 {
+    stat.apparent_len()
 }
 
 #[cfg(unix)]
-pub(crate) fn device(metadata: &fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.dev()
+pub(crate) fn device(stat: &impl Stat) -> u64 {
+    stat.dev()
 }
 
 #[cfg(not(unix))]
-pub(crate) fn device(_metadata: &fs::Metadata) -> u64 {
+pub(crate) fn device(_stat: &impl Stat) -> u64 {
     0
 }
 
@@ -190,13 +269,12 @@ pub(crate) fn device(_metadata: &fs::Metadata) -> u64 {
 /// a store *outside* the claim: deleting the tree frees only the links. Answering that would
 /// mean proving no link lives elsewhere, which costs a scan of the whole filesystem.
 #[cfg(unix)]
-pub(crate) fn multiply_linked(metadata: &fs::Metadata) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    (metadata.nlink() > 1 && !metadata.is_dir()).then(|| (metadata.dev(), metadata.ino()))
+pub(crate) fn multiply_linked(stat: &impl Stat) -> Option<(u64, u64)> {
+    (stat.nlink() > 1 && !stat.is_dir()).then(|| (stat.dev(), stat.ino()))
 }
 
 #[cfg(not(unix))]
-pub(crate) fn multiply_linked(_metadata: &fs::Metadata) -> Option<(u64, u64)> {
+pub(crate) fn multiply_linked(_stat: &impl Stat) -> Option<(u64, u64)> {
     None
 }
 

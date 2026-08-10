@@ -61,9 +61,11 @@ a copy, which is exactly the wrong thing to do to a 40 GB tree. The checks below
 instead, and every one of them is a test rather than a promise.
 
 - Every target's path is resolved — `..` and symlinked ancestors and all — and proved to be under the
-  scan root before any unlink. The scan root itself is never a target. The way down to a target is
-  proved again when the removal starts, so a directory swapped for a symlink while the confirmation
-  prompt was on screen is reported rather than followed out of the root.
+  scan root before any unlink. The scan root itself is never a target.
+- Nothing is removed by name. The scan root is opened once and every entry beneath it is reached by
+  `openat` from an already-open parent with `O_NOFOLLOW`, then removed by `unlinkat` against that
+  same descriptor. Re-pointing a directory mid-run — even while the removal is inside it — can make
+  the removal fail and say so, but it cannot redirect one out of the root.
 - Symlinks are never followed out of the root. A symlinked target is unlinked as a link, and so is
   every link found inside one.
 - A filesystem boundary is not crossed unless `--one-file-system=false`.
