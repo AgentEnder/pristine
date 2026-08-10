@@ -46,8 +46,15 @@
 //! Rust. The root is opened once per batch rather than once per target, so the root itself
 //! cannot be swapped mid-run either.
 //!
-//! One ambient, path-based call survives, and it has to: opening the scan root. That is the
-//! directory the user named, and every descriptor below it descends from that one handle.
+//! One path still has to be resolved by name, and it cannot be avoided: the scan root has to
+//! be opened from somewhere. That makes it the most dangerous name in the program rather than
+//! an exempt one, because every descriptor descends from that handle — get it wrong and the
+//! whole batch is misdirected, not one target. So [`open_root`] opens the root's final
+//! component with `O_NOFOLLOW` from its own parent, and then checks the descriptor's
+//! `(device, inode)` against the pair recorded while the plan was built. The second check is
+//! the one that matters: a root renamed away and replaced by an ordinary directory on the same
+//! filesystem offers no symlink to refuse and crosses no boundary, so nothing about the name
+//! distinguishes it from the directory the planner validated. Only the inode does.
 //!
 //! ## Fan-out
 //!
@@ -74,7 +81,7 @@ use cap_primitives::fs::{
     remove_file, stat,
 };
 
-use crate::size::{Size, Stat, allocated, device, multiply_linked};
+use crate::size::{Size, Stat, allocated, device, identity, multiply_linked};
 use crate::walk::Hit;
 
 /// How far the pool is oversubscribed past the machine's parallelism, because the work is
@@ -184,6 +191,10 @@ pub struct PlanTarget {
 #[derive(Debug, Clone)]
 pub struct Plan {
     root: PathBuf,
+    /// Which directory the root's path named when the plan was built. The deleter has to
+    /// resolve that path once, and this is what proves the descriptor it gets back is the
+    /// same directory rather than whatever has taken the name since.
+    root_identity: Option<(u64, u64)>,
     targets: Vec<PlanTarget>,
     kept: Vec<Refused>,
     boundary: u64,
@@ -284,7 +295,11 @@ impl Planner {
         I: IntoIterator<Item = Target>,
     {
         let now = SystemTime::now();
-        let (root, boundary) = match canonical_root(&self.root) {
+        let ValidatedRoot {
+            path: root,
+            device: boundary,
+            identity: root_identity,
+        } = match canonical_root(&self.root) {
             Ok(resolved) => resolved,
             Err(err) => {
                 // With no root there is nothing to prove anything against, so every target
@@ -292,6 +307,7 @@ impl Planner {
                 let why = format!("{}: {err}", self.root.display());
                 return Plan {
                     root: self.root.clone(),
+                    root_identity: None,
                     targets: Vec::new(),
                     kept: targets
                         .into_iter()
@@ -336,6 +352,7 @@ impl Planner {
 
         Plan {
             root,
+            root_identity,
             targets,
             kept,
             boundary,
@@ -413,10 +430,11 @@ impl Deleter {
             return removal;
         }
 
-        // The one ambient, path-based call in the whole removal, and the anchor for every
-        // descriptor below it. Opening it once per batch rather than once per target means
-        // the root cannot be swapped between two targets either.
-        let root = match open_ambient_dir(&plan.root, ambient_authority()) {
+        // The one path resolved by name in the whole removal, and the anchor for every
+        // descriptor below it, so it is checked hardest — see [`open_root`]. Opened once per
+        // batch rather than once per target, which also means the root cannot be swapped
+        // between two targets.
+        let root = match open_root(plan) {
             Ok(root) => root,
             Err(err) => {
                 removal.failures.push(Failure {
@@ -790,11 +808,56 @@ pub fn confirm(
     ))
 }
 
-/// The canonical root and the device it lives on.
-fn canonical_root(root: &Path) -> io::Result<(PathBuf, u64)> {
+/// The scan root as the planner proved it: where it really is, which device everything under
+/// it has to sit on, and — the part a path cannot carry — which directory it actually is.
+struct ValidatedRoot {
+    path: PathBuf,
+    device: u64,
+    identity: Option<(u64, u64)>,
+}
+
+/// The canonical root, the device it lives on, and the inode it is.
+fn canonical_root(root: &Path) -> io::Result<ValidatedRoot> {
     let canonical = fs::canonicalize(root)?;
     let metadata = canonical.symlink_metadata()?;
-    Ok((canonical, device(&metadata)))
+    Ok(ValidatedRoot {
+        device: device(&metadata),
+        identity: identity(&metadata),
+        path: canonical,
+    })
+}
+
+/// Opens the scan root, and proves the descriptor is the directory the planner validated.
+///
+/// This is the one path still resolved by name, and therefore the one place a name decides
+/// which directory a whole batch acts on: every other descriptor descends from this one, so
+/// getting it wrong misdirects everything rather than one target. Two guards, because they
+/// catch different attacks.
+///
+/// The final component is opened with `O_NOFOLLOW` from its own parent, so a root replaced by
+/// a symlink fails here rather than quietly anchoring the sweep somewhere else.
+///
+/// Then the descriptor's `(device, inode)` is compared with the pair recorded when the plan was
+/// built. That is the load-bearing one: a root renamed away and replaced by an ordinary
+/// directory offers no symlink to refuse, and if the replacement is on the same filesystem the
+/// boundary check passes too. Nothing about the *name* tells the two apart — only the inode.
+fn open_root(plan: &Plan) -> io::Result<fs::File> {
+    let opened = match (plan.root.parent(), plan.root.file_name()) {
+        (Some(parent), Some(name)) => {
+            let parent = open_ambient_dir(parent, ambient_authority())?;
+            open_dir_nofollow(&parent, Path::new(name))?
+        }
+        // `/` has no parent to be opened from, and cannot itself be a symlink.
+        _ => open_ambient_dir(&plan.root, ambient_authority())?,
+    };
+    // `fstat` on the descriptor rather than a stat on the path, so what is checked is the
+    // directory now held open and not whatever the name resolves to a moment later.
+    if identity(&opened.metadata()?) != plan.root_identity {
+        return Err(io::Error::other(
+            "the scan root is no longer the directory the plan was built against",
+        ));
+    }
+    Ok(opened)
 }
 
 /// Resolves `path` and proves it is under `root`, without resolving the final component.

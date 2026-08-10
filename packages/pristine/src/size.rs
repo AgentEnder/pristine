@@ -261,6 +261,28 @@ pub(crate) fn device(_stat: &impl Stat) -> u64 {
     0
 }
 
+/// What names a directory for as long as it exists, which a *path* does not.
+///
+/// The deleter records this for the scan root while the plan is built and checks it against the
+/// descriptor it later opens, because the root is the one name that still has to be resolved
+/// and a renamed-away root can be replaced by something that answers to the same name on the
+/// same device.
+///
+/// `None` off unix, where there is no stable pair to be had. The whole `st_dev` family of
+/// checks is equally inert there — see [`device`] — and the crate claims macOS and Linux.
+// The `Option` is not redundant: it is `None` in the `not(unix)` arm below, and a caller has
+// to be able to tell "this platform cannot answer" from an answer.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn identity(stat: &impl Stat) -> Option<(u64, u64)> {
+    Some((stat.dev(), stat.ino()))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn identity(_stat: &impl Stat) -> Option<(u64, u64)> {
+    None
+}
+
 /// The `(device, inode)` identity of a file with more than one hard link, or `None` when it
 /// has exactly one and cannot be double-counted.
 ///

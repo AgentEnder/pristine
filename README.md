@@ -66,6 +66,10 @@ instead, and every one of them is a test rather than a promise.
   `openat` from an already-open parent with `O_NOFOLLOW`, then removed by `unlinkat` against that
   same descriptor. Re-pointing a directory mid-run — even while the removal is inside it — can make
   the removal fail and say so, but it cannot redirect one out of the root.
+- The scan root is the one name that still has to be resolved, so it is checked twice: its final
+  component is opened without following a symlink, and the descriptor is then matched against the
+  device and inode recorded when the plan was built. A root renamed away and replaced — even by an
+  ordinary directory on the same disk, laid out to match — is reported rather than swept.
 - Symlinks are never followed out of the root. A symlinked target is unlinked as a link, and so is
   every link found inside one.
 - A filesystem boundary is not crossed unless `--one-file-system=false`.

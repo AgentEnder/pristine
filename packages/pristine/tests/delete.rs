@@ -249,6 +249,82 @@ fn an_ancestor_swapped_for_a_link_after_planning_cannot_take_the_removal_out_of_
     assert!(!removal.failures.is_empty(), "the swap was not reported");
 }
 
+/// The scan ROOT swapped, which is the one name a descriptor-relative sweep still has to
+/// resolve — every other descriptor descends from this one, so getting it wrong misdirects the
+/// entire batch rather than one target.
+///
+/// The mirror sits on the same filesystem and is laid out name for name, so neither the
+/// boundary check nor an `ENOENT` can be what saves this. Two separate guards have to hold:
+/// the root's final component is opened with `O_NOFOLLOW`, and the descriptor's identity is
+/// checked against the one the planner recorded.
+#[cfg(unix)]
+#[test]
+fn the_scan_root_swapped_for_a_link_after_planning_misdirects_nothing() {
+    let (_tmp, base) = fixture();
+    let root = base.join("root");
+    let target = root.join("app/node_modules");
+    touch(&target.join("left-pad/index.js"));
+    let mirror = base.join("mirror");
+    touch(&mirror.join("app/node_modules/left-pad/index.js"));
+    let intact = walk_files(&mirror);
+
+    let plan = plan_for(&root, std::slice::from_ref(&target));
+    assert_eq!(targets(&plan), std::slice::from_ref(&target));
+
+    // The root itself moves this time, not something beneath it.
+    fs::rename(&root, base.join("parked")).unwrap();
+    std::os::unix::fs::symlink(&mirror, &root).unwrap();
+
+    let removal = Deleter::new().remove(&plan);
+
+    assert_eq!(
+        walk_files(&mirror),
+        intact,
+        "the batch was anchored to a swapped root and deleted from the mirror"
+    );
+    assert!(removal.removed.is_empty(), "{:?}", removal.removed);
+    assert!(
+        !removal.failures.is_empty(),
+        "the swapped root was not reported"
+    );
+}
+
+/// The same swap done with a real directory rather than a symlink, which is what makes the
+/// identity check load-bearing rather than belt-and-braces.
+///
+/// There is no link here to refuse, the replacement is a perfectly ordinary directory on the
+/// same device, and its layout matches. Nothing about the *name* distinguishes it from the
+/// directory the planner validated — only the inode does.
+#[cfg(unix)]
+#[test]
+fn the_scan_root_replaced_by_a_real_directory_after_planning_misdirects_nothing() {
+    let (_tmp, base) = fixture();
+    let root = base.join("root");
+    let target = root.join("app/node_modules");
+    touch(&target.join("left-pad/index.js"));
+    let mirror = base.join("mirror");
+    touch(&mirror.join("app/node_modules/left-pad/index.js"));
+
+    let plan = plan_for(&root, std::slice::from_ref(&target));
+    assert_eq!(targets(&plan), std::slice::from_ref(&target));
+
+    fs::rename(&root, base.join("parked")).unwrap();
+    fs::rename(&mirror, &root).unwrap();
+
+    let removal = Deleter::new().remove(&plan);
+
+    // The mirror now answers to the root's name, so it is checked where it now lives.
+    assert!(
+        root.join("app/node_modules/left-pad/index.js").exists(),
+        "the batch was anchored to a replaced root and deleted from it"
+    );
+    assert!(removal.removed.is_empty(), "{:?}", removal.removed);
+    assert!(
+        !removal.failures.is_empty(),
+        "the replaced root was not reported"
+    );
+}
+
 /// The escape attempted at the one instant it is guaranteed to matter: after the removal has
 /// demonstrably begun descending into the target, and held there for the rest of the run.
 ///
