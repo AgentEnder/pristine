@@ -305,6 +305,34 @@ fn yes_on_its_own_selects_nothing() {
     assert!(printed.contains("nothing selected"), "{printed}");
 }
 
+#[test]
+fn yes_does_not_ask_what_to_do_however_eagerly_the_input_answers() {
+    let (_tmp, root) = checkout();
+    sediment(&root);
+    write(&root.join("tracked.txt"), "changed\n");
+
+    // Closed input proves nothing here, because every prompt defaults to no anyway. The
+    // dangerous shape is an input that says yes to everything: if `--yes` let the cascade run,
+    // it would select reset AND both lists and then skip the final confirmation it is supposed
+    // to be the answer TO — turning "I consent to what I asked for" into "I consent to
+    // whatever I am about to be asked".
+    let printed = succeeds(&root, &["--yes"], "3\ny\ny\ny\ny\ny\n");
+
+    assert!(
+        !printed.contains("[y/N]"),
+        "--yes reached a prompt:\n{printed}"
+    );
+    assert!(!printed.contains("Reset changed"), "{printed}");
+    assert!(printed.contains("nothing selected"), "{printed}");
+    assert!(root.join("dist/bundle.js").exists(), "{printed}");
+    assert!(root.join("node_modules").exists(), "{printed}");
+    assert_eq!(
+        fs::read_to_string(root.join("tracked.txt")).unwrap(),
+        "changed\n",
+        "--yes reset a work tree nobody asked it to"
+    );
+}
+
 // ------------------------------------------------------------------------------------------
 // The dry run.
 // ------------------------------------------------------------------------------------------
@@ -413,6 +441,70 @@ fn a_bare_reset_is_a_hard_one() {
             .is_empty(),
         "a bare --reset was not a hard one"
     );
+}
+
+#[test]
+fn a_reset_that_makes_a_planned_target_tracked_does_not_delete_it() {
+    let (_tmp, root) = checkout();
+    // The stale-index window, and the reason the plan cannot outlive the reset. `git rm
+    // --cached` takes the file out of the INDEX and leaves it on disk, so `git clean -n -d`
+    // reports it as untracked and it lands on the plan — and then `git reset --hard HEAD` puts
+    // it back in the index, making it a tracked file. A plan built before the reset and
+    // executed after it deletes a file that is, by the time of the unlink, tracked and
+    // committed.
+    git(&root, &["rm", "--cached", "--quiet", "tracked.txt"]);
+    write(&root.join("scratch.txt"), "untracked\n");
+    assert!(
+        git(&root, &["clean", "-n", "-d"]).contains("tracked.txt"),
+        "the fixture did not reach the state the bug needs"
+    );
+
+    let printed = succeeds(&root, &["--reset=hard", "--untracked", "--yes"], "");
+
+    assert!(
+        root.join("tracked.txt").exists(),
+        "a file the reset made tracked was deleted by a plan built before it:\n{printed}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("tracked.txt")).unwrap(),
+        "the original\n"
+    );
+    // The rest of the run still happens: this is a narrowing, not an abort.
+    assert!(!root.join("scratch.txt").exists(), "{printed}");
+}
+
+#[test]
+fn a_reset_that_makes_git_collapse_a_directory_does_not_widen_the_plan() {
+    let (_tmp, root) = checkout();
+    // The other half of the same window, and the destructive one. `dir/` holds three things:
+    // an untracked file, a file staged but never committed, and an env file that repo mode
+    // holds back by default.
+    write(&root.join("dir/a.txt"), "untracked\n");
+    write(&root.join("dir/.env"), "SECRET=1\n");
+    write(&root.join("dir/staged.txt"), "staged\n");
+    git(&root, &["add", "dir/staged.txt"]);
+
+    // Before the reset git will not collapse `dir/`, because `staged.txt` is tracked — so the
+    // plan names `dir/a.txt`, and `dir/.env` is excluded from it.
+    let before = git(&root, &["clean", "-n", "-d"]);
+    assert!(before.contains("dir/a.txt"), "{before}");
+    assert!(!before.contains("Would remove dir/\n"), "{before}");
+
+    let printed = succeeds(&root, &["--reset=hard", "--untracked", "--yes"], "");
+
+    // The reset deletes `staged.txt`, and git then collapses `dir/` — so a re-enumeration that
+    // was merely trusted would remove the whole directory, taking with it the env file the
+    // user was told had been held back and never saw on any plan.
+    assert!(
+        root.join("dir/.env").exists(),
+        "the reset widened the plan onto a file that was deliberately excluded:\n{printed}"
+    );
+    assert!(
+        printed.contains("withdrawn after the reset"),
+        "the widening was not reported:\n{printed}"
+    );
+    // Nothing was staged, so the reset removed it.
+    assert!(!root.join("dir/staged.txt").exists(), "{printed}");
 }
 
 #[test]

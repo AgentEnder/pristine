@@ -221,18 +221,28 @@ impl From<ResetScope> for Reset {
 }
 
 impl RepoArgs {
-    /// Whether the command line said what to do.
+    /// Whether the command line, rather than a person, is resolving the plan.
     ///
     /// The presence of *any* of these makes the run non-interactive, which is the whole reason
     /// the rule exists: a prompt in CI is a hang, and a hang is worse than a refusal. The two
     /// modifiers count, because passing one is a statement about the plan even though it
     /// selects nothing on its own.
+    ///
+    /// **`--yes` counts too, and leaving it out was a hole.** It selects nothing — see
+    /// [`RepoArgs::selection`], which never reads it — so `pristine repo --yes` still resolves
+    /// to an empty selection and does nothing. But if it did not make the run non-interactive,
+    /// `--yes` would put the cascade and the skipped confirmation in the same run: a person
+    /// could be asked what to clean and then never asked to confirm it, because the flag that
+    /// was supposed to be the answer to the final question had already answered it in advance.
+    /// That turns "I consent to what I asked for" into "I consent to whatever I am about to be
+    /// asked", which is the one reading of consent this must not have.
     fn chosen(&self) -> bool {
         self.reset.is_some()
             || self.untracked
             || self.ignored
             || self.node_modules.is_some()
             || self.env.is_some()
+            || self.yes
     }
 
     fn selection(&self) -> Selection {
@@ -348,9 +358,22 @@ fn run(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::error::Er
 
 /// Cleans one checkout.
 ///
-/// The order is the one the Node predecessor established and it has exactly one consequence:
-/// **the reset happens first**, before anything is unlinked, because restoring a tracked file
-/// the deleter is about to walk past is the only way these two steps can interfere.
+/// The order is the one the Node predecessor established, and **the reset happens first**. What
+/// that costs is the thing this function is shaped around: `git clean` answers out of the
+/// index, the reset MOVES the index, so a plan built before a reset is a plan about a
+/// repository that no longer exists.
+///
+/// It is not a theoretical window. `git rm --cached tracked.txt` leaves a committed file on
+/// disk and out of the index, so `git clean -n -d` reports it as untracked and it lands on the
+/// plan — and then `git reset --hard HEAD` puts it back, making it tracked. Executing the
+/// original plan deletes a committed file, which is the one thing `git clean` semantics exist
+/// to make impossible.
+///
+/// So the enumeration does not outlive the reset. After the reset the work tree is asked again,
+/// and the answer is narrowed to what the user was shown and confirmed — see [`reconsider`].
+/// Both halves are load-bearing: re-asking is what stops a now-tracked file being deleted, and
+/// narrowing is what stops a *newly* collapsed directory being deleted without ever appearing
+/// on a plan anybody saw.
 ///
 /// Untracked and ignored, by contrast, go into ONE plan rather than two sequential ones. The
 /// design says "untracked, then ignored" and the two lists are disjoint by construction, so the
@@ -375,10 +398,20 @@ fn clean(args: &RepoArgs, out: &mut impl Write) -> Result<bool, Box<dyn std::err
     let selected = pristine::repo::select(&enumeration, &selection);
     // The work tree root, not the path the user typed: the plan's under-root check is what
     // keeps every target inside the checkout, and the checkout is what repo mode cleans.
-    let plan = Planner::new(repo.root()).plan(selected.targets.iter().cloned());
+    let mut plan = Planner::new(repo.root()).plan(selected.targets.iter().cloned());
     write_repo_plan(out, &plan, selection, &selected, &enumeration)?;
 
     if args.dry_run {
+        if selection.reset.is_some() {
+            // A dry run does not reset, so it cannot show what the work tree looks like
+            // afterwards. Saying so keeps the preview honest: the list above is what a real
+            // run starts from, and the reset can only take rows off it.
+            writeln!(
+                out,
+                "note: a real run re-asks git after the reset, so the list above is an upper \
+                 bound"
+            )?;
+        }
         writeln!(out, "\ndry run: nothing was reset and nothing was removed")?;
         return Ok(true);
     }
@@ -402,7 +435,11 @@ fn clean(args: &RepoArgs, out: &mut impl Write) -> Result<bool, Box<dyn std::err
         // The plan above already said which command this is. What is worth saying here is only
         // that it ran, because it ran before the removal and the removal may yet report
         // something.
-        writeln!(out, "\nreset: done")?;
+        writeln!(out, "reset: done")?;
+        // ...and the index has moved under the plan. Ask again.
+        let (refreshed, withdrawn) = reconsider(&repo, selection, &plan)?;
+        write_withdrawn(out, &withdrawn, plan.root())?;
+        plan = refreshed;
     }
     if plan.is_empty() {
         return Ok(true);
@@ -413,6 +450,74 @@ fn clean(args: &RepoArgs, out: &mut impl Write) -> Result<bool, Box<dyn std::err
         eprintln!("pristine: {}: {}", failure.path.display(), failure.message);
     }
     Ok(removal.is_clean())
+}
+
+/// Asks the work tree again after a reset, and narrows the answer to what was confirmed.
+///
+/// Two separate jobs, and each catches a different way the reset can invalidate a plan.
+///
+/// **Re-asking** catches a target that stopped being removable. `git clean` answers out of the
+/// index, so a file that was outside it — `git rm --cached` on a committed file is the ordinary
+/// route — is untracked before the reset and tracked after it. It is on the plan and it must
+/// not be deleted, and the only authority on that is git, asked again.
+///
+/// **Narrowing** catches the opposite: a target that appeared, or grew, because of the reset. A
+/// hard reset deletes a file that was staged but never committed, and a directory whose last
+/// non-removable child was that file is one git now collapses — so `git clean` starts offering
+/// the whole directory where it previously offered one child. Deleting it would be deleting
+/// something no plan ever showed anyone. Anything not contained by a confirmed target is
+/// therefore withdrawn rather than executed, and the user runs again against a listing that is
+/// true.
+///
+/// The comparison is against [`PlanTarget::requested`] — the path as this handed it in, before
+/// the planner resolved it — because both sides are built by the same code from the same work
+/// tree root, so they are directly comparable without either being canonicalised.
+fn reconsider(
+    repo: &Repo,
+    selection: Selection,
+    confirmed: &Plan,
+) -> Result<(Plan, Vec<PathBuf>), pristine::RepoError> {
+    let enumeration = repo.enumerate()?;
+    let approved: Vec<&Path> = confirmed
+        .targets()
+        .iter()
+        .map(|target| target.requested.as_path())
+        .collect();
+
+    let mut targets = Vec::new();
+    let mut withdrawn = Vec::new();
+    for target in pristine::repo::select(&enumeration, &selection).targets {
+        // `starts_with` compares whole components, so `out-takes` is not under `out`.
+        if approved.iter().any(|ok| target.path.starts_with(ok)) {
+            targets.push(target);
+        } else {
+            withdrawn.push(target.path);
+        }
+    }
+    withdrawn.sort_unstable();
+    Ok((Planner::new(repo.root()).plan(targets), withdrawn))
+}
+
+/// What the reset put beyond what was confirmed, and what to do about it.
+fn write_withdrawn(
+    out: &mut impl Write,
+    withdrawn: &[PathBuf],
+    root: &Path,
+) -> std::io::Result<()> {
+    if withdrawn.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "withdrawn after the reset: {}, because the reset made them reach past the plan you \
+         confirmed. Run again to see them.",
+        plural(withdrawn.len(), PATH)
+    )?;
+    for path in withdrawn {
+        let path = path.strip_prefix(root).unwrap_or(path);
+        writeln!(out, "  {}", path.display())?;
+    }
+    Ok(())
 }
 
 /// The cascade, asked only when the command line did not answer it.
@@ -889,6 +994,10 @@ mod tests {
             "--ignored",
             "--node-modules",
             "--env",
+            // `--yes` selects nothing, but it does mean the command line is resolving the
+            // plan. Left out, it would put the cascade and the skipped final confirmation in
+            // the same run.
+            "--yes",
         ] {
             assert!(repo(&[flag]).chosen(), "`{flag}` left the run interactive");
         }
@@ -904,7 +1013,10 @@ mod tests {
             consented.selection().is_empty(),
             "consent was read as a selection"
         );
-        assert!(!consented.chosen(), "consent was read as an action");
+        // It does resolve the plan from the command line, though, which is a different claim
+        // from selecting something and is what keeps the cascade and the skipped confirmation
+        // out of the same run. See `RepoArgs::chosen`.
+        assert!(consented.chosen(), "consent left the run interactive");
     }
 
     #[test]
