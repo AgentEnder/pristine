@@ -1,0 +1,63 @@
+# pristine
+
+A language-agnostic reclaimable-space finder and cleaner.
+
+`du` tells you where the bytes are. It cannot tell you which of them you are allowed to delete.
+pristine answers the second question: it finds build artifacts and vendored dependency directories
+across every ecosystem on the machine, shows you what each costs, and tells you the command that
+regenerates it before you decide.
+
+`node_modules` is one ecosystem's answer to a question every ecosystem answers. The same disk is also
+carrying `target/`, `.venv/`, `bin/`, `obj/`, `_build/`, `.gradle/` and `vendor/`, all equally
+reclaimable and all invisible to a tool that only knows about npm.
+
+> **Status: nothing is implemented yet.** This repository is a root commit. The design is settled and
+> lives outside this repo; the scaffold is the next piece of work.
+
+## How it finds things
+
+Two tiers.
+
+**A curated marker ruleset.** Detection is marker-anchored, never name-anchored, because directory
+names collide across ecosystems in ways that matter. `target/` is Rust's build output and also
+Maven's. `vendor/` belongs to Go, Composer and Bundler. `build/` is Gradle's output, Dart's output,
+and in a CMake project it is ordinary source that must never be touched. So a rule is a pair: a
+directory name plus a marker file that has to be present in its parent. `node_modules` next to a
+`package.json` is reclaimable. A `build` directory next to nothing in particular is not.
+
+**A gitignore fallback.** Inside a git work tree, a directory that is ignored, contains no tracked
+file at any depth, and exceeds a size floor is reclaimable by inference even when no rule names it.
+This is what makes the tool genuinely language-agnostic rather than agnostic across whichever
+ecosystems happened to get a rule written. The "no tracked files" condition is the safety property,
+and it is exactly the guarantee `git clean` enforces.
+
+## Two modes
+
+- **sweep** across a directory tree, for "my disk is full". Every project underneath, sorted by size.
+- **repo** inside a single checkout, git-aware, inheriting `git clean`'s exact semantics for nested
+  ignore files, negations and `info/exclude`, plus the guarantee that a directory holding a tracked
+  file is never removed.
+
+Both share one walker and one deleter.
+
+## Safety
+
+- Every target is resolved and asserted to be under the scan root before any unlink.
+- Symlinks are never followed out of the root.
+- Nested git repositories are not descended into during a sweep, and are reported.
+- `--dry-run` prints the plan and deletes nothing. The final confirmation defaults to no.
+- Failures never abort the batch; they are collected, reported, and set a non-zero exit.
+
+## Install
+
+Not yet published. When it is:
+
+```sh
+brew install pristine
+npx @agentender/pristine
+cargo install pristine-cli    # the crate is `pristine-cli`; the binary is `pristine`
+```
+
+## License
+
+MIT

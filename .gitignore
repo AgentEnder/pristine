@@ -1,0 +1,20 @@
+# Rust build output. One `target/` at the workspace root: cargo puts every member's
+# artifacts there, so there is nothing to ignore under `packages/`.
+/target
+
+# Node dependencies and the Nx scaffold
+node_modules/
+.nx/
+*.tsbuildinfo
+
+# Logs and scratch output
+*.log
+
+# Agent worktrees: full checkouts of this repo living inside it. Every tool that walks
+# the tree would otherwise find a second copy of every file, so Nx sees duplicate
+# projects and linters check stale code.
+/.worktrees/
+/worktrees/
+
+# OS noise
+.DS_Store
