@@ -1,0 +1,25 @@
+{
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "name": "pristine",
+  "projectType": "application",
+  "sourceRoot": "packages/pristine/src",
+  "targets": {
+    "build": {
+      "command": "cargo build --release -p pristine-cli",
+      "outputs": ["{workspaceRoot}/target/release/pristine"]
+    },
+    "test": {
+      "command": "cargo test -p pristine-cli --all-features"
+    },
+    "lint": {
+      "command": "cargo clippy -p pristine-cli --all-targets --all-features -- -D warnings"
+    },
+    "fmt": {
+      "command": "cargo fmt -p pristine-cli",
+      "cache": false
+    },
+    "fmt-check": {
+      "command": "cargo fmt -p pristine-cli -- --check"
+    }
+  }
+}

@@ -1,0 +1,7 @@
+packages:
+  - packages/*
+
+# nx's postinstall wires up its platform-native binary. pnpm 11 blocks install scripts
+# unless they are named here.
+allowBuilds:
+  nx: true

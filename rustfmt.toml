@@ -1,0 +1,8 @@
+# Stable-only options: CI formats with the stable toolchain pinned in mise.toml, and a
+# nightly-gated key here would degrade into a warning that `cargo fmt --check` still exits
+# 0 on, which is the worst of both worlds.
+style_edition = "2024"
+max_width = 100
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_try_shorthand = true
