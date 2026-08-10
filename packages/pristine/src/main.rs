@@ -6,9 +6,13 @@
 //! is enough to point the library at a directory and read what it found, and it exists mainly
 //! so `--min-size` is a flag a person can type rather than a builder method.
 //!
-//! Two things it does have to get right, because they are properties of the *output* rather
-//! than of the scan: a tier-two hit says it does not know how to regenerate what it found, and
-//! a tier that could not run says so instead of looking like a clean result.
+//! Three things it does have to get right, because they are properties of the *output* rather
+//! than of the scan: a tier-two hit says it does not know how to regenerate what it found; a
+//! tier that could not run says so instead of looking like a clean result; and a scan that
+//! could not read everything it was pointed at exits non-zero. The last one is the safety
+//! model's "failures are collected, reported, and set a non-zero exit", and it matters because
+//! prose cannot carry it — `pristine /does/not/exist` prints "0 directories reclaimable" and no
+//! script can tell that from an empty tree except by the status.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -43,7 +47,11 @@ struct Cli {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match scan(&cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(Scanned::Whole) => ExitCode::SUCCESS,
+        // A listing that is a lower bound must not look, to a script, like a listing that is
+        // the whole truth. `pristine /does/not/exist` otherwise prints "0 directories
+        // reclaimable" and succeeds.
+        Ok(Scanned::Partly) => ExitCode::FAILURE,
         Err(err) => {
             eprintln!("pristine: {err}");
             ExitCode::FAILURE
@@ -51,7 +59,14 @@ fn main() -> ExitCode {
     }
 }
 
-fn scan(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+/// How much of the tree the scan actually got through.
+#[derive(Debug, PartialEq, Eq)]
+enum Scanned {
+    Whole,
+    Partly,
+}
+
+fn scan(cli: &Cli) -> Result<Scanned, Box<dyn std::error::Error>> {
     let ruleset = Arc::new(Ruleset::load(None)?);
     let hits = Mutex::new(Vec::new());
     let outcome = Walker::new(&cli.root, ruleset)
@@ -74,6 +89,15 @@ fn scan(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         writeln!(out, "{}", row(hit, &cli.root))?;
     }
     writeln!(out, "{}", summary(&hits, &outcome))?;
+    if !outcome.errors.is_empty() {
+        // On stdout, beside the numbers it qualifies, because someone reading only the listing
+        // would otherwise take an undercount for a total. The detail goes to stderr below.
+        writeln!(
+            out,
+            "scan incomplete: {} could not be read, so everything above is a lower bound",
+            plural(outcome.errors.len(), "path", "paths"),
+        )?;
+    }
 
     for error in &outcome.errors {
         match &error.path {
@@ -81,7 +105,12 @@ fn scan(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             None => eprintln!("pristine: {}", error.message),
         }
     }
-    Ok(())
+
+    Ok(if outcome.errors.is_empty() {
+        Scanned::Whole
+    } else {
+        Scanned::Partly
+    })
 }
 
 /// One reclaimable directory, with what is known about getting it back.

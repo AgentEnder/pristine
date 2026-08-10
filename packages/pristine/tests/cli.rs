@@ -57,6 +57,24 @@ fn run(args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("output should be utf-8")
 }
 
+/// Runs the binary expecting it to fail, and returns its stdout and stderr.
+fn run_expecting_failure(args: &[&str]) -> (String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_pristine"))
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("the pristine binary should be runnable");
+    assert!(
+        !output.status.success(),
+        "pristine {args:?} succeeded:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    (
+        String::from_utf8(output.stdout).expect("output should be utf-8"),
+        String::from_utf8(output.stderr).expect("output should be utf-8"),
+    )
+}
+
 /// A repository with one gitignored directory of `OVER` bytes and nothing tracked in it.
 fn repo_with_reclaimable_sediment() -> TempDir {
     let tmp = TempDir::new().unwrap();
@@ -127,6 +145,56 @@ fn the_output_says_which_deletions_are_cheap_and_which_are_not() {
         sediment.contains("no known way to regenerate"),
         "{sediment}"
     );
+}
+
+#[test]
+fn a_root_that_is_not_there_fails_instead_of_reporting_an_empty_tree() {
+    // Nothing was scanned, so "0 directories reclaimable" is not a finding — but it reads
+    // exactly like one, and a script cannot tell the difference from the text. The exit status
+    // is where that difference has to live.
+    let (printed, complaints) = run_expecting_failure(&["/pristine/does/not/exist"]);
+
+    assert!(printed.contains("scan incomplete"), "{printed}");
+    assert!(
+        complaints.contains("/pristine/does/not/exist"),
+        "{complaints}"
+    );
+}
+
+#[test]
+fn a_repository_that_will_not_answer_makes_the_scan_incomplete() {
+    let tmp = TempDir::new().unwrap();
+    // A `.git` that is not a repository: the fallback tier goes inert here and says so, and
+    // that is a scan which did not cover what it was pointed at rather than a clean one.
+    fs::create_dir_all(tmp.path().join(".git")).unwrap();
+    fs::write(tmp.path().join(".gitignore"), "sediment/\n").unwrap();
+    write(&tmp.path().join("sediment/blob.bin"), OVER);
+
+    let (printed, complaints) =
+        run_expecting_failure(&[&tmp.path().to_string_lossy(), "--min-size", "128K"]);
+
+    assert!(printed.contains("scan incomplete"), "{printed}");
+    assert!(
+        complaints.contains("git would not list the index"),
+        "{complaints}"
+    );
+}
+
+#[test]
+fn a_scan_that_covered_everything_it_was_pointed_at_succeeds() {
+    // The other half of the pair above: a clean scan has to stay clean, or the exit status
+    // stops carrying information.
+    let tmp = repo_with_reclaimable_sediment();
+    let output = Command::new(env!("CARGO_BIN_EXE_pristine"))
+        .args([&tmp.path().to_string_lossy(), "--min-size", "128K"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{:?}", output.status.code());
+    let printed = String::from_utf8(output.stdout).unwrap();
+    assert!(printed.contains("sediment"), "{printed}");
+    assert!(!printed.contains("scan incomplete"), "{printed}");
 }
 
 #[test]

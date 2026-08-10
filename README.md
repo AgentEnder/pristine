@@ -31,6 +31,9 @@ A dash is not a zero: nothing looked inside, because a matched directory is neve
 the scan that found it. The fallback tier's rows do carry a size, because that tier cannot claim
 a directory without walking it.
 
+A scan that could not read everything it was pointed at says `scan incomplete` and exits
+non-zero, so a listing that is a lower bound never looks — to a script — like the whole truth.
+
 ## How it finds things
 
 Two tiers.
