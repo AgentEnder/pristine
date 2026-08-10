@@ -11,9 +11,10 @@ regenerates it before you decide.
 carrying `target/`, `.venv/`, `bin/`, `obj/`, `_build/`, `.gradle/` and `vendor/`, all equally
 reclaimable and all invisible to a tool that only knows about npm.
 
-> **Status: early.** The parallel walker, both detection tiers and the deleter work and are tested.
-> The rollup tree TUI does not exist yet, so there is nothing to select with: `--delete` means
-> everything the scan found. The design is settled and lives outside this repo.
+> **Status: early.** The parallel walker, both detection tiers, the deleter and both modes work
+> and are tested. The rollup tree TUI does not exist yet, so in the sweep there is nothing to
+> select with: `--delete` means everything the scan found. The design is settled and lives outside
+> this repo.
 
 ## Using it
 
@@ -22,6 +23,10 @@ pristine ~/repos                       # list what is reclaimable, and what rege
 pristine ~/repos --dry-run             # the plan it would execute, and what it would refuse
 pristine ~/repos --delete              # the same plan, then a confirmation that defaults to no
 pristine ~/repos --delete --yes --older-than 30d
+
+pristine repo                          # one checkout: ask what to clean, then clean it
+pristine repo --untracked --ignored --dry-run
+pristine repo --reset=hard --untracked --ignored --yes
 ```
 
 ```console
@@ -73,12 +78,54 @@ against tier one is the point: it tells you which deletions are cheap.
 
 ## Two modes
 
-- **sweep** across a directory tree, for "my disk is full". Every project underneath, sorted by size.
-- **repo** inside a single checkout, git-aware, inheriting `git clean`'s exact semantics for nested
-  ignore files, negations and `info/exclude`, plus the guarantee that a directory holding a tracked
-  file is never removed.
+**sweep** — a bare `pristine [PATH]` — walks a directory tree for "my disk is full". Every project
+underneath, sorted by size. Everything above describes it.
 
-Both share one walker and one deleter.
+**`pristine repo`** cleans one git checkout, and replaces `git clean -fdx`. It enumerates nothing
+itself: `git clean -n -d` lists the untracked files and `git clean -n -d -X` lists the ignored ones,
+so nested ignore files, negations, `info/exclude`, your global excludes and the refusal to touch a
+nested repository are inherited exactly rather than reimplemented. The two lists are disjoint, which
+is why each is a separate choice.
+
+```console
+$ pristine repo --untracked --ignored --dry-run
+         —  .nx/workspace-data
+         —  dist
+         —  target
+
+plan: 3 paths, 0 B priced, 3 not priced
+excluded: 1 vendored path (--node-modules includes them)
+skipped: 1 nested repository git will not clean
+  sandboxes/work
+
+dry run: nothing was reset and nothing was removed
+```
+
+| Flag | Meaning |
+|---|---|
+| `--untracked` | remove untracked files |
+| `--ignored` | remove ignored files |
+| `--reset[=worktree\|hard]` | discard tracked changes; bare `--reset` is `hard` |
+| `--node-modules[=BOOL]` | include vendored dependency directories (off) |
+| `--env[=BOOL]` | include `*.env*` files (off) |
+| `--dry-run` | print the plan, change nothing |
+| `--yes`, `-y` | answer the final confirmation |
+
+Reset first, then the removal. `--reset=worktree` is `git restore -- .` and keeps the index;
+`--reset=hard` is `git reset --hard HEAD` and does not.
+
+With no action flag it asks — reset, untracked, ignored, then vendor and env — and every question
+defaults to the answer that changes nothing, so a run with nothing on its standard input does
+nothing. With *any* action flag it does not ask, so nothing in CI hangs on a prompt. `--yes` gates
+the final confirmation and nothing else: `pristine repo --ignored` in a script still refuses to
+delete without it, and `pristine repo --yes` on its own selects nothing.
+
+Vendor and env are held back even from a list you did ask for, in both lists rather than only in
+the ignored one. `node_modules` costs minutes and a network to get back, and nothing at all
+regenerates a `.env` — least of all one that is untracked rather than ignored, which is the copy
+git is not even hiding.
+
+Both modes share one deleter and the whole of the safety model below.
 
 ## Safety
 
