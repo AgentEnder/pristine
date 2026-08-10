@@ -27,12 +27,21 @@
 //! ## What the under-root check is and is not
 //!
 //! It is defence in depth against a malformed, stale or hostile path arriving from a caller,
-//! a config file or a scan of a tree someone else can write to. It is **not** a defence
-//! against an attacker racing the removal: every check here is a `stat` followed later by an
-//! `unlink`, and between the two a path component can be swapped. Closing that needs an
-//! `openat`-based descent holding a directory descriptor, which needs `libc` and therefore
-//! `unsafe`, which this crate forbids. Saying so is better than implying a guarantee that is
-//! not here; on the disk of the person running the cleaner, the window is not the threat.
+//! a config file or a scan of a tree someone else can write to.
+//!
+//! What it proves, though, it proves about a *path*, and a path is a name something else can
+//! re-point. The longest gap between the proof and the `unlink` is the one a person spends
+//! reading the plan and answering the confirmation, so the ancestry is proved a second time
+//! when the removal starts — see `Sweep::ancestry_intact`. A component swapped for a symlink
+//! while the prompt was on screen is therefore reported, rather than followed out of the root
+//! under the very name it was cleared under.
+//!
+//! It is still **not** a defence against an attacker racing the removal itself: the recheck
+//! is a `stat` and the removal is a later `unlink`, and no number of stats closes the gap
+//! between two syscalls. Closing it needs an `openat`-based descent holding a directory
+//! descriptor, which needs `libc` and therefore `unsafe`, which this crate forbids. Saying so
+//! is better than implying a guarantee that is not here; on the disk of the person running
+//! the cleaner, what is left of the window is not the threat.
 //!
 //! ## Fan-out
 //!
@@ -529,6 +538,9 @@ impl<'a> Sweep<'a> {
 
     fn run(mut self, target: &PlanTarget) -> Self {
         self.path.clone_from(&target.path);
+        if !self.ancestry_intact(&target.path) {
+            return self;
+        }
         self.complete = match target.path.symlink_metadata() {
             Ok(metadata) => self.entry(&target.path, &metadata),
             Err(err) => {
@@ -537,6 +549,69 @@ impl<'a> Sweep<'a> {
             }
         };
         self
+    }
+
+    /// Re-proves, at the moment of removal, that the way down to the target is still the way
+    /// the plan cleared.
+    ///
+    /// Everything [`Planner::judge`] proved, it proved about a *path*, and a path is a name
+    /// that something else can re-point. The plan is then printed and a confirmation is
+    /// answered, so the gap between the proof and the `unlink` is human-scale rather than
+    /// instantaneous — long enough for a component to be swapped for a symlink, after which
+    /// the descent leaves the root under the very name it was cleared under. Each component
+    /// from the root down to the target's *parent* is therefore stat-ed again and required to
+    /// still be a directory in its own right.
+    ///
+    /// `symlink_metadata().is_dir()` is false for a symlink to a directory, which is the
+    /// whole point: the check is that the name still *is* the directory, not that it still
+    /// leads to one. The target itself is deliberately not included, because a claim may
+    /// legitimately be a symlink — Bazel's `bazel-*` — and unlinking it as a link is correct.
+    ///
+    /// This shortens the window; it does not close it. What remains is a race against these
+    /// syscalls rather than against a person reading a prompt, and closing that needs an
+    /// `openat` descent holding a directory descriptor, which needs `unsafe`.
+    fn ancestry_intact(&mut self, target: &Path) -> bool {
+        let Some(inside) = target
+            .parent()
+            .and_then(|parent| parent.strip_prefix(&self.plan.root).ok())
+        else {
+            // Unreachable for a planned target, which the planner proved is under the root.
+            // Refusing beats descending from a root this path has nothing to do with.
+            self.failures.push(Failure {
+                path: target.to_path_buf(),
+                message: format!("is not under {}", self.plan.root.display()),
+            });
+            return false;
+        };
+
+        // One `lstat` per component per target, repeated across targets that share ancestry.
+        // Cheap, warm-cached, and the alternative — caching it across the pool — would be a
+        // cache of exactly the answer that has to be fresh.
+        let mut walked = self.plan.root.clone();
+        let mut components = inside.components();
+        loop {
+            match walked.symlink_metadata() {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => {
+                    self.failures.push(Failure {
+                        path: walked,
+                        message: "is no longer a directory: the way to the target changed \
+                                  after the plan was built, and following it could leave the \
+                                  scan root"
+                            .to_owned(),
+                    });
+                    return false;
+                }
+                Err(err) => {
+                    self.failed(&walked, &err);
+                    return false;
+                }
+            }
+            match components.next() {
+                Some(component) => walked.push(component),
+                None => return true,
+            }
+        }
     }
 
     /// One filesystem entry, whatever kind it is. The metadata is always from

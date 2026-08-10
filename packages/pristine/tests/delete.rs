@@ -188,6 +188,53 @@ fn a_target_that_is_no_longer_there_is_reported_rather_than_silently_dropped() {
     );
 }
 
+/// The window between validating a path and acting on it, which is deterministic here
+/// because planning and removal are two calls a caller makes in order.
+///
+/// A check is only worth what it is worth at the moment of the `unlink`. Everything the plan
+/// proved was proved about a path, and a path is a name that something else can re-point —
+/// and between the two calls sits the part of the gap that is not measured in syscalls: the
+/// plan is printed and a person answers a prompt. So the removal proves the way down to the
+/// target a second time before it descends.
+///
+/// This is not the same as being race-free, and the test is written so it cannot be mistaken
+/// for it: the swap happens between two calls rather than concurrently with one. Closing the
+/// remaining gap needs an `openat` descent holding a directory descriptor, so that "under the
+/// root" is a property of how the syscall was issued rather than a claim checked just before
+/// it — and that needs `unsafe`, which the crate forbids. What is tested here is the window
+/// that can actually be closed without it.
+#[cfg(unix)]
+#[test]
+fn an_ancestor_swapped_for_a_link_after_planning_cannot_take_the_removal_out_of_the_root() {
+    let (_tmp, base) = fixture();
+    let root = base.join("root");
+    let target = root.join("app/node_modules");
+    touch(&target.join("left-pad/index.js"));
+    // Deliberately laid out so the swapped-in tree answers to the same relative path: this is
+    // what makes the attack work at all, and a fixture that skipped it would pass against a
+    // vulnerable deleter.
+    let outside = base.join("precious");
+    touch(&outside.join("node_modules/thesis.md"));
+
+    // Validated while `root/app` really is a directory holding the target.
+    let plan = plan_for(&root, std::slice::from_ref(&target));
+    assert_eq!(targets(&plan), [target]);
+
+    // ...and then it is not.
+    fs::remove_dir_all(root.join("app")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("app")).unwrap();
+
+    let removal = Deleter::new().remove(&plan);
+
+    assert!(
+        outside.join("node_modules/thesis.md").exists(),
+        "the removal followed a swapped ancestor out of the root and deleted {}",
+        outside.display()
+    );
+    assert!(removal.removed.is_empty(), "{:?}", removal.removed);
+    assert!(!removal.failures.is_empty(), "the swap was not reported");
+}
+
 // ---------------------------------------------------------------------------------------
 // 3. A filesystem boundary is not crossed unless the flag says to.
 // ---------------------------------------------------------------------------------------
