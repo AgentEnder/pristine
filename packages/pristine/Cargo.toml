@@ -1,0 +1,28 @@
+# The published package is `pristine-cli`: the plain `pristine` on crates.io is a 0.0.0
+# placeholder from an unrelated project and crates.io does not reclaim names. The binary a
+# human types stays `pristine` on every channel, so the collision leaks into exactly one
+# install string (`cargo install pristine-cli`).
+[package]
+name = "pristine-cli"
+description = "A language-agnostic reclaimable-space finder and cleaner."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+keywords = ["disk", "cleanup", "node_modules", "cli"]
+categories = ["command-line-utilities", "filesystem"]
+# Nx wiring is workspace machinery; it has no business inside the published crate.
+exclude = ["project.json"]
+
+[[bin]]
+name = "pristine"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+
+[lints]
+workspace = true

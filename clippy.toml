@@ -1,0 +1,20 @@
+# Configuration only. The lint *levels* are in `[workspace.lints]` in the root Cargo.toml,
+# so members inherit them instead of repeating them.
+
+# `unwrap_used` and `expect_used` are on for the binary. A test that unwraps is asserting,
+# not risking anything, so exempt them rather than making every test carry a match arm.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+# Words `clippy::doc_markdown` (from pedantic) would otherwise demand back-ticks around on
+# every mention. The trailing ".." keeps clippy's own default list rather than replacing it.
+doc-valid-idents = [
+    "GiB",
+    "KiB",
+    "MiB",
+    "TiB",
+    "macOS",
+    "node_modules",
+    "pyproject",
+    "..",
+]

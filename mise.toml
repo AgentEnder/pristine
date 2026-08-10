@@ -1,0 +1,9 @@
+# The single source of truth for the toolchain. CI installs from this file rather than
+# naming versions a second time in the workflow, so a bump here is a bump everywhere.
+[tools]
+# `components` is load-bearing, not decoration: mise's rust backend only applies `profile`
+# when it installs the toolchain, and GitHub's runners ship one already. Naming clippy and
+# rustfmt explicitly makes mise add them to whatever toolchain it finds.
+rust = { version = "stable", profile = "default", components = ["clippy", "rustfmt"] }
+node = "lts"
+pnpm = "11"

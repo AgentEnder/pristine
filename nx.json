@@ -1,0 +1,42 @@
+{
+  "$schema": "./node_modules/nx/schemas/nx-schema.json",
+  "namedInputs": {
+    "default": ["{projectRoot}/**/*", "sharedGlobals"],
+    "sharedGlobals": ["{workspaceRoot}/mise.toml"],
+    "rust": [
+      "{projectRoot}/src/**/*.rs",
+      "{projectRoot}/tests/**/*.rs",
+      "{projectRoot}/Cargo.toml",
+      "{workspaceRoot}/Cargo.toml",
+      "{workspaceRoot}/Cargo.lock",
+      "{workspaceRoot}/clippy.toml",
+      "{workspaceRoot}/rustfmt.toml",
+      "sharedGlobals"
+    ],
+    "js": [
+      "{projectRoot}/**/*.{ts,js,mjs,cjs,json}",
+      "{workspaceRoot}/package.json",
+      "{workspaceRoot}/pnpm-lock.yaml",
+      "sharedGlobals"
+    ]
+  },
+  "targetDefaults": {
+    "build": {
+      "cache": true,
+      "dependsOn": ["^build"],
+      "inputs": ["rust", "^rust"]
+    },
+    "test": {
+      "cache": true,
+      "inputs": ["rust", "^rust"]
+    },
+    "lint": {
+      "cache": true,
+      "inputs": ["rust", "^rust"]
+    },
+    "fmt-check": {
+      "cache": true,
+      "inputs": ["rust", "^rust"]
+    }
+  }
+}

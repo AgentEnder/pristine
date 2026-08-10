@@ -11,8 +11,9 @@ regenerates it before you decide.
 carrying `target/`, `.venv/`, `bin/`, `obj/`, `_build/`, `.gradle/` and `vendor/`, all equally
 reclaimable and all invisible to a tool that only knows about npm.
 
-> **Status: nothing is implemented yet.** This repository is a root commit. The design is settled and
-> lives outside this repo; the scaffold is the next piece of work.
+> **Status: scaffold only.** `pristine --version` is the whole of the behaviour. The workspace,
+> toolchain and CI are in place; the walker, the ruleset and the TUI are not. The design is settled
+> and lives outside this repo.
 
 ## How it finds things
 
@@ -57,6 +58,21 @@ brew install pristine
 npx @agentender/pristine
 cargo install pristine-cli    # the crate is `pristine-cli`; the binary is `pristine`
 ```
+
+## Development
+
+[mise](https://mise.jdx.dev) owns the toolchain; `mise install` gets you rust, node and pnpm at the
+versions CI uses.
+
+```sh
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+```
+
+The same commands are wrapped as Nx targets (`pnpm nx run-many -t fmt-check lint test`), which is how
+the npm wrapper will share a graph with the crate later.
+
+The crate is `packages/pristine` and its published name is `pristine-cli`; the binary is `pristine`.
 
 ## License
 

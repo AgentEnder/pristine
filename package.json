@@ -1,0 +1,18 @@
+{
+  "name": "@agentender/pristine-source",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Nx workspace for pristine. The published crate is pristine-cli; the npm wrapper lands later.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AgentEnder/pristine.git"
+  },
+  "packageManager": "pnpm@11.21.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "nx": "23.1.1"
+  }
+}
