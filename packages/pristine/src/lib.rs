@@ -37,11 +37,19 @@
 //! [`Planner`] resolves every path and applies every check in the safety model; a [`Deleter`]
 //! executes the resulting [`Plan`] and decides nothing. That split is what makes a dry run
 //! honest: the plan a preview prints is the same object the removal consumes.
+//!
+//! All of the above is the *sweep*: point it at a tree of unrelated projects and ask what is
+//! reclaimable across all of them. The second mode is [`repo`], which points at one git
+//! checkout and replaces `git clean -fdx`. It enumerates nothing itself — `git clean -n -d`
+//! and `git clean -n -d -X` are the authority, so nested ignore files, negations,
+//! `info/exclude` and global excludes are inherited exactly rather than reimplemented — and it
+//! feeds the same [`Planner`] and [`Deleter`] as the sweep.
 
 pub mod delete;
 mod detect;
 pub mod fallback;
 pub mod git;
+pub mod repo;
 pub mod rules;
 pub mod size;
 pub mod tree;
@@ -52,6 +60,7 @@ pub use delete::{
 };
 pub use fallback::{DEFAULT_MIN_SIZE, FallbackReport};
 pub use git::{GitError, WorkTree};
+pub use repo::{Class, Enumeration, Repo, RepoError, Reset, Selected, Selection};
 pub use rules::{Anchor, MarkersRequired, RegenerateWhen, Rule, RuleError, Ruleset};
 pub use size::{Measurement, Measurer, Size, SizeMode, Survey};
 pub use tree::{Node, NodeId, Tree};
