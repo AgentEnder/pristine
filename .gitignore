@@ -8,6 +8,13 @@
 # binary at the next release.
 /npm/pristine-*/pristine
 
+# Release scratch. `release.yml` packs the npm tarballs into `npm-dist/` and unpacks the
+# downloaded build artifacts into `dist-assets/` — never `dist/`, which is a tracked source
+# directory holding the Homebrew formula generator. Both appear locally the moment anyone
+# reproduces a release step by hand.
+/npm-dist/
+/dist-assets/
+
 # Node dependencies and the Nx scaffold
 node_modules/
 .nx/
