@@ -25,13 +25,22 @@
 //! `target` whose parent holds a `Cargo.toml`", never "a directory named `target`".
 //! `target` is Rust's and Maven's, `vendor` is Go's and Composer's and Bundler's, and `build`
 //! is Gradle's, Dart's and — in a CMake project — hand-written source. See [`rules`].
+//!
+//! Removing what a scan found is [`delete`], and it is split in two on purpose. A [`Planner`]
+//! resolves every path and applies every check in the safety model; a [`Deleter`] executes
+//! the resulting [`Plan`] and decides nothing. That split is what makes a dry run honest: the
+//! plan a preview prints is the same object the removal consumes.
 
+pub mod delete;
 mod detect;
 pub mod rules;
 pub mod size;
 pub mod tree;
 pub mod walk;
 
+pub use delete::{
+    Deleter, Failure, Plan, PlanTarget, Planner, Refusal, Refused, Removal, Removed, Target,
+};
 pub use rules::{Anchor, MarkersRequired, RegenerateWhen, Rule, RuleError, Ruleset};
 pub use size::{Measurement, Measurer, Size, SizeMode};
 pub use tree::{Node, NodeId, Tree};

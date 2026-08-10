@@ -161,24 +161,24 @@ impl Measurer {
 
 /// Bytes actually allocated on disk, which is what deleting gives back.
 #[cfg(unix)]
-fn allocated(metadata: &fs::Metadata) -> u64 {
+pub(crate) fn allocated(metadata: &fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
     metadata.blocks() * 512
 }
 
 #[cfg(not(unix))]
-fn allocated(metadata: &fs::Metadata) -> u64 {
+pub(crate) fn allocated(metadata: &fs::Metadata) -> u64 {
     metadata.len()
 }
 
 #[cfg(unix)]
-fn device(metadata: &fs::Metadata) -> u64 {
+pub(crate) fn device(metadata: &fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
     metadata.dev()
 }
 
 #[cfg(not(unix))]
-fn device(_metadata: &fs::Metadata) -> u64 {
+pub(crate) fn device(_metadata: &fs::Metadata) -> u64 {
     0
 }
 
@@ -190,13 +190,13 @@ fn device(_metadata: &fs::Metadata) -> u64 {
 /// a store *outside* the claim: deleting the tree frees only the links. Answering that would
 /// mean proving no link lives elsewhere, which costs a scan of the whole filesystem.
 #[cfg(unix)]
-fn multiply_linked(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+pub(crate) fn multiply_linked(metadata: &fs::Metadata) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     (metadata.nlink() > 1 && !metadata.is_dir()).then(|| (metadata.dev(), metadata.ino()))
 }
 
 #[cfg(not(unix))]
-fn multiply_linked(_metadata: &fs::Metadata) -> Option<(u64, u64)> {
+pub(crate) fn multiply_linked(_metadata: &fs::Metadata) -> Option<(u64, u64)> {
     None
 }
 
