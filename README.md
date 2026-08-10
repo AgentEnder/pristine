@@ -114,11 +114,24 @@ dry run: nothing was reset and nothing was removed
 Reset first, then the removal. `--reset=worktree` is `git restore -- .` and keeps the index;
 `--reset=hard` is `git reset --hard HEAD` and does not.
 
+A reset moves the index, and the index is what makes a path untracked — so **the enumeration does
+not outlive it**. After the reset the work tree is asked again, and the second answer is narrowed
+to what you were shown and confirmed. Both halves matter. Re-asking is what stops a file the reset
+made *tracked* from being deleted: `git rm --cached committed.txt` leaves it on disk and out of the
+index, so `git clean` offers it, and `--reset=hard` then puts it back. Narrowing is what stops a
+directory the reset made git *collapse* from being removed without ever appearing on a plan — which
+would take the vendor and env files you were told had been held back. Anything withdrawn that way
+is named, and a second run shows it honestly.
+
 With no action flag it asks — reset, untracked, ignored, then vendor and env — and every question
 defaults to the answer that changes nothing, so a run with nothing on its standard input does
-nothing. With *any* action flag it does not ask, so nothing in CI hangs on a prompt. `--yes` gates
-the final confirmation and nothing else: `pristine repo --ignored` in a script still refuses to
-delete without it, and `pristine repo --yes` on its own selects nothing.
+nothing. With *any* action flag it does not ask, so nothing in CI hangs on a prompt.
+
+`--yes` gates the final confirmation and nothing else. It selects nothing, so `pristine repo --yes`
+on its own does nothing, and `pristine repo --ignored` in a script still refuses to delete without
+it. It does count as the command line resolving the plan, so it makes the run non-interactive too —
+otherwise `--yes` would let you be asked what to clean and then never asked to confirm it, which
+turns "I consent to what I asked for" into "I consent to whatever I am about to be asked".
 
 Vendor and env are held back even from a list you did ask for, in both lists rather than only in
 the ignored one. `node_modules` costs minutes and a network to get back, and nothing at all
