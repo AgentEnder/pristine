@@ -26,13 +26,22 @@
 //! `target` is Rust's and Maven's, `vendor` is Go's and Composer's and Bundler's, and `build`
 //! is Gradle's, Dart's and — in a CMake project — hand-written source. See [`rules`].
 //!
-//! Removing what a scan found is [`delete`], and it is split in two on purpose. A [`Planner`]
-//! resolves every path and applies every check in the safety model; a [`Deleter`] executes
-//! the resulting [`Plan`] and decides nothing. That split is what makes a dry run honest: the
-//! plan a preview prints is the same object the removal consumes.
+//! A curated ruleset only ever covers the ecosystems somebody wrote a rule for, so there is a
+//! second tier underneath it: inside a git work tree, a directory that is gitignored, holds no
+//! tracked file and no git checkout at any depth, and clears a size floor is reclaimable by
+//! inference even when no rule names it. It reports honestly that it does not know how to
+//! regenerate what it found, and outside a work tree it is inert rather than guessing from
+//! directory names. See [`fallback`].
+//!
+//! Removing what either tier found is [`delete`], and it is split in two on purpose. A
+//! [`Planner`] resolves every path and applies every check in the safety model; a [`Deleter`]
+//! executes the resulting [`Plan`] and decides nothing. That split is what makes a dry run
+//! honest: the plan a preview prints is the same object the removal consumes.
 
 pub mod delete;
 mod detect;
+pub mod fallback;
+pub mod git;
 pub mod rules;
 pub mod size;
 pub mod tree;
@@ -41,7 +50,9 @@ pub mod walk;
 pub use delete::{
     Deleter, Failure, Plan, PlanTarget, Planner, Refusal, Refused, Removal, Removed, Target,
 };
+pub use fallback::{DEFAULT_MIN_SIZE, FallbackReport};
+pub use git::{GitError, WorkTree};
 pub use rules::{Anchor, MarkersRequired, RegenerateWhen, Rule, RuleError, Ruleset};
-pub use size::{Measurement, Measurer, Size, SizeMode};
+pub use size::{Measurement, Measurer, Size, SizeMode, Survey};
 pub use tree::{Node, NodeId, Tree};
-pub use walk::{Hit, WalkError, WalkOutcome, Walker};
+pub use walk::{Claim, Hit, IgnoredClaim, RuleClaim, WalkError, WalkOutcome, Walker};

@@ -40,6 +40,7 @@ ignore = "0.4.33"
 globset = "0.4.20"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.4"
+unicode-normalization = "0.1.25"
 # The deleter's descriptor-relative syscalls: `openat` with `O_NOFOLLOW`, `fstatat`,
 # `unlinkat`. This is the layer `cap-std` is built from, taken directly because the deleter
 # wants the primitives rather than the capability wrapper. It is what lets the removal descend
