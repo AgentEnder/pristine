@@ -11,9 +11,22 @@ regenerates it before you decide.
 carrying `target/`, `.venv/`, `bin/`, `obj/`, `_build/`, `.gradle/` and `vendor/`, all equally
 reclaimable and all invisible to a tool that only knows about npm.
 
-> **Status: scaffold only.** `pristine --version` is the whole of the behaviour. The workspace,
-> toolchain and CI are in place; the walker, the ruleset and the TUI are not. The design is settled
-> and lives outside this repo.
+> **Status: early.** The walker, the curated ruleset and the deleter work. The rollup tree TUI does
+> not exist yet, so `--delete` means everything the scan found rather than a selection. The design is
+> settled and lives outside this repo.
+
+## Using it
+
+```sh
+pristine ~/repos                       # list what is reclaimable, and what regenerates each
+pristine ~/repos --dry-run             # the plan it would execute, and what it would refuse
+pristine ~/repos --delete              # the same plan, then a confirmation that defaults to no
+pristine ~/repos --delete --yes --older-than 30d
+```
+
+A scan does not measure what it claims. Pruning at `node_modules` and then walking it to size it
+would give back everything the pruning saved, so sizes read `—` until something asks for a
+breakdown; a removal reports the bytes it actually freed.
 
 ## How it finds things
 
@@ -43,11 +56,23 @@ Both share one walker and one deleter.
 
 ## Safety
 
-- Every target is resolved and asserted to be under the scan root before any unlink.
-- Symlinks are never followed out of the root.
-- Nested git repositories are not descended into during a sweep, and are reported.
-- `--dry-run` prints the plan and deletes nothing. The final confirmation defaults to no.
-- Failures never abort the batch; they are collected, reported, and set a non-zero exit.
+Deletion is by `unlink`, not by moving to the platform trash. Trash is a move, and across filesystems
+a copy, which is exactly the wrong thing to do to a 40 GB tree. The checks below carry the weight
+instead, and every one of them is a test rather than a promise.
+
+- Every target's path is resolved — `..` and symlinked ancestors and all — and proved to be under the
+  scan root before any unlink. The scan root itself is never a target.
+- Symlinks are never followed out of the root. A symlinked target is unlinked as a link, and so is
+  every link found inside one.
+- A filesystem boundary is not crossed unless `--one-file-system=false`.
+- A directory holding a git checkout is refused and reported rather than swept up, at any depth. It
+  stops that subtree, and everything above the refusal is left standing.
+- `--older-than <duration>` keeps anything touched recently, because a `node_modules` you used this
+  morning is not reclaimable in any useful sense. Off by default, and worth turning on.
+- `--dry-run` prints the plan and deletes nothing. The final confirmation defaults to no, and so does
+  end of input — a script consents with `--yes` or not at all.
+- Failures never abort the batch; they are collected, reported, and set a non-zero exit. So does a
+  scan that could not read everything it was pointed at.
 
 ## Install
 
