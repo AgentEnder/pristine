@@ -18,6 +18,26 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::{fmt, io};
 
+/// Environment variables that redirect git at a repository other than the one it was pointed
+/// at, cleared before every invocation.
+///
+/// This is not hygiene, it is the safety property again. Anything running inside a git hook,
+/// a `filter-branch` or a rebase has `GIT_DIR` and `GIT_INDEX_FILE` set, and they win over
+/// `-C`: `GIT_INDEX_FILE=<another repo's index> git -C here ls-files` lists the *other*
+/// repository's files and reports nothing about this one. Every path here would then look
+/// untracked, and looking untracked is what makes a directory deletable. It fails silently and
+/// in the dangerous direction, which is the combination that has to be designed out.
+const AMBIENT_GIT_ENV: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_NAMESPACE",
+];
+
 /// Whether `dir` is the root of a git work tree.
 ///
 /// A `.git` that is a *file* rather than a directory is a linked work tree or a submodule, and
@@ -60,14 +80,20 @@ impl WorkTree {
     ///
     /// If git cannot be run at all, or refuses to list the index.
     pub fn open(root: &Path) -> Result<Self, GitError> {
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        command
             .arg("-C")
             .arg(root)
             // `--full-name` pins the paths to the work tree root rather than to a working
             // directory, and `-z` gives them raw: git quotes and escapes any other way, and a
             // path this module misreads is a path it wrongly believes is untracked.
             .args(["ls-files", "-z", "--full-name"])
-            .stdin(Stdio::null())
+            .stdin(Stdio::null());
+        for variable in AMBIENT_GIT_ENV {
+            command.env_remove(variable);
+        }
+
+        let output = command
             .output()
             .map_err(|err| GitError::Run(root.to_path_buf(), err))?;
         if !output.status.success() {

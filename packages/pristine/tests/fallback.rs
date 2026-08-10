@@ -37,17 +37,31 @@ fn ruleset() -> Arc<Ruleset> {
     Arc::new(Ruleset::builtin().unwrap())
 }
 
-/// Runs git in `repo`, with the ambient configuration shut out so a developer's global
-/// `.gitconfig` cannot change what a test proves.
+/// Runs git in `repo`, with the ambient configuration and any inherited repository redirection
+/// shut out, so neither a developer's global `.gitconfig` nor a `GIT_DIR` from a surrounding
+/// hook or rebase can change what a test proves. The library clears the same variables for the
+/// same reason; running this suite under `GIT_DIR=<some other repo>/.git` is what proves it.
 fn git(repo: &Path, args: &[&str]) {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .current_dir(repo)
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+        .stdin(Stdio::null());
+    for variable in [
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_NAMESPACE",
+    ] {
+        command.env_remove(variable);
+    }
+    let output = command.output().unwrap();
     assert!(
         output.status.success(),
         "git {args:?} in {}: {}",
