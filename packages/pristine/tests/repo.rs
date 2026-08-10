@@ -252,6 +252,138 @@ fn opting_in_takes_them() {
 }
 
 // ------------------------------------------------------------------------------------------
+// ...and they survive being hidden behind a directory git collapsed over them.
+//
+// `git clean` emits a whole directory whenever everything inside it is removable, so a target
+// is not a description of its own contents. Judging only the emitted path means a `.env` or a
+// `node_modules` one level down is invisible, and the exclusion that was reported as holding
+// them back never sees them at all.
+// ------------------------------------------------------------------------------------------
+
+#[test]
+fn an_untracked_directory_that_hides_an_env_file_is_held_back() {
+    let (_tmp, root) = checkout();
+    write(&root.join("docker/compose.yaml"), "services: {}\n");
+    write(&root.join("docker/.env"), "SECRET=1\n");
+    // git offers the directory, not its contents: everything inside is untracked.
+    let offered = git(&root, &["clean", "-n", "-d"]);
+    assert!(offered.contains("docker/"), "{offered}");
+    assert!(
+        !offered.contains(".env"),
+        "the fixture did not collapse: {offered}"
+    );
+
+    let printed = succeeds(&root, &["--untracked", "--yes"], "");
+
+    assert!(
+        root.join("docker/.env").exists(),
+        "an env file was deleted from behind a collapsed directory:\n{printed}"
+    );
+    assert!(root.join("docker/compose.yaml").exists(), "{printed}");
+    // Named, with the flag that would release it. A count nobody can act on is a puzzle.
+    assert!(printed.contains("docker"), "{printed}");
+    assert!(printed.contains("--env"), "{printed}");
+}
+
+#[test]
+fn an_untracked_directory_that_hides_node_modules_is_held_back() {
+    let (_tmp, root) = checkout();
+    write(&root.join("pkg/index.js"), "source\n");
+    write(&root.join("pkg/node_modules/left-pad/index.js"), "module\n");
+
+    let printed = succeeds(&root, &["--untracked", "--yes"], "");
+
+    assert!(
+        root.join("pkg/node_modules/left-pad/index.js").exists(),
+        "a vendored tree was deleted from behind a collapsed directory:\n{printed}"
+    );
+    assert!(printed.contains("--node-modules"), "{printed}");
+}
+
+#[test]
+fn an_ignored_directory_that_hides_an_env_file_is_held_back() {
+    let (_tmp, root) = checkout();
+    // The half git cannot help with. `-e` protects a pattern in the untracked pass, but under
+    // `-X` it makes it a TARGET instead, and no pathspec stops the collapse — so the ignored
+    // list has to be judged here or not at all.
+    write(&root.join(".gitignore"), "build/\n");
+    git(&root, &["add", ".gitignore"]);
+    git(&root, &["commit", "--quiet", "-m", "ignore build"]);
+    write(&root.join("build/out.js"), "built\n");
+    write(&root.join("build/.env"), "SECRET=1\n");
+    let offered = git(&root, &["clean", "-n", "-d", "-X"]);
+    assert!(offered.contains("build/"), "{offered}");
+    assert!(
+        !offered.contains(".env"),
+        "the fixture did not collapse: {offered}"
+    );
+
+    let printed = succeeds(&root, &["--ignored", "--yes"], "");
+
+    assert!(
+        root.join("build/.env").exists(),
+        "an env file was deleted from behind a collapsed ignored directory:\n{printed}"
+    );
+}
+
+#[test]
+fn opting_in_releases_a_directory_that_was_only_held_back_by_what_it_hides() {
+    let (_tmp, root) = checkout();
+    write(&root.join("docker/compose.yaml"), "services: {}\n");
+    write(&root.join("docker/.env"), "SECRET=1\n");
+    write(&root.join("pkg/node_modules/left-pad/index.js"), "module\n");
+
+    let printed = succeeds(
+        &root,
+        &["--untracked", "--node-modules", "--env", "--yes"],
+        "",
+    );
+
+    assert!(!root.join("docker").exists(), "{printed}");
+    assert!(!root.join("pkg").exists(), "{printed}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_that_cannot_be_read_is_not_a_directory_that_was_cleared() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_tmp, root) = checkout();
+    write(&root.join("opaque/inner/thing.txt"), "who knows\n");
+    let sealed = root.join("opaque/inner");
+    fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&sealed).is_ok() {
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755)).unwrap();
+        return; // running as root, where permissions prove nothing
+    }
+
+    // git offers `opaque/` regardless — it warns that it could not open `inner` and collapses
+    // anyway, because its guarantee is about the index and the index it can read.
+    let offered = git(&root, &["clean", "-n", "-d"]);
+    assert!(offered.contains("opaque/"), "{offered}");
+
+    let run = run(&root, &["--untracked", "--yes"], "");
+    fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // #588's lesson, one layer further out: "I could not look" must not read as "there was
+    // nothing there". An unreadable subtree could hold anything, env files included.
+    assert!(
+        root.join("opaque/inner/thing.txt").exists(),
+        "a subtree nothing could read was removed anyway:\n{}",
+        run.stdout
+    );
+    // The deleter would have stopped this too — it refuses a directory it cannot read — but it
+    // would have stopped it as a FAILURE, half-way in and with a non-zero exit. Catching it
+    // while the plan is built is the difference between a run that declined to do something
+    // and a run that broke, so this asserts which of the two happened.
+    assert!(
+        run.stdout.contains("held back"),
+        "the unreadable subtree was not caught while planning:\n{}",
+        run.stdout
+    );
+    assert!(run.ok, "declining to act is not a failure:\n{}", run.stderr);
+}
+
+// ------------------------------------------------------------------------------------------
 // `--yes` gates the confirmation and nothing else.
 // ------------------------------------------------------------------------------------------
 
@@ -476,16 +608,14 @@ fn a_reset_that_makes_a_planned_target_tracked_does_not_delete_it() {
 #[test]
 fn a_reset_that_makes_git_collapse_a_directory_does_not_widen_the_plan() {
     let (_tmp, root) = checkout();
-    // The other half of the same window, and the destructive one. `dir/` holds three things:
-    // an untracked file, a file staged but never committed, and an env file that repo mode
-    // holds back by default.
+    // The other half of the same window. `dir/` holds an untracked file and a file staged but
+    // never committed — nothing protected, so this isolates the narrowing from the exclusions.
     write(&root.join("dir/a.txt"), "untracked\n");
-    write(&root.join("dir/.env"), "SECRET=1\n");
     write(&root.join("dir/staged.txt"), "staged\n");
     git(&root, &["add", "dir/staged.txt"]);
 
-    // Before the reset git will not collapse `dir/`, because `staged.txt` is tracked — so the
-    // plan names `dir/a.txt`, and `dir/.env` is excluded from it.
+    // Before the reset git will not collapse `dir/`, because `staged.txt` is tracked, so the
+    // plan names `dir/a.txt` — a file inside it, not the directory.
     let before = git(&root, &["clean", "-n", "-d"]);
     assert!(before.contains("dir/a.txt"), "{before}");
     assert!(!before.contains("Would remove dir/\n"), "{before}");
@@ -493,18 +623,54 @@ fn a_reset_that_makes_git_collapse_a_directory_does_not_widen_the_plan() {
     let printed = succeeds(&root, &["--reset=hard", "--untracked", "--yes"], "");
 
     // The reset deletes `staged.txt`, and git then collapses `dir/` — so a re-enumeration that
-    // was merely trusted would remove the whole directory, taking with it the env file the
-    // user was told had been held back and never saw on any plan.
-    assert!(
-        root.join("dir/.env").exists(),
-        "the reset widened the plan onto a file that was deliberately excluded:\n{printed}"
-    );
+    // was merely trusted would remove the whole directory when the plan named one file in it.
     assert!(
         printed.contains("withdrawn after the reset"),
         "the widening was not reported:\n{printed}"
     );
-    // Nothing was staged, so the reset removed it.
+    assert!(
+        root.join("dir/a.txt").exists(),
+        "the withdrawn target was removed anyway:\n{printed}"
+    );
+    // Nothing was committed, so the reset removed the staged file.
     assert!(!root.join("dir/staged.txt").exists(), "{printed}");
+}
+
+#[test]
+fn a_reset_that_uncovers_an_env_file_holds_the_directory_back_on_this_run_and_the_next() {
+    let (_tmp, root) = checkout();
+    // The same widening, with an env file in the directory — which is what makes it
+    // destructive rather than merely wrong. The two guards stack here: the reset uncovers a
+    // collapsed `dir/`, and `dir/` holds a `.env` that no plan ever offered.
+    write(&root.join("dir/a.txt"), "untracked\n");
+    write(&root.join("dir/.env"), "SECRET=1\n");
+    write(&root.join("dir/staged.txt"), "staged\n");
+    git(&root, &["add", "dir/staged.txt"]);
+
+    let printed = succeeds(&root, &["--reset=hard", "--untracked", "--yes"], "");
+
+    assert!(
+        root.join("dir/.env").exists(),
+        "the reset widened the plan onto a file that was deliberately excluded:\n{printed}"
+    );
+
+    // The rerun the report tells the user to do. `dir/` is collapsed for real now, so the
+    // second run sees the shape the first one refused to act on — and it still must not take
+    // the env file, which is what makes the first run's refusal a deferral rather than a
+    // loophole. This is the rerun that a fix living only in the reset path would fail.
+    let again = succeeds(&root, &["--untracked", "--yes"], "");
+
+    assert!(
+        root.join("dir/.env").exists(),
+        "the rerun deleted the env file the first run protected:\n{again}"
+    );
+    // The whole directory stays, `dir/a.txt` included. git offers `dir/` as one entry and it
+    // holds an env file, so it is held back whole — expanding it would mean deciding for
+    // ourselves what inside it is removable, which is the reimplementation this mode exists to
+    // avoid. The report names it and the flag that releases it.
+    assert!(root.join("dir/a.txt").exists(), "{again}");
+    assert!(again.contains("held back"), "{again}");
+    assert!(again.contains("--env includes it"), "{again}");
 }
 
 #[test]

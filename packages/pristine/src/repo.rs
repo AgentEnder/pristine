@@ -34,7 +34,7 @@
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
-use std::{fmt, io};
+use std::{fmt, fs, io};
 
 use crate::delete::Target;
 use crate::git::git;
@@ -111,10 +111,17 @@ impl Selection {
     }
 }
 
-/// Which of the three classes an entry falls in.
+/// The one directory name that means "these are vendored dependencies".
 ///
-/// The partition is over the entries git returned, and it never re-walks the tree: a
-/// collapsed `node_modules/` is one entry and one decision.
+/// Shared by [`classify`] and [`conceals`] so the two cannot drift. They answer the same
+/// question about different things — what an entry IS, and what an entry HIDES — and a run
+/// where those disagree is a run that reports holding something back and then deletes it.
+const VENDOR_DIR: &str = "node_modules";
+
+/// What the design's `*.env*` reduces to against a single path component.
+const ENV_MARK: &str = ".env";
+
+/// Which of the three classes an entry falls in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
     /// A vendored dependency directory. Cheap to get back in the sense that a command does it,
@@ -126,7 +133,12 @@ pub enum Class {
     Other,
 }
 
-/// Which class `entry` falls in, judged only from its path.
+/// Which class `entry` falls in, judged only from its path, which must be **relative to the
+/// work tree root**.
+///
+/// Relative because the components are searched for `node_modules`, and an absolute path drags
+/// in the components of the root itself: a checkout that happens to live under a directory of
+/// that name would otherwise classify every entry in it as vendored.
 ///
 /// `vendor` is any path with a `node_modules` component rather than only an entry that *is*
 /// one. The broader reading matters because git hands back whatever it did not collapse: a
@@ -136,19 +148,73 @@ pub enum Class {
 ///
 /// `env` is the design's `*.env*` against the final component, which is `contains(".env")`.
 /// It catches `.env`, `.env.local` and `prod.env`, and does not catch `environment`.
+///
+/// This judges the entry and nothing else. What an entry *hides* is [`conceals`], and both are
+/// needed — see [`select`].
 #[must_use]
 pub fn classify(entry: &Path) -> Class {
     if entry
         .components()
-        .any(|component| component.as_os_str() == "node_modules")
+        .any(|component| component.as_os_str() == VENDOR_DIR)
     {
         return Class::Vendor;
     }
     let name = entry.file_name().unwrap_or_default().to_string_lossy();
-    if name.contains(".env") {
+    if name.contains(ENV_MARK) {
         return Class::Env;
     }
     Class::Other
+}
+
+/// What a directory holds that the run was not asked to remove.
+///
+/// Paths are relative to the work tree root, as everything a user reads is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Conceals {
+    /// A vendored directory lives here, under the entry.
+    Vendor(PathBuf),
+    /// An env file lives here, under the entry.
+    Env(PathBuf),
+    /// This directory under the entry could not be read, so nothing below it could be ruled
+    /// out.
+    Unreadable(PathBuf, String),
+}
+
+impl Conceals {
+    /// Which class would have to be opted in to release the entry, or `None` when opting in
+    /// would not help because the obstacle is that something could not be read.
+    #[must_use]
+    pub fn class(&self) -> Option<Class> {
+        match self {
+            Self::Vendor(_) => Some(Class::Vendor),
+            Self::Env(_) => Some(Class::Env),
+            Self::Unreadable(..) => None,
+        }
+    }
+}
+
+impl fmt::Display for Conceals {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Vendor(path) => write!(f, "holds {}, which is vendored", path.display()),
+            Self::Env(path) => write!(f, "holds {}, which is an env file", path.display()),
+            Self::Unreadable(path, why) => write!(
+                f,
+                "could not read {}, so nothing under it could be ruled out: {why}",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// An entry left where it is because of what is under it rather than what it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Concealed {
+    /// The entry git offered, relative to the work tree root.
+    pub path: PathBuf,
+    /// What is under it that was not asked for.
+    pub reason: Conceals,
 }
 
 /// What git says it would remove from one work tree.
@@ -156,6 +222,9 @@ pub fn classify(entry: &Path) -> Class {
 /// The two lists are disjoint: `-d` is untracked-and-not-ignored, `-dX` is ignored only.
 #[derive(Debug, Clone, Default)]
 pub struct Enumeration {
+    /// The work tree the lists below describe. Carried so an entry can be judged by its
+    /// position *within the checkout* rather than by its absolute path.
+    pub root: PathBuf,
     /// Untracked paths, absolute. A directory here means everything under it.
     pub untracked: Vec<PathBuf>,
     /// Ignored paths, absolute.
@@ -171,10 +240,14 @@ pub struct Enumeration {
 pub struct Selected {
     /// What to remove, untracked before ignored.
     pub targets: Vec<Target>,
-    /// How many entries were left alone because vendor was not opted in.
+    /// How many entries were left alone because they *are* vendored and vendor was not opted
+    /// in.
     pub vendor: usize,
-    /// How many entries were left alone because env was not opted in.
+    /// How many entries were left alone because they *are* env files and env was not opted in.
     pub env: usize,
+    /// Entries left alone because of what is under them. Named rather than counted, because
+    /// the reason is one level down and a count would send the reader looking for it.
+    pub concealed: Vec<Concealed>,
 }
 
 /// Applies a selection to an enumeration.
@@ -182,19 +255,113 @@ pub struct Selected {
 /// The vendor and env filters apply to **both** lists, not only to the ignored one. The guard
 /// is about what the file is worth, and an untracked-but-not-ignored `.env` is the most
 /// precious kind rather than the least: it is the one git is not even hiding.
+///
+/// ## Why an entry has to be judged twice
+///
+/// `git clean` emits a whole directory whenever *everything* inside it is removable, so an
+/// entry is not a description of its own contents. `docker/` arrives as one line and may hold a
+/// `docker/.env`; `pkg/` arrives as one line and may hold a `pkg/node_modules`. Judging only
+/// the emitted path deletes both while the same run reports, truthfully as far as it knows,
+/// that env files were held back.
+///
+/// So every directory entry is also asked what it hides, and one that hides something not
+/// opted in is held back whole. Held back rather than expanded, because expanding would mean
+/// deciding for ourselves what inside it is removable — which is the reimplementation of
+/// `git clean` this mode exists to avoid.
+///
+/// **git cannot be made to do this itself, and it is worth recording why so nobody retries
+/// it.** `git clean -n -d -e '*.env*'` really does expand around the pattern, and for the
+/// untracked pass it is exactly right. But under `-X` the same flag *inverts*: `-e` adds to the
+/// ignore rules and `-X` removes what is ignored, so the protected pattern becomes a target.
+/// A `:(exclude)` pathspec does not stop the collapse at all. And the one form that protects
+/// both, `-d -x -e <pattern>`, merges untracked and ignored into a single pass — which
+/// collapses a mixed directory across the two classes and reintroduces the exact `.nx` bug this
+/// module's header exists to describe. All three measured against real git.
 #[must_use]
 pub fn select(enumeration: &Enumeration, selection: &Selection) -> Selected {
     let mut selected = Selected::default();
     let untracked = selection.untracked.then_some(&enumeration.untracked);
     let ignored = selection.ignored.then_some(&enumeration.ignored);
     for path in untracked.into_iter().chain(ignored).flatten() {
-        match classify(path) {
-            Class::Vendor if !selection.vendor => selected.vendor += 1,
-            Class::Env if !selection.env => selected.env += 1,
-            _ => selected.targets.push(Target::at(path.clone())),
+        let relative = path.strip_prefix(&enumeration.root).unwrap_or(path);
+        match classify(relative) {
+            Class::Vendor if !selection.vendor => {
+                selected.vendor += 1;
+                continue;
+            }
+            Class::Env if !selection.env => {
+                selected.env += 1;
+                continue;
+            }
+            _ => {}
         }
+        if let Some(reason) = conceals(path, &enumeration.root, *selection) {
+            selected.concealed.push(Concealed {
+                path: relative.to_path_buf(),
+                reason,
+            });
+            continue;
+        }
+        selected.targets.push(Target::at(path.clone()));
     }
     selected
+}
+
+/// Looks under `entry` for the first thing `selection` did not ask to remove.
+///
+/// Returns as soon as it finds one — the answer is "hold this back", and a second reason does
+/// not change it. A directory it cannot read is an answer too: #588's lesson is that the check
+/// to distrust is the one whose failure is silent, and "I could not look" must never read as
+/// "there was nothing there".
+///
+/// Nothing about git's semantics is re-derived here. Everything under `entry` is already, on
+/// git's own authority, in the class the user selected — this only asks whether any of it is
+/// *also* something they held back.
+fn conceals(entry: &Path, root: &Path, selection: Selection) -> Option<Conceals> {
+    // Nothing is being held back, so nothing can be hidden. This is also what keeps the walk
+    // off the common `--node-modules --env` path entirely.
+    if selection.vendor && selection.env {
+        return None;
+    }
+    // A file hides nothing. A symlink is removed as a link rather than followed, so it hides
+    // nothing either, and descending one would leave the work tree.
+    if !entry.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
+        return None;
+    }
+
+    let show = |path: &Path| path.strip_prefix(root).unwrap_or(path).to_path_buf();
+    let mut stack = vec![entry.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let listing = match fs::read_dir(&dir) {
+            Ok(listing) => listing,
+            Err(err) => return Some(Conceals::Unreadable(show(&dir), err.to_string())),
+        };
+        for found in listing {
+            let found = match found {
+                Ok(found) => found,
+                // `read_dir` gave up part-way through a directory it had already opened, so
+                // the listing is short by an unknown amount and the unknown part could be the
+                // env file this is looking for.
+                Err(err) => return Some(Conceals::Unreadable(show(&dir), err.to_string())),
+            };
+            let path = found.path();
+            let name = found.file_name();
+            let name = name.to_string_lossy();
+            if !selection.vendor && name == VENDOR_DIR {
+                return Some(Conceals::Vendor(show(&path)));
+            }
+            if !selection.env && name.contains(ENV_MARK) {
+                return Some(Conceals::Env(show(&path)));
+            }
+            // `DirEntry::file_type` does not follow symlinks, so a link is never descended.
+            match found.file_type() {
+                Ok(kind) if kind.is_dir() => stack.push(path),
+                Ok(_) => {}
+                Err(err) => return Some(Conceals::Unreadable(show(&path), err.to_string())),
+            }
+        }
+    }
+    None
 }
 
 /// One git work tree, asked what it would clean.
@@ -264,6 +431,7 @@ impl Repo {
         skipped.sort_unstable();
         skipped.dedup();
         Ok(Enumeration {
+            root: self.root.clone(),
             untracked: untracked.removals,
             ignored: ignored.removals,
             skipped,
@@ -659,8 +827,12 @@ mod tests {
         }
     }
 
+    /// A fixture whose paths do not exist on disk, which is deliberate: nothing here is a
+    /// directory, so [`conceals`] is inert and these tests isolate the classification half.
+    /// What an entry hides is covered against real git in `tests/repo.rs`.
     fn enumeration() -> Enumeration {
         Enumeration {
+            root: PathBuf::from("/r"),
             untracked: vec![PathBuf::from("/r/scratch.txt"), PathBuf::from("/r/.env")],
             ignored: vec![
                 PathBuf::from("/r/dist"),
@@ -669,6 +841,29 @@ mod tests {
             ],
             skipped: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_checkout_living_under_a_node_modules_does_not_classify_as_all_vendored() {
+        // `classify` searches the components for `node_modules`, so it has to be handed the
+        // path relative to the work tree — an absolute one drags in the root's own components
+        // and every entry in such a checkout would be held back as vendored.
+        let enumeration = Enumeration {
+            root: PathBuf::from("/home/me/node_modules/checkout"),
+            untracked: vec![PathBuf::from("/home/me/node_modules/checkout/dist")],
+            ..Enumeration::default()
+        };
+
+        let selected = select(
+            &enumeration,
+            &Selection {
+                untracked: true,
+                ..Selection::default()
+            },
+        );
+
+        assert_eq!(selected.targets.len(), 1, "{selected:?}");
+        assert_eq!(selected.vendor, 0);
     }
 
     #[test]

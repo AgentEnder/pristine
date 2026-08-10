@@ -47,7 +47,7 @@ use std::time::Duration;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use pristine::delete::confirm;
-use pristine::repo::{Repo, Reset, Selected, Selection};
+use pristine::repo::{Class, Repo, Reset, Selected, Selection};
 use pristine::{
     DEFAULT_MIN_SIZE, Deleter, Enumeration, FallbackReport, Hit, Plan, Planner, Removal, Ruleset,
     Size, Target, WalkOutcome, Walker,
@@ -608,6 +608,32 @@ fn write_repo_plan(
                 out,
                 "excluded: {} ({flag} includes them)",
                 plural(count, what)
+            )?;
+        }
+    }
+    // Named rather than counted. git offers a directory whole whenever everything inside it is
+    // removable, so the reason one of these is held back is a level down from the row — and a
+    // bare count would send the reader looking for something the output never showed them.
+    if !selected.concealed.is_empty() {
+        writeln!(
+            out,
+            "held back: {}, because git offered them whole and they hold something you did not \
+             ask to remove",
+            plural(selected.concealed.len(), PATH)
+        )?;
+        for concealed in &selected.concealed {
+            // The flag that would release it, where one would. An unreadable subtree is not a
+            // thing any flag opts into, and saying otherwise would send the reader in a circle.
+            let hint = match concealed.reason.class() {
+                Some(Class::Vendor) => " (--node-modules includes it)",
+                Some(Class::Env) => " (--env includes it)",
+                _ => "",
+            };
+            writeln!(
+                out,
+                "  {}  —  {}{hint}",
+                concealed.path.display(),
+                concealed.reason
             )?;
         }
     }
