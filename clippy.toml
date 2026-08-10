@@ -9,6 +9,8 @@ allow-expect-in-tests = true
 # Words `clippy::doc_markdown` (from pedantic) would otherwise demand back-ticks around on
 # every mention. The trailing ".." keeps clippy's own default list rather than replacing it.
 doc-valid-idents = [
+    "CMake",
+    "CMakeCache.txt",
     "GiB",
     "KiB",
     "MiB",

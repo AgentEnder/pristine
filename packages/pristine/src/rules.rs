@@ -1,0 +1,443 @@
+//! The tier-one ruleset: what a reclaimable directory looks like, as data.
+//!
+//! The rules themselves live in [`rules.toml`](../src/rules.toml), which is compiled into the
+//! binary and can be extended or replaced by a user file. Nothing in this module encodes a
+//! single ecosystem, so adding one is a config edit rather than a release.
+
+use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use serde::Deserialize;
+
+use crate::detect::Detector;
+
+/// The ruleset shipped with the binary.
+const BUILTIN: &str = include_str!("rules.toml");
+
+/// Where the markers for a rule are looked for, relative to the directory being judged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Anchor {
+    /// The directory the target path hangs off. For a single-segment target such as
+    /// `node_modules` that is simply the matched directory's parent.
+    #[default]
+    Parent,
+    /// The matched directory itself. This is how an ambiguous name is made safe: a CMake
+    /// `build/` is only output if it contains the `CMakeCache.txt` CMake wrote there.
+    #[serde(rename = "self")]
+    SelfDir,
+    /// The nearest ancestor carrying a marker, searched upward as far as the scan root. For
+    /// artefacts scattered through a project rather than parked at its root, like
+    /// `__pycache__`.
+    Ancestor,
+}
+
+/// Whether one marker is enough, or all of them are needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MarkersRequired {
+    /// Any one marker proves the project type. The common case.
+    #[default]
+    Any,
+    /// Every marker must be present. Unity is a `ProjectSettings/` **and** an `Assets/`.
+    All,
+}
+
+/// One marker-anchored rule: the evidence that a project is of some kind, and the directories
+/// that kind of project generates.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rule {
+    /// Stable identifier. A user rule with the same id replaces the built-in one.
+    pub id: String,
+    /// Human-readable label for the ecosystem, for display.
+    pub ecosystem: String,
+    /// File or directory names proving the anchor is a project of this kind. A name
+    /// containing `*` or `?` is a glob and costs a directory listing to check.
+    pub markers: Vec<String>,
+    /// Whether one marker is enough.
+    #[serde(default)]
+    pub markers_required: MarkersRequired,
+    /// Reclaimable paths relative to the anchor. Multi-segment paths (`vendor/bundle`) and a
+    /// globbed final segment (`bazel-*`) are both allowed.
+    pub targets: Vec<String>,
+    /// Where the markers are looked for.
+    #[serde(default)]
+    pub anchor: Anchor,
+    /// The command that brings the directory back when nothing in `regenerate_when` applies.
+    /// Mandatory: it is what turns "is this safe to delete" into "am I willing to pay for it".
+    pub regenerate: String,
+    /// Refinements of `regenerate`, chosen by a marker found at or above the project root.
+    /// The first entry whose marker is found wins.
+    #[serde(default)]
+    pub regenerate_when: Vec<RegenerateWhen>,
+    /// An optional caveat to surface next to the hit.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// A more specific regeneration command, unlocked by the presence of a marker.
+///
+/// `node_modules` is the case this exists for. "npm ci / pnpm install / yarn — whichever
+/// lockfile is present" is a sentence, not a command: it cannot be run, and it leaves the
+/// user to work out something the filesystem already knows. A `pnpm-lock.yaml` beside (or
+/// above) the `package.json` settles it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegenerateWhen {
+    /// The file whose presence selects this command. Searched for at the project root and
+    /// then upward, because a workspace keeps one lockfile at its root while every package
+    /// under it has its own `package.json` and its own `node_modules`.
+    pub marker: String,
+    /// The command to report instead.
+    pub regenerate: String,
+}
+
+/// A parsed, validated and compiled set of rules.
+#[derive(Debug)]
+pub struct Ruleset {
+    rules: Vec<Arc<Rule>>,
+    detector: Detector,
+}
+
+/// The wire shape of a rules file. Only ever seen by serde.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RulesFile {
+    #[serde(default)]
+    rules: Vec<Rule>,
+}
+
+impl Ruleset {
+    /// The ruleset compiled into the binary.
+    ///
+    /// # Errors
+    ///
+    /// Only if the compiled-in TOML is malformed, which a unit test in this module rules out.
+    pub fn builtin() -> Result<Self, RuleError> {
+        Self::from_rules(Self::parse_rules(BUILTIN)?)
+    }
+
+    /// Parses a rules file on its own, replacing the built-in set entirely.
+    ///
+    /// # Errors
+    ///
+    /// If the TOML is malformed, a rule is incomplete, or a glob fails to compile.
+    pub fn parse(toml: &str) -> Result<Self, RuleError> {
+        Self::from_rules(Self::parse_rules(toml)?)
+    }
+
+    /// Parses a user rules file and layers it over the built-in set: a rule whose `id`
+    /// already exists replaces the built-in one in place, and a new `id` is appended.
+    ///
+    /// Replacing in place rather than appending keeps the first-match-wins ordering
+    /// predictable — overriding `cargo` does not quietly move it behind `maven`.
+    ///
+    /// # Errors
+    ///
+    /// If either file is malformed, a rule is incomplete, or a glob fails to compile.
+    pub fn with_overrides(user_toml: &str) -> Result<Self, RuleError> {
+        let mut rules = Self::parse_rules(BUILTIN)?;
+        for rule in Self::parse_rules(user_toml)? {
+            match rules.iter().position(|existing| existing.id == rule.id) {
+                Some(at) => rules[at] = rule,
+                None => rules.push(rule),
+            }
+        }
+        Self::from_rules(rules)
+    }
+
+    /// Loads the ruleset, layering the user's file over the built-in set when it exists.
+    ///
+    /// Passing `None` looks in the default location, [`Ruleset::user_config_path`]. A missing
+    /// file is not an error; an unreadable or malformed one is, because silently falling back
+    /// to the built-in set would hide the user's edits from them.
+    ///
+    /// # Errors
+    ///
+    /// If the user file exists but cannot be read or parsed.
+    pub fn load(user_path: Option<&Path>) -> Result<Self, RuleError> {
+        let Some(path) = user_path.map(PathBuf::from).or_else(Self::user_config_path) else {
+            return Self::builtin();
+        };
+        match fs::read_to_string(&path) {
+            Ok(toml) => Self::with_overrides(&toml),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::builtin(),
+            Err(err) => Err(RuleError::Read(path, err)),
+        }
+    }
+
+    /// The default location of the user's rules file, `$XDG_CONFIG_HOME/pristine/rules.toml`
+    /// falling back to `~/.config/pristine/rules.toml`.
+    #[must_use]
+    pub fn user_config_path() -> Option<PathBuf> {
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+        Some(base.join("pristine").join("rules.toml"))
+    }
+
+    /// The rules, in evaluation order.
+    #[must_use]
+    pub fn rules(&self) -> &[Arc<Rule>] {
+        &self.rules
+    }
+
+    pub(crate) fn detector(&self) -> &Detector {
+        &self.detector
+    }
+
+    fn parse_rules(toml: &str) -> Result<Vec<Rule>, RuleError> {
+        let file: RulesFile =
+            toml::from_str(toml).map_err(|err| RuleError::Parse(err.to_string()))?;
+        Ok(file.rules)
+    }
+
+    fn from_rules(rules: Vec<Rule>) -> Result<Self, RuleError> {
+        for rule in &rules {
+            if rule.markers.is_empty() {
+                return Err(RuleError::NoMarkers(rule.id.clone()));
+            }
+            if rule.targets.is_empty() {
+                return Err(RuleError::NoTargets(rule.id.clone()));
+            }
+            // Searched for by `stat` rather than by listing, so a glob would silently never
+            // match. Refuse it instead.
+            if let Some(when) = rule
+                .regenerate_when
+                .iter()
+                .find(|when| when.marker.contains(['*', '?', '[', '{']))
+            {
+                return Err(RuleError::Glob(
+                    when.marker.clone(),
+                    "a regenerate_when marker is looked up by name and cannot be a glob".to_owned(),
+                ));
+            }
+            if let Some(other) = rules.iter().filter(|r| r.id == rule.id).nth(1) {
+                return Err(RuleError::DuplicateId(other.id.clone()));
+            }
+        }
+        let rules: Vec<Arc<Rule>> = rules.into_iter().map(Arc::new).collect();
+        let detector = Detector::new(&rules)?;
+        Ok(Self { rules, detector })
+    }
+}
+
+/// Why a ruleset could not be loaded.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum RuleError {
+    /// The user's rules file could not be read.
+    Read(PathBuf, std::io::Error),
+    /// The TOML was malformed or a rule was missing a mandatory field.
+    Parse(String),
+    /// A rule declared no markers, which would make it a bare-name match.
+    NoMarkers(String),
+    /// A rule declared nothing to reclaim.
+    NoTargets(String),
+    /// Two rules share an id, so an override would be ambiguous.
+    DuplicateId(String),
+    /// A marker or target pattern is not a valid glob.
+    Glob(String, String),
+}
+
+impl fmt::Display for RuleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(path, err) => write!(f, "reading rules from {}: {err}", path.display()),
+            Self::Parse(err) => write!(f, "parsing rules: {err}"),
+            Self::NoMarkers(id) => write!(
+                f,
+                "rule `{id}` declares no markers; a rule without one is a bare-name match, \
+                 which is how a cleaner deletes somebody's source"
+            ),
+            Self::NoTargets(id) => write!(f, "rule `{id}` declares nothing to reclaim"),
+            Self::DuplicateId(id) => write!(f, "two rules share the id `{id}`"),
+            Self::Glob(pattern, err) => write!(f, "`{pattern}` is not a valid glob: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for RuleError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read(_, err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Anchor, MarkersRequired, RuleError, Ruleset};
+
+    #[test]
+    fn the_builtin_ruleset_parses() {
+        let ruleset = Ruleset::builtin().unwrap();
+        assert!(
+            ruleset.rules().len() >= 20,
+            "kondo covers 20+ project types and pristine must not ship narrower"
+        );
+    }
+
+    #[test]
+    fn every_builtin_rule_is_marker_anchored_and_says_how_to_regenerate() {
+        for rule in Ruleset::builtin().unwrap().rules() {
+            assert!(!rule.markers.is_empty(), "{} has no marker", rule.id);
+            assert!(!rule.targets.is_empty(), "{} reclaims nothing", rule.id);
+            assert!(
+                !rule.regenerate.is_empty(),
+                "{} cannot be regenerated",
+                rule.id
+            );
+            assert!(
+                !rule.ecosystem.is_empty(),
+                "{} has no ecosystem label",
+                rule.id
+            );
+        }
+    }
+
+    #[test]
+    fn the_builtin_ruleset_covers_the_ecosystems_kondo_does() {
+        let ruleset = Ruleset::builtin().unwrap();
+        let ids: Vec<&str> = ruleset.rules().iter().map(|r| r.id.as_str()).collect();
+        for expected in [
+            "node",
+            "cargo",
+            "go",
+            "python",
+            "dotnet",
+            "gradle",
+            "maven",
+            "composer",
+            "bundler",
+            "elixir",
+            "swift",
+            "dart",
+            "zig",
+            "unity",
+            "nx",
+            "bazel",
+            "cmake",
+            "godot",
+            "unreal",
+            "terraform",
+            "react-native",
+            "sbt",
+            "stack",
+            "cabal",
+            "pixi",
+            "jupyter",
+            "turborepo",
+        ] {
+            assert!(ids.contains(&expected), "no rule for {expected}");
+        }
+    }
+
+    #[test]
+    fn anchors_and_marker_modes_round_trip_from_toml() {
+        let ruleset = Ruleset::parse(
+            r#"
+            [[rules]]
+            id = "a"
+            ecosystem = "A"
+            anchor = "self"
+            markers_required = "all"
+            markers = ["m1", "m2"]
+            targets = ["out"]
+            regenerate = "make"
+            "#,
+        )
+        .unwrap();
+        let rule = &ruleset.rules()[0];
+        assert_eq!(rule.anchor, Anchor::SelfDir);
+        assert_eq!(rule.markers_required, MarkersRequired::All);
+        assert_eq!(rule.anchor, Anchor::SelfDir);
+    }
+
+    #[test]
+    fn a_user_rule_replaces_a_builtin_one_in_place() {
+        let builtin = Ruleset::builtin().unwrap();
+        let cargo_at = builtin
+            .rules()
+            .iter()
+            .position(|r| r.id == "cargo")
+            .unwrap();
+
+        let ruleset = Ruleset::with_overrides(
+            r#"
+            [[rules]]
+            id = "cargo"
+            ecosystem = "Rust"
+            markers = ["Cargo.toml"]
+            targets = ["target", "coverage"]
+            regenerate = "cargo build --release"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(ruleset.rules().len(), builtin.rules().len());
+        let cargo = &ruleset.rules()[cargo_at];
+        assert_eq!(cargo.targets, ["target", "coverage"]);
+        assert_eq!(cargo.regenerate, "cargo build --release");
+    }
+
+    #[test]
+    fn a_rule_without_markers_is_rejected() {
+        let err = Ruleset::parse(
+            r#"
+            [[rules]]
+            id = "reckless"
+            ecosystem = "Reckless"
+            markers = []
+            targets = ["build"]
+            regenerate = "make"
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RuleError::NoMarkers(id) if id == "reckless"));
+    }
+
+    #[test]
+    fn an_unknown_field_is_rejected_rather_than_silently_ignored() {
+        let err = Ruleset::parse(
+            r#"
+            [[rules]]
+            id = "typo"
+            ecosystem = "Typo"
+            markers = ["m"]
+            target = ["build"]
+            targets = ["build"]
+            regenerate = "make"
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RuleError::Parse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn duplicate_ids_are_rejected() {
+        let err = Ruleset::parse(
+            r#"
+            [[rules]]
+            id = "dup"
+            ecosystem = "A"
+            markers = ["a"]
+            targets = ["out"]
+            regenerate = "make"
+
+            [[rules]]
+            id = "dup"
+            ecosystem = "B"
+            markers = ["b"]
+            targets = ["out"]
+            regenerate = "make"
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RuleError::DuplicateId(id) if id == "dup"));
+    }
+}

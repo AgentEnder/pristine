@@ -1,0 +1,300 @@
+# The tier-one ruleset.
+#
+# This file is compiled into the binary and can be replaced or extended by a user file (see
+# `rules.rs`), so adding an ecosystem is a config edit rather than a release.
+#
+# EVERY RULE IS MARKER-ANCHORED. There is no such thing as a bare directory name here, and
+# adding one is the single change most likely to make pristine delete somebody's source.
+# `target` is Rust's and Maven's and SBT's; `vendor` is Go's and Composer's and Bundler's;
+# `build` is Gradle's and Dart's, and in a CMake project it is very often hand-written source.
+#
+# Fields:
+#   id           stable identifier. A user rule with the same id REPLACES the built-in one.
+#   ecosystem    human label for the UI.
+#   markers      evidence that the anchor directory really is a project of this kind. Literal
+#                names are checked with one stat; a name containing `*` or `?` costs one
+#                read_dir, so prefer literals.
+#   markers_required  "any" (default) or "all".
+#   targets      paths relative to the anchor. Multi-segment paths (`vendor/bundle`) and
+#                globbed final segments (`bazel-*`) are both allowed.
+#   anchor       where the markers are looked for, relative to the matched directory:
+#                  "parent"   (default) the directory the target path hangs off — for a
+#                             single-segment target that is the matched directory's parent.
+#                  "self"     the matched directory itself. This is how an ambiguous name is
+#                             made safe: a CMake `build/` is reclaimable only when it
+#                             contains the `CMakeCache.txt` that CMake generated there.
+#                  "ancestor" the nearest ancestor carrying a marker, searched upward to the
+#                             scan root. For artefacts that are scattered through a project
+#                             rather than parked at its root, like `__pycache__`.
+#   regenerate   the command that brings it back. This is what turns "is this safe to delete"
+#                into "am I willing to pay for it", so it is mandatory.
+#   note         optional caveat surfaced next to the hit.
+#
+# Rules are evaluated in order and the first match wins, so put the more specific rule first
+# where two could claim the same directory.
+
+# The lockfile picks the command. "whichever lockfile is present" is a sentence, not
+# something a user can run, and the filesystem already knows the answer. The search runs from
+# the project root upward so a workspace — one lockfile at the root, a `package.json` and a
+# `node_modules` per package — still names the right package manager for every package.
+[[rules]]
+id = "node"
+ecosystem = "Node"
+markers = ["package.json"]
+targets = ["node_modules"]
+regenerate = "npm install"
+regenerate_when = [
+    { marker = "pnpm-lock.yaml", regenerate = "pnpm install" },
+    { marker = "yarn.lock", regenerate = "yarn install" },
+    { marker = "bun.lock", regenerate = "bun install" },
+    { marker = "bun.lockb", regenerate = "bun install" },
+    { marker = "package-lock.json", regenerate = "npm ci" },
+    { marker = "npm-shrinkwrap.json", regenerate = "npm ci" },
+    { marker = "deno.lock", regenerate = "deno install" },
+]
+
+[[rules]]
+id = "cargo"
+ecosystem = "Rust"
+markers = ["Cargo.toml"]
+targets = ["target"]
+regenerate = "cargo build"
+
+[[rules]]
+id = "go"
+ecosystem = "Go"
+markers = ["go.mod"]
+targets = ["vendor"]
+regenerate = "go mod vendor"
+
+[[rules]]
+id = "python"
+ecosystem = "Python"
+markers = [
+    "pyproject.toml",
+    "requirements.txt",
+    "setup.py",
+    "setup.cfg",
+    "Pipfile",
+]
+targets = [".venv", "venv", ".tox"]
+regenerate = "uv sync / python -m venv .venv && pip install -r requirements.txt"
+
+# Split from `python` because these are scattered through a package tree rather than parked
+# at its root: `src/pkg/sub/__pycache__` is normal and its parent holds no manifest.
+[[rules]]
+id = "python-caches"
+ecosystem = "Python"
+anchor = "ancestor"
+markers = [
+    "pyproject.toml",
+    "requirements.txt",
+    "setup.py",
+    "setup.cfg",
+    "Pipfile",
+]
+targets = ["__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"]
+regenerate = "rebuilt automatically on the next import / test run"
+
+[[rules]]
+id = "pixi"
+ecosystem = "Pixi"
+markers = ["pixi.toml", "pixi.lock"]
+targets = [".pixi"]
+regenerate = "pixi install"
+
+[[rules]]
+id = "jupyter"
+ecosystem = "Jupyter"
+markers = ["*.ipynb"]
+targets = [".ipynb_checkpoints"]
+regenerate = "recreated by Jupyter on the next save"
+
+[[rules]]
+id = "dotnet"
+ecosystem = ".NET"
+markers = ["*.csproj", "*.fsproj", "*.vbproj", "*.sln", "*.slnx"]
+targets = ["bin", "obj"]
+regenerate = "dotnet build"
+
+[[rules]]
+id = "gradle"
+ecosystem = "Gradle"
+markers = [
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts",
+]
+targets = ["build", ".gradle"]
+regenerate = "gradle build"
+
+[[rules]]
+id = "maven"
+ecosystem = "Maven"
+markers = ["pom.xml"]
+targets = ["target"]
+regenerate = "mvn package"
+
+[[rules]]
+id = "sbt"
+ecosystem = "SBT"
+markers = ["build.sbt"]
+targets = ["target", "project/target"]
+regenerate = "sbt compile"
+
+[[rules]]
+id = "composer"
+ecosystem = "PHP / Composer"
+markers = ["composer.json"]
+targets = ["vendor"]
+regenerate = "composer install"
+
+[[rules]]
+id = "bundler"
+ecosystem = "Ruby / Bundler"
+markers = ["Gemfile"]
+targets = ["vendor/bundle", ".bundle"]
+regenerate = "bundle install"
+
+[[rules]]
+id = "elixir"
+ecosystem = "Elixir"
+markers = ["mix.exs"]
+targets = ["_build", "deps"]
+regenerate = "mix deps.get && mix compile"
+
+[[rules]]
+id = "swift"
+ecosystem = "Swift"
+markers = ["Package.swift"]
+targets = [".build"]
+regenerate = "swift build"
+
+[[rules]]
+id = "cocoapods"
+ecosystem = "CocoaPods"
+markers = ["Podfile"]
+targets = ["Pods"]
+regenerate = "pod install"
+
+[[rules]]
+id = "dart"
+ecosystem = "Dart / Flutter"
+markers = ["pubspec.yaml"]
+targets = [".dart_tool", "build"]
+regenerate = "flutter pub get (dart pub get for a non-Flutter package)"
+
+[[rules]]
+id = "zig"
+ecosystem = "Zig"
+markers = ["build.zig"]
+targets = [".zig-cache", "zig-cache", "zig-out"]
+regenerate = "zig build"
+
+[[rules]]
+id = "stack"
+ecosystem = "Haskell / Stack"
+markers = ["stack.yaml"]
+targets = [".stack-work"]
+regenerate = "stack build"
+
+[[rules]]
+id = "cabal"
+ecosystem = "Haskell / Cabal"
+markers = ["*.cabal", "cabal.project"]
+targets = ["dist-newstyle", "dist"]
+regenerate = "cabal build"
+
+# Self-anchored, and this is the rule the whole marker-anchoring argument was made for: a
+# directory named `build` in a CMake project is as likely to be hand-written source as it is
+# to be output. CMake writes `CMakeCache.txt` into the binary directory it owns, and nothing
+# else does, so requiring the marker INSIDE the candidate is what makes the name safe.
+[[rules]]
+id = "cmake"
+ecosystem = "CMake"
+anchor = "self"
+markers = ["CMakeCache.txt"]
+targets = ["build", "_build", "out", "cmake-build-*", "build-*"]
+regenerate = "cmake -B <dir> && cmake --build <dir>"
+
+[[rules]]
+id = "unity"
+ecosystem = "Unity"
+markers = ["ProjectSettings", "Assets"]
+markers_required = "all"
+targets = ["Library", "Temp", "Obj"]
+regenerate = "Unity reimports on the next open"
+note = "a Unity reimport is slow — minutes to hours on a large project"
+
+# `Build/` is NOT claimed, though kondo claims it. An Unreal project keeps authored
+# per-platform build configuration under it — `Build/IOS/` provisioning and icons,
+# `Build/Android/` manifests and resources — so a `.uproject` beside it proves the project's
+# type and not that the directory is generated. That is the same mistake as matching a bare
+# `build`, one rule further in. `Saved/` is out for the same reason: logs, configs, autosaves.
+[[rules]]
+id = "unreal"
+ecosystem = "Unreal Engine"
+markers = ["*.uproject"]
+targets = ["Binaries", "Intermediate", "DerivedDataCache"]
+regenerate = "regenerate project files, then rebuild from the editor or UnrealBuildTool"
+note = "`Build/` and `Saved/` are not claimed: both hold authored files alongside output"
+
+[[rules]]
+id = "godot"
+ecosystem = "Godot"
+markers = ["project.godot"]
+targets = [".godot", ".import"]
+regenerate = "Godot reimports assets on the next open"
+
+[[rules]]
+id = "react-native"
+ecosystem = "React Native"
+markers = ["metro.config.js", "metro.config.cjs", "react-native.config.js"]
+targets = ["android/build", "android/app/build", "ios/build", ".expo"]
+regenerate = "npx react-native run-android / run-ios rebuilds it"
+
+[[rules]]
+id = "nextjs"
+ecosystem = "Next.js"
+markers = [
+    "next.config.js",
+    "next.config.mjs",
+    "next.config.cjs",
+    "next.config.ts",
+]
+targets = [".next"]
+regenerate = "next build"
+
+[[rules]]
+id = "turborepo"
+ecosystem = "Turborepo"
+anchor = "ancestor"
+markers = ["turbo.json"]
+targets = [".turbo"]
+regenerate = "turbo run build"
+
+[[rules]]
+id = "nx"
+ecosystem = "Nx"
+markers = ["nx.json"]
+targets = [".nx/cache", ".nx/workspace-data", "dist"]
+regenerate = "nx reset, then rebuild"
+
+[[rules]]
+id = "terraform"
+ecosystem = "Terraform"
+markers = ["*.tf", "*.tf.json"]
+targets = [".terraform", ".terragrunt-cache"]
+regenerate = "terraform init"
+
+# Bazel's `bazel-*` entries are symlinks into an output base that usually lives outside the
+# scan root, so the bytes they report are the links' own and not the output base's. They are
+# still worth surfacing: removing them is what unpins a stale output base.
+[[rules]]
+id = "bazel"
+ecosystem = "Bazel"
+markers = ["MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel"]
+targets = ["bazel-*"]
+regenerate = "bazel build"
+note = "these are symlinks; the space is in the output base, which `bazel clean --expunge` frees"
