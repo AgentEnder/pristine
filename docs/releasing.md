@@ -6,12 +6,14 @@ built, so a release where the two disagree is a broken release.
 
 ## What ships
 
-| Nx project                  | Path                        | Published as                        |
-| --------------------------- | --------------------------- | ----------------------------------- |
-| `pristine`                  | `packages/pristine`         | `pristine-cli` on crates.io         |
-| `npm-pristine`              | `npm/pristine`              | `@agentender/pristine`              |
-| `npm-pristine-darwin-arm64` | `npm/pristine-darwin-arm64` | `@agentender/pristine-darwin-arm64` |
-| `npm-pristine-linux-x64-gnu`| `npm/pristine-linux-x64-gnu`| `@agentender/pristine-linux-x64-gnu`|
+| Nx project                     | Path                           | Published as                           |
+| ------------------------------ | ------------------------------ | -------------------------------------- |
+| `pristine`                     | `packages/pristine`            | `pristine-cli` on crates.io            |
+| `npm-pristine`                 | `npm/pristine`                 | `@agentender/pristine`                 |
+| `npm-pristine-darwin-arm64`    | `npm/pristine-darwin-arm64`    | `@agentender/pristine-darwin-arm64`    |
+| `npm-pristine-darwin-x64`      | `npm/pristine-darwin-x64`      | `@agentender/pristine-darwin-x64`      |
+| `npm-pristine-linux-arm64-gnu` | `npm/pristine-linux-arm64-gnu` | `@agentender/pristine-linux-arm64-gnu` |
+| `npm-pristine-linux-x64-gnu`   | `npm/pristine-linux-x64-gnu`   | `@agentender/pristine-linux-x64-gnu`   |
 
 ## Cutting a release
 
@@ -56,6 +58,43 @@ Do not replace the flag with `version.fallbackCurrentVersionResolver: "disk"`. I
 work without `--first-release`, but it also makes a later release fall back to the manifests when the
 tag it expects is missing, republishing a version that already shipped. A missing tag should fail
 loudly.
+
+## The npm wrapper
+
+`@agentender/pristine` ships no code of its own beyond a shim. Its `optionalDependencies` name one
+platform package per prebuilt target, each declaring the `os` and `cpu` it is for, so npm resolves
+exactly one and skips the rest. The wrapper's `bin` runs `bin/pristine.cjs`, which asks
+`lib/platform.cjs` which package this host wants, resolves that package's manifest, and executes the
+`pristine` binary sitting beside it.
+
+Nothing is downloaded at install time and there is no build step, which is the point: the install
+works offline, behind a proxy, and where lifecycle scripts are disabled. `test/manifests.test.cjs`
+fails if a lifecycle script appears in any of the five manifests.
+
+**`npm/pristine/lib/platform.cjs` is the target list.** `TARGETS` there is the single source of
+truth; the wrapper's `optionalDependencies` and the `npm/pristine-*` directories are checked against
+it by `npm-pristine:test`. Adding a target means adding an entry, a directory, and a build in the
+release job — and the tests name whichever of the three you forgot.
+
+### The binaries are not in git
+
+A platform package is committed with its manifest and no binary. `.gitignore` covers
+`/npm/pristine-*/pristine`, and something has to put the file there before `npm pack` runs: the
+release job for every target, or `nx run npm-pristine:verify-pack` for the host you are sitting at.
+
+This is the sharpest edge in the whole npm half. **A `files` entry naming a file that does not exist
+is skipped in silence** — no warning, no non-zero exit — so a release job whose cross-compile step
+failed publishes a platform package containing nothing but a manifest, and the failure surfaces as a
+user's `pristine: command not found`. Anything that packs these directories has to assert the binary
+is in the tarball first. The verification below does.
+
+### Windows
+
+There is no Windows package. The crate does compile for `x86_64-pc-windows-msvc` — checked, not
+assumed — so the gap is that nothing builds or tests a Windows binary: CI runs on ubuntu and macos
+only, and the deleter's safety model is written against `openat`/`O_NOFOLLOW` semantics that no test
+exercises on Windows. Publishing the package before that changes would promise a platform nothing
+verifies. Adding it later is an entry in `TARGETS`, a directory, and a matrix row.
 
 ## How the config holds the two ecosystems together
 
@@ -173,5 +212,26 @@ string. Guides written against Nx 21 or earlier will disagree with this file.
 The check that matters is the lockstep one, and it needs a real run rather than a dry run. On a
 scratch branch, make a crate-only conventional commit, run `npx nx release version` (the version step
 alone, so nothing is committed, tagged, or pushed), and confirm that
-`packages/pristine/Cargo.toml`, all three `npm/*/package.json` versions, the wrapper's
+`packages/pristine/Cargo.toml`, all five `npm/*/package.json` versions, the wrapper's
 `optionalDependencies` pins, and `Cargo.lock` all moved to the same version. Then reset the branch.
+
+## Verifying the wrapper
+
+Manifests can be read and still be wrong. The executable bit surviving `npm pack`, npm honouring
+`os` and `cpu`, the shim resolving a package it does not depend on directly, and the binary's own
+`--version` agreeing with the wrapper's are all properties of an installed tree.
+
+```sh
+pnpm nx run npm-pristine:verify-pack
+```
+
+It builds the release binary, stages it into this host's platform package, packs both, installs the
+tarballs into a scratch project, and runs the `pristine` npm put on the `PATH`. It covers one
+platform — whichever one you are on — which is the honest limit of a local check; the release job
+is what covers the rest.
+
+One thing it does that is easy to get wrong by hand: installing the two tarballs side by side is not
+enough. npm resolves the wrapper's `optionalDependencies` pin against the registry, where an
+unpublished version does not exist, and **an optional dependency that fails to resolve is skipped in
+silence**. The scratch project pins the edge to the tarball with an `overrides` entry, so a pass
+means the wrapper found a binary rather than that npm quietly declined to install one.

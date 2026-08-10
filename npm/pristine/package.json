@@ -16,11 +16,20 @@
   "engines": {
     "node": ">=22"
   },
+  "bin": {
+    "pristine": "bin/pristine.cjs"
+  },
+  "files": [
+    "bin",
+    "lib"
+  ],
   "publishConfig": {
     "access": "public"
   },
   "optionalDependencies": {
     "@agentender/pristine-darwin-arm64": "0.1.0",
+    "@agentender/pristine-darwin-x64": "0.1.0",
+    "@agentender/pristine-linux-arm64-gnu": "0.1.0",
     "@agentender/pristine-linux-x64-gnu": "0.1.0"
   }
 }

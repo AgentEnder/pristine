@@ -1,7 +1,7 @@
 {
-  "name": "@agentender/pristine-darwin-arm64",
+  "name": "@agentender/pristine-darwin-x64",
   "version": "0.1.0",
-  "description": "The pristine binary for darwin-arm64. Installed for you by @agentender/pristine.",
+  "description": "The pristine binary for darwin-x64. Installed for you by @agentender/pristine.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -11,7 +11,7 @@
     "darwin"
   ],
   "cpu": [
-    "arm64"
+    "x64"
   ],
   "files": [
     "pristine"

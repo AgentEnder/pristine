@@ -199,6 +199,11 @@ npx @agentender/pristine
 cargo install pristine-cli    # the crate is `pristine-cli`; the binary is `pristine`
 ```
 
+The npm route is a wrapper over the same binaries the crate builds, with no postinstall download,
+so it works offline and where install scripts are disabled. It carries prebuilt binaries for
+`darwin-arm64`, `darwin-x64`, `linux-x64-gnu` and `linux-arm64-gnu`; anywhere else, `cargo install`
+builds from source.
+
 ## Development
 
 [mise](https://mise.jdx.dev) owns the toolchain; `mise install` gets you rust, node and pnpm at the
@@ -210,9 +215,11 @@ cargo test
 ```
 
 The same commands are wrapped as Nx targets (`pnpm nx run-many -t fmt-check lint test`), which is how
-the npm wrapper will share a graph with the crate later.
+the npm wrapper shares a graph — and a version — with the crate.
 
 The crate is `packages/pristine` and its published name is `pristine-cli`; the binary is `pristine`.
+The npm wrapper and its per-platform binary packages are under `npm/`; see
+[docs/releasing.md](docs/releasing.md) for how the two stay in lockstep.
 
 ## License
 
