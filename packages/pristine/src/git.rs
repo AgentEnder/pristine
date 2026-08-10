@@ -40,6 +40,31 @@ const AMBIENT_GIT_ENV: [&str; 8] = [
     "GIT_NAMESPACE",
 ];
 
+/// A `git` invocation pointed at `dir`, with everything ambient that could change its answer
+/// shut out.
+///
+/// Two families of variable, and they are dangerous for different reasons.
+///
+/// [`AMBIENT_GIT_ENV`] redirects git at another *repository*, which is the failure described
+/// above it.
+///
+/// The locale redirects git's *prose*, and repo mode reads git's prose because `git clean` has
+/// no `-z` and no porcelain format — it prints `Would remove <path>`, and that sentence is
+/// translated. Measured, not assumed: under `LANGUAGE=de` the same command prints
+/// `Würde … löschen`, and a parser looking for `Would remove` finds nothing at all. So a repo
+/// full of build output would report as already clean. `LC_ALL=C` wins over `LANGUAGE`
+/// (measured), and `LANGUAGE` is cleared as well because it is the one variable that otherwise
+/// wins over `LANG`.
+pub(crate) fn git(dir: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir).stdin(Stdio::null());
+    for variable in AMBIENT_GIT_ENV {
+        command.env_remove(variable);
+    }
+    command.env("LC_ALL", "C").env("LANGUAGE", "");
+    command
+}
+
 /// Whether `dir` is the root of a git work tree.
 ///
 /// A `.git` that is a *file* rather than a directory is a linked work tree or a submodule, and
@@ -82,18 +107,11 @@ impl WorkTree {
     ///
     /// If git cannot be run at all, or refuses to list the index.
     pub fn open(root: &Path) -> Result<Self, GitError> {
-        let mut command = Command::new("git");
-        command
-            .arg("-C")
-            .arg(root)
-            // `--full-name` pins the paths to the work tree root rather than to a working
-            // directory, and `-z` gives them raw: git quotes and escapes any other way, and a
-            // path this module misreads is a path it wrongly believes is untracked.
-            .args(["ls-files", "-z", "--full-name"])
-            .stdin(Stdio::null());
-        for variable in AMBIENT_GIT_ENV {
-            command.env_remove(variable);
-        }
+        let mut command = git(root);
+        // `--full-name` pins the paths to the work tree root rather than to a working
+        // directory, and `-z` gives them raw: git quotes and escapes any other way, and a
+        // path this module misreads is a path it wrongly believes is untracked.
+        command.args(["ls-files", "-z", "--full-name"]);
 
         let output = command
             .output()
