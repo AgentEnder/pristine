@@ -399,7 +399,10 @@ fn clean(args: &RepoArgs, out: &mut impl Write) -> Result<bool, Box<dyn std::err
 
     if let Some(reset) = selection.reset {
         repo.reset(reset)?;
-        writeln!(out, "\nreset: {}", reset.command())?;
+        // The plan above already said which command this is. What is worth saying here is only
+        // that it ran, because it ran before the removal and the removal may yet report
+        // something.
+        writeln!(out, "\nreset: done")?;
     }
     if plan.is_empty() {
         return Ok(true);
