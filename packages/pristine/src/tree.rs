@@ -196,7 +196,7 @@ mod tests {
     use super::Tree;
     use crate::rules::Ruleset;
     use crate::size::Size;
-    use crate::walk::Hit;
+    use crate::walk::{Claim, Hit, RuleClaim};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -205,9 +205,11 @@ mod tests {
         let rule = Arc::clone(&ruleset.rules()[0]);
         Hit {
             path: PathBuf::from(path),
-            project_root: PathBuf::from("/scan"),
-            regenerate: rule.regenerate.clone(),
-            rule,
+            claim: Claim::Rule(RuleClaim {
+                project_root: PathBuf::from("/scan"),
+                regenerate: rule.regenerate.clone(),
+                rule,
+            }),
             size: Size::Measured(size),
             modified: None,
         }

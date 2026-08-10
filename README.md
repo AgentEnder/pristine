@@ -11,9 +11,28 @@ regenerates it before you decide.
 carrying `target/`, `.venv/`, `bin/`, `obj/`, `_build/`, `.gradle/` and `vendor/`, all equally
 reclaimable and all invisible to a tool that only knows about npm.
 
-> **Status: scaffold only.** `pristine --version` is the whole of the behaviour. The workspace,
-> toolchain and CI are in place; the walker, the ruleset and the TUI are not. The design is settled
-> and lives outside this repo.
+> **Status: it finds, it does not yet clean.** The parallel walker, both detection tiers and the
+> rollup tree work and are tested. The deleter and the rollup tree TUI are not written, so
+> nothing is deleted and the front end is a plain listing. The design is settled and lives
+> outside this repo.
+
+```console
+$ pristine ~/repos/pua
+  59.1 MiB  .nx                       no known way to regenerate this
+         —  dist                      nx reset, then rebuild
+         —  node_modules              pnpm install
+         —  target                    cargo build
+
+5 directories reclaimable, 59.1 MiB priced, 4 not priced
+fallback tier: 1 directory found in 1 work tree above a 10.0 MiB floor
+```
+
+A dash is not a zero: nothing looked inside, because a matched directory is never enumerated by
+the scan that found it. The fallback tier's rows do carry a size, because that tier cannot claim
+a directory without walking it.
+
+A scan that could not read everything it was pointed at says `scan incomplete` and exits
+non-zero, so a listing that is a lower bound never looks — to a script — like the whole truth.
 
 ## How it finds things
 
@@ -27,10 +46,20 @@ directory name plus a marker file that has to be present in its parent. `node_mo
 `package.json` is reclaimable. A `build` directory next to nothing in particular is not.
 
 **A gitignore fallback.** Inside a git work tree, a directory that is ignored, contains no tracked
-file at any depth, and exceeds a size floor is reclaimable by inference even when no rule names it.
-This is what makes the tool genuinely language-agnostic rather than agnostic across whichever
-ecosystems happened to get a rule written. The "no tracked files" condition is the safety property,
-and it is exactly the guarantee `git clean` enforces.
+file at any depth, holds no git checkout, and exceeds a size floor (10 MiB, `--min-size`) is
+reclaimable by inference even when no rule names it. This is what makes the tool genuinely
+language-agnostic rather than agnostic across whichever ecosystems happened to get a rule written.
+On one real machine it is what turns up `dist/`, `tmp/`, `artifacts/`, `playwright-report/`,
+`.angular/cache` and a downloaded `Godot.app` — none of which any ruleset names.
+
+The last two conditions are the safety properties, and both are guarantees `git clean` enforces:
+it will not remove a directory holding a tracked file, and it skips rather than collapses one
+holding a checkout. Outside a git work tree the tier is **inert**, and says so rather than
+reporting an empty result. With no repository the only signal left would be the directory's name,
+and a name is not evidence — guessing from one is how a cleaner deletes somebody's source.
+
+A tier-two hit reports that it does not know how to regenerate what it found. That asymmetry
+against tier one is the point: it tells you which deletions are cheap.
 
 ## Two modes
 
