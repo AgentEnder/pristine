@@ -376,6 +376,13 @@ pub struct View {
     prompt: Option<Prompt>,
     help: Option<usize>,
     pending: Option<Pending>,
+    /// Claims a pricing pass has been asked for and has not answered yet.
+    ///
+    /// The one piece of state that stops a gesture from being repeatable into unbounded
+    /// work: a claim in here is one somebody is already traversing, so a second double click
+    /// on the row above it asks for nothing. Emptied by [`View::repriced`] on every way a
+    /// pass can end — see there for why that matters more than it looks.
+    pricing: HashSet<PathBuf>,
     /// Whether the walk is still running, for the header.
     scanning: bool,
     /// Whether a removal is in flight. A second one would race the first over the same tree.
@@ -415,6 +422,7 @@ impl View {
             prompt: None,
             help: None,
             pending: None,
+            pricing: HashSet::new(),
             scanning: true,
             deleting: false,
             quitting: false,
@@ -459,16 +467,19 @@ impl View {
         self.scanning = false;
     }
 
-    /// The pricing a double click asked for is over.
+    /// A pricing pass is over, and these are the claims it was holding.
     ///
     /// The prices themselves arrived one at a time through [`View::priced`], exactly as the
-    /// walk's do — this is only the footer catching up, so a `pricing 12 directories…` notice
-    /// does not sit there after the work behind it has finished.
-    pub fn repriced(&mut self, claims: usize) {
-        self.notice = Some(format!(
-            "priced {}",
-            plural(claims, "directory", "directories")
-        ));
+    /// walk's do; this hands the claims back, which is what lets the next double click on
+    /// them mean something again. It is called on **every** way a pass can end, the worker
+    /// dying included — an in-flight set that leaked would be a subtree the reader can never
+    /// ask about again for the rest of the run, which is a quiet permanent no-op on a gesture
+    /// they keep making.
+    pub fn repriced(&mut self, claims: &[PathBuf], notice: String) {
+        for claim in claims {
+            self.pricing.remove(claim);
+        }
+        self.notice = Some(notice);
     }
 
     /// The removal is over, and this is what it did.
@@ -1009,18 +1020,42 @@ impl View {
     /// `--breakdown-under` every row outside the named scope reads as a dash, and this is how
     /// one of them is asked about without re-running the scan; on a fully priced tree it
     /// finds nothing and says so rather than starting work with no result.
+    ///
+    /// Two things it refuses, and both are about work rather than about display. A row that
+    /// is **no longer on screen** starts nothing: a detached node keeps its hit, so walking
+    /// what is under one would hand back a path the reader can no longer see and the deleter
+    /// has already removed — the identity rule running the other way round, since here the
+    /// vanished target costs a traversal rather than a selection. And a claim **already being
+    /// priced** is not asked for again: `Tree::price` rejects a duplicate result, but only
+    /// after the expensive part has happened, so leaning on the button during a traversal of
+    /// a real `node_modules` would queue that traversal over and over.
     fn price_row(&mut self, id: NodeId) -> Effect {
-        self.point_at(id);
-        let unpriced = self.unpriced_under(id);
-        if unpriced.is_empty() {
-            self.notice = Some("everything under here already carries a price".to_owned());
+        if !self.point_at(id) {
             return Effect::None;
         }
+        let (waiting, running): (Vec<PathBuf>, Vec<PathBuf>) = self
+            .unpriced_under(id)
+            .into_iter()
+            .partition(|path| !self.pricing.contains(path));
+        if waiting.is_empty() {
+            // Two different facts, and the reader can act on the difference: one says there
+            // is nothing to learn here, the other says to wait.
+            self.notice = Some(if running.is_empty() {
+                "everything under here already carries a price".to_owned()
+            } else {
+                format!(
+                    "{} under here is already being priced",
+                    plural(running.len(), "directory", "directories")
+                )
+            });
+            return Effect::None;
+        }
+        self.pricing.extend(waiting.iter().cloned());
         self.notice = Some(format!(
             "pricing {}…",
-            plural(unpriced.len(), "directory", "directories")
+            plural(waiting.len(), "directory", "directories")
         ));
-        Effect::Price(unpriced)
+        Effect::Price(waiting)
     }
 
     /// Every claim under `id` that nobody has put a number on.
@@ -2260,9 +2295,93 @@ mod tests {
         assert!(view.notice().unwrap().contains("pricing 1 directory"));
 
         // A subtree that is already priced says so rather than starting work with no result.
-        let ui = at(&view, "/scan/nx/packages");
-        assert_eq!(view.apply(Action::Price(ui)), Effect::None);
-        assert!(view.notice().unwrap().contains("already carries a price"));
+        // Opened on the way, because a press can only land on a row that is drawn — which is
+        // also why an off-screen row starts nothing at all.
+        point_at(&mut view, "/scan/nx/packages");
+        let packages = at(&view, "/scan/nx/packages");
+        assert_eq!(view.apply(Action::Price(packages)), Effect::None);
+        assert!(
+            view.notice().unwrap().contains("already carries a price"),
+            "{:?}",
+            view.notice()
+        );
+    }
+
+    #[test]
+    fn a_double_click_on_a_row_that_has_gone_prices_nothing() {
+        let mut tree = Tree::new("/scan");
+        tree.insert(hit("/scan/old/target", Size::Unmeasured, 100));
+        let mut view = View::new(tree);
+        view.viewport(40);
+        point_at(&mut view, "/scan/old");
+        view.apply(Action::Expand);
+        let target = at(&view, "/scan/old/target");
+
+        // The row was pressed and then deleted before the button came up. A detached node
+        // keeps its hit, so "walk what is under this id" would happily hand back a path that
+        // is no longer on screen and no longer on disk — which is the identity rule going
+        // one way for the cursor and the other way for the work.
+        view.removed(Path::new("/scan/old/target"), true);
+        view.sync();
+
+        assert_eq!(view.apply(Action::Price(target)), Effect::None);
+    }
+
+    #[test]
+    fn a_subtree_already_being_priced_is_not_asked_for_a_second_time() {
+        let mut tree = Tree::new("/scan");
+        tree.insert(hit("/scan/nx/node_modules", Size::Unmeasured, 900));
+        let mut view = View::new(tree);
+        view.viewport(40);
+        let nx = at(&view, "/scan/nx");
+        let claim = PathBuf::from("/scan/nx/node_modules");
+
+        assert_eq!(
+            view.apply(Action::Price(nx)),
+            Effect::Price(vec![claim.clone()])
+        );
+
+        // Leaning on the button during a traversal of a real `node_modules` would otherwise
+        // queue the same traversal again and again. `Tree::price` rejecting the duplicate
+        // *result* is no help: by then the expensive part has already happened.
+        assert_eq!(view.apply(Action::Price(nx)), Effect::None);
+        assert!(
+            view.notice().unwrap().contains("already being priced"),
+            "{:?}",
+            view.notice()
+        );
+
+        // …and the two facts stay apart once the pass reports: nothing left to ask for
+        // because it has a price now, rather than because somebody is still working on it.
+        view.priced(&claim, Size::Measured(64));
+        view.repriced(&[claim], "priced 1 directory".to_owned());
+        assert_eq!(view.apply(Action::Price(nx)), Effect::None);
+        assert!(
+            view.notice().unwrap().contains("already carries a price"),
+            "{:?}",
+            view.notice()
+        );
+    }
+
+    #[test]
+    fn a_pricing_pass_that_never_reports_does_not_strand_its_rows() {
+        let mut tree = Tree::new("/scan");
+        tree.insert(hit("/scan/nx/node_modules", Size::Unmeasured, 900));
+        let mut view = View::new(tree);
+        view.viewport(40);
+        let nx = at(&view, "/scan/nx");
+        let claim = PathBuf::from("/scan/nx/node_modules");
+        view.apply(Action::Price(nx));
+
+        // Handing the claims back is what the loop does when the worker has gone. Without
+        // it the in-flight set leaks and the subtree can never be asked about again for the
+        // rest of the run — a quiet, permanent no-op on a gesture the reader keeps making.
+        view.repriced(
+            std::slice::from_ref(&claim),
+            "the pricing went away".to_owned(),
+        );
+        assert_eq!(view.notice(), Some("the pricing went away"));
+        assert_eq!(view.apply(Action::Price(nx)), Effect::Price(vec![claim]));
     }
 
     #[test]
@@ -2296,7 +2415,10 @@ mod tests {
         view.apply(Action::Price(nx));
         assert!(view.notice().unwrap().contains("pricing"));
 
-        view.repriced(1);
+        view.repriced(
+            &[PathBuf::from("/scan/nx/node_modules")],
+            "priced 1 directory".to_owned(),
+        );
         assert_eq!(view.notice(), Some("priced 1 directory"));
     }
 

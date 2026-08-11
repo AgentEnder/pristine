@@ -132,9 +132,11 @@ enum Message {
     /// A subtree the reader double-clicked, now that it has been priced.
     ///
     /// The prices themselves went out one at a time as [`Found::Priced`], exactly as the
-    /// walk's do. This is what the pass could not read, plus the count for the footer.
+    /// walk's do. This carries the **claims the pass was holding** — the view is keeping them
+    /// as "being priced" and nothing else knows which ones this pass had — plus what it could
+    /// not read.
     Repriced {
-        claims: usize,
+        claims: Vec<PathBuf>,
         errors: Vec<WalkError>,
     },
 }
@@ -497,6 +499,10 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
     // `Spot::Nowhere` and does nothing.
     let mut placed = Placed::default();
     let mut pointer = Pointer::default();
+    // The pricing worker's queue, started by the first double click that needs one and never
+    // replaced: one `Option` here *is* the guarantee that a run has at most one of them, the
+    // same way owning the removal's handle is the guarantee it gets joined.
+    let mut pricer: Option<Sender<Vec<PathBuf>>> = None;
 
     loop {
         drain(&mut view, &inbox, &mut outcome);
@@ -580,9 +586,28 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
                 batch_since = Instant::now();
                 batch.takes_over(spawn_delete(options, targets, post.clone()));
             }
-            // Detached rather than held, for the walk's reason and not the removal's: this
-            // only *reads*, so abandoning one at the end of a run costs nothing.
-            Effect::Price(paths) => spawn_price(options, paths, post.clone()),
+            // Queued onto the one pricing worker, started on the first gesture that needs
+            // one — see [`spawn_pricer`] for why there is exactly one of these.
+            Effect::Price(claims) => {
+                let queue = pricer.get_or_insert_with(|| spawn_pricer(options, post.clone()));
+                if let Err(returned) = queue.send(claims) {
+                    // The worker died — nothing in it should panic, and if one ever does the
+                    // cost is not the panic: the view is holding these claims as "being
+                    // priced", and left there the subtree can never be asked about again for
+                    // the rest of the run. Handing them back is the same shape of repair
+                    // `reap` makes for a removal that ended without reporting.
+                    //
+                    // Deliberately not an exit-status failure. Pricing is what a row *shows*,
+                    // not something the run was asked to accomplish — a claim left unpriced
+                    // reads as a dash, which is exactly the state `--breakdown-under` leaves
+                    // most of the tree in and exits zero on.
+                    view.repriced(
+                        &returned.0,
+                        "the pricing ended without reporting what it did".to_owned(),
+                    );
+                    pricer = None;
+                }
+            }
         }
     }
 
@@ -635,7 +660,11 @@ fn drain(view: &mut View, inbox: &Receiver<Message>, outcome: &mut Outcome) {
                 // The walk's rule, kept: a pass that could not read everything makes every
                 // total it fed a lower bound, and the header says so beside the numbers.
                 outcome.errors.extend(errors);
-                view.repriced(claims);
+                let said = format!(
+                    "priced {}",
+                    plural(claims.len(), "directory", "directories")
+                );
+                view.repriced(&claims, said);
             }
             Ok(Message::Deleted(removal)) => {
                 outcome.failures += removal.failures.len();
@@ -695,7 +724,7 @@ fn spawn_delete(options: &Options, targets: Vec<PathBuf>, post: Sender<Message>)
     })
 }
 
-/// Prices the claims a double click asked about, reporting each one as the walk would.
+/// The **one** thread that prices subtrees a reader has asked about, and the queue into it.
 ///
 /// A full [`SizeMode::Breakdown`] whatever the command line asked for, and that is the whole
 /// gesture: `--breakdown-under` scopes what the *scan* pays for, and this is the reader
@@ -703,41 +732,58 @@ fn spawn_delete(options: &Options, targets: Vec<PathBuf>, post: Sender<Message>)
 /// filesystem when the run does, because what the deleter will not cross the measurer must
 /// not count.
 ///
-/// Nothing stops a reader double-clicking the same subtree twice, and nothing needs to:
-/// [`crate::tree::Tree::price`] refuses a claim that already carries a size, so a second pass
-/// over the same claims costs the traversal and changes no number. That is what makes an
-/// unbounded, unjoined gesture safe rather than merely tolerated.
-fn spawn_price(options: &Options, paths: Vec<PathBuf>, post: Sender<Message>) {
+/// # One worker, not one per gesture
+///
+/// A double click is a gesture a reader can repeat faster than a traversal of a real
+/// `node_modules` finishes, so a thread per press is an unbounded number of concurrent full
+/// walks over the same disk — which is slower than doing them in turn as well as unbounded.
+/// Requests queue here instead, and there is only ever one of these in a run because
+/// [`drive`] holds a single [`Option`] of its sender.
+///
+/// The queue cannot grow without bound either, and that guarantee is the *view's*:
+/// [`View::price_row`] refuses a claim it has already asked about, so what can be waiting
+/// here is at most the unpriced claims in the tree rather than however many times somebody
+/// pressed the button.
+///
+/// Detached and unjoined, for the walk's reason rather than the removal's: it only reads, so
+/// abandoning one at the end of a run costs nothing. It ends on its own when [`drive`] drops
+/// the sender — which is why a run that never prices anything never starts it at all.
+fn spawn_pricer(options: &Options, post: Sender<Message>) -> Sender<Vec<PathBuf>> {
+    let (ask, queue) = channel::<Vec<PathBuf>>();
     let measurer = Measurer::new(SizeMode::Breakdown).same_file_system(options.one_file_system);
     std::thread::spawn(move || {
-        let claims = paths.len();
-        let mut errors = Vec::new();
-        for path in paths {
-            let metadata = match std::fs::symlink_metadata(&path) {
-                Ok(metadata) => metadata,
-                // The directory has gone since the scan claimed it. Not a failure of the
-                // run — somebody else's `rm` is a fact about the machine — but it is why the
-                // row is about to keep its dash, so it is said rather than swallowed.
-                Err(err) => {
-                    errors.push(WalkError {
-                        path: Some(path),
-                        message: err.to_string(),
-                    });
-                    continue;
-                }
-            };
-            let sized = measurer.measure(&path, &metadata);
-            errors.extend(sized.unreadable.into_iter().map(|path| WalkError {
-                path: Some(path),
-                message: "unreadable, so this size is a lower bound".to_owned(),
-            }));
-            let _ = post.send(Message::Found(Found::Priced(Priced {
-                path,
-                size: sized.size,
-            })));
+        while let Ok(claims) = queue.recv() {
+            let mut errors = Vec::new();
+            for path in &claims {
+                let metadata = match std::fs::symlink_metadata(path) {
+                    Ok(metadata) => metadata,
+                    // The directory has gone since the scan claimed it. Not a failure of the
+                    // run — somebody else's `rm` is a fact about the machine — but it is why
+                    // the row is about to keep its dash, so it is said rather than swallowed.
+                    Err(err) => {
+                        errors.push(WalkError {
+                            path: Some(path.clone()),
+                            message: err.to_string(),
+                        });
+                        continue;
+                    }
+                };
+                let sized = measurer.measure(path, &metadata);
+                errors.extend(sized.unreadable.into_iter().map(|path| WalkError {
+                    path: Some(path),
+                    message: "unreadable, so this size is a lower bound".to_owned(),
+                }));
+                let _ = post.send(Message::Found(Found::Priced(Priced {
+                    path: path.clone(),
+                    size: sized.size,
+                })));
+            }
+            // The claims go back with the report, because the view is holding them as "being
+            // priced" and nothing else knows which ones this pass had.
+            let _ = post.send(Message::Repriced { claims, errors });
         }
-        let _ = post.send(Message::Repriced { claims, errors });
     });
+    ask
 }
 
 /// One line about what the scan found, for the notification that says it is over.
@@ -793,7 +839,10 @@ pub fn size_mode(asked: SizeMode) -> SizeMode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Batch, Chrome, Decor, Message, Outcome, Restore, drain, reap, summarise};
+    use super::{
+        Batch, Chrome, Decor, Message, Options, Outcome, Restore, SizeMode, drain, reap,
+        spawn_pricer, summarise,
+    };
     use crate::delete::{Failure, Refusal, Refused, Removal, Removed};
     use crate::fixture::priced;
     use crate::tree::Tree;
@@ -937,6 +986,61 @@ mod tests {
             finished.load(Ordering::SeqCst),
             "the removal was abandoned rather than waited for"
         );
+    }
+
+    #[test]
+    fn one_pricing_worker_answers_a_queue_of_requests_and_ends_when_the_loop_lets_go() {
+        // The other half of the bound. The view refuses to ask twice for a claim it is
+        // already waiting on; this is what makes the requests that *do* get through cost one
+        // traversal at a time rather than one thread each.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let first = tmp.path().join("a/node_modules");
+        let second = tmp.path().join("b/node_modules");
+        for dir in [&first, &second] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("f.js"), "xxxx").unwrap();
+        }
+
+        let (post, inbox) = channel();
+        let queue = spawn_pricer(
+            &Options {
+                root: tmp.path().to_path_buf(),
+                min_size: crate::DEFAULT_MIN_SIZE,
+                size_mode: SizeMode::Skip,
+                one_file_system: true,
+                older_than: None,
+            },
+            post,
+        );
+        queue.send(vec![first.clone()]).unwrap();
+        queue.send(vec![second.clone()]).unwrap();
+
+        // Both requests answered, in the order they were queued, by the one worker.
+        let mut reported = Vec::new();
+        let mut sized = 0;
+        while reported.len() < 2 {
+            match inbox.recv().unwrap() {
+                Message::Repriced { claims, errors } => {
+                    assert!(errors.is_empty(), "{errors:?}");
+                    reported.push(claims);
+                }
+                // Each claim's price goes out on its own first, exactly as the walk's do,
+                // so a row fills in without waiting for the rest of its batch.
+                Message::Found(Found::Priced(priced)) => {
+                    assert!(priced.size.bytes().is_some_and(|bytes| bytes > 0));
+                    sized += 1;
+                }
+                _ => panic!("the pricer said something else"),
+            }
+        }
+        assert_eq!(reported, [vec![first], vec![second]]);
+        assert_eq!(sized, 2);
+
+        // The claims come back with the report, which is what lets the view stop holding
+        // them — and the worker ends when the loop drops the queue rather than parking for
+        // the life of the process. Nothing else holds a sender, so the channel disconnects.
+        drop(queue);
+        assert!(matches!(inbox.recv(), Err(std::sync::mpsc::RecvError)));
     }
 
     #[test]
