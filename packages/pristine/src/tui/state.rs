@@ -339,6 +339,14 @@ pub struct View {
     scanning: bool,
     /// Whether a removal is in flight. A second one would race the first over the same tree.
     deleting: bool,
+    /// Whether the reader has asked to leave and is waiting on a removal to finish.
+    ///
+    /// `q` is reserved everywhere, and it stays reserved — but it cannot *end* a run that is
+    /// half way through unlinking a directory tree. The process leaving takes the pool with
+    /// it, so what would be left on disk is neither the tree the reader had nor the one they
+    /// asked for, and nothing would ever report which. So the keystroke is remembered instead
+    /// of obeyed, and the loop leaves the moment the removal is over.
+    quitting: bool,
     /// What just happened, for the footer to say.
     notice: Option<String>,
     /// Whether the rows on hand still describe the tree.
@@ -368,6 +376,7 @@ impl View {
             pending: None,
             scanning: true,
             deleting: false,
+            quitting: false,
             notice: None,
             stale: true,
             sorted: false,
@@ -594,6 +603,15 @@ impl View {
         self.deleting
     }
 
+    /// Puts the view mid-removal without one having happened.
+    ///
+    /// The event loop's own tests need a view that is waiting on a deleter, and the honest
+    /// door into that state runs an actual removal against an actual filesystem.
+    #[cfg(test)]
+    pub(crate) fn deleting_for_test(&mut self) {
+        self.deleting = true;
+    }
+
     /// What just happened, for the footer.
     #[must_use]
     pub fn notice(&self) -> Option<&str> {
@@ -629,7 +647,7 @@ impl View {
     pub fn apply(&mut self, action: Action) -> Effect {
         self.sync();
         match action {
-            Action::Quit => return Effect::Quit,
+            Action::Quit => return self.quit(),
             Action::Ignore => {}
             Action::Help => {
                 self.help = if self.help.is_some() { None } else { Some(0) };
@@ -699,6 +717,26 @@ impl View {
         }
         self.sync();
         Effect::None
+    }
+
+    /// `q`: leave — unless something irreversible is in flight, in which case wait for it.
+    ///
+    /// The wait is bounded by the work the reader themselves asked for, and it is *visible*:
+    /// rows keep disappearing as the deleter finishes each target. Tearing the batch in half
+    /// would not be.
+    fn quit(&mut self) -> Effect {
+        if self.deleting {
+            self.quitting = true;
+            self.notice = Some("the removal has to finish — closing the moment it does".to_owned());
+            return Effect::None;
+        }
+        Effect::Quit
+    }
+
+    /// Whether a quit that was held back by a removal can be honoured now.
+    #[must_use]
+    pub fn wants_to_quit(&self) -> bool {
+        self.quitting && !self.deleting
     }
 
     /// One rung down the ladder: whatever is in front of the reader, taken away.
@@ -1840,6 +1878,41 @@ mod tests {
     fn quitting_is_the_only_thing_that_ends_the_view() {
         let mut view = view();
         assert_eq!(view.apply(Action::Quit), Effect::Quit);
+    }
+
+    #[test]
+    fn quitting_cannot_end_a_view_that_is_half_way_through_a_removal() {
+        let mut view = view();
+        view.ask(pending(&["/scan/old/target"]));
+        view.apply(Action::Highlight(Turn::Next));
+        view.apply(Action::Answer);
+        assert!(view.is_deleting());
+
+        // Leaving would take the pool with it, and what is left on disk would be neither the
+        // tree the reader had nor the one they asked for — with nothing to report which.
+        assert_eq!(view.apply(Action::Quit), Effect::None);
+        assert!(!view.wants_to_quit());
+        assert!(view.notice().unwrap().contains("has to finish"));
+
+        // Pressing it again does not wear the rule down either.
+        assert_eq!(view.apply(Action::Quit), Effect::None);
+        assert!(!view.wants_to_quit());
+
+        // …and the keystroke is remembered rather than dropped: the loop leaves on the first
+        // frame after the removal reports.
+        view.deleted("removed 10 B from 1 directory".to_owned());
+        assert!(view.wants_to_quit());
+    }
+
+    #[test]
+    fn a_view_that_was_never_asked_to_quit_does_not_want_to() {
+        let mut view = view();
+        assert!(!view.wants_to_quit());
+        view.ask(pending(&["/scan/old/target"]));
+        view.apply(Action::Highlight(Turn::Next));
+        view.apply(Action::Answer);
+        view.deleted("removed 10 B from 1 directory".to_owned());
+        assert!(!view.wants_to_quit());
     }
 
     /// The batch, as paths, for the tests that are about *what* is in it.

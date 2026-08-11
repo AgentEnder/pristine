@@ -49,6 +49,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event};
@@ -98,6 +99,69 @@ enum Message {
     Deleted(Box<Removal>),
 }
 
+/// What the run turns out to have been, for the exit status.
+///
+/// A live view says everything it knows on the screen — an unreadable path in the header, a
+/// failed removal in the footer — and none of that reaches a script. The listing's rule is
+/// that a run which could not do everything it was asked exits non-zero, and there is no
+/// reason for the tree to be the exception: the same person pipes the same tool into the same
+/// `&&` the next day.
+#[derive(Debug, Default)]
+pub struct Outcome {
+    /// Paths the walk could not read, so every total is a lower bound. The header says so.
+    pub errors: Vec<WalkError>,
+    /// Targets a removal could not finish. **Not** the ones it refused: a refusal is the
+    /// safety model working, which is exactly the distinction [`Removal::is_clean`] draws.
+    pub failures: usize,
+}
+
+impl Outcome {
+    /// Whether everything the run was asked to do actually happened.
+    #[must_use]
+    pub fn whole(&self) -> bool {
+        self.errors.is_empty() && self.failures == 0
+    }
+}
+
+/// The terminal states this took, and the undoing of each.
+///
+/// A guard rather than a pair of calls at the end, because the two things that go wrong are
+/// both invisible until somebody is left with a broken terminal: an *early* failure between
+/// the two setup steps skips a cleanup that had not been written yet, and a `?` on the first
+/// cleanup step skips the second. Each flag is set the moment its state is genuinely entered,
+/// so [`Restore::finish`] and [`Drop`] both undo exactly what happened and nothing else.
+#[derive(Debug, Default)]
+struct Restore {
+    raw: bool,
+    alternate: bool,
+}
+
+impl Restore {
+    /// Puts back what was taken, attempting **every** step and reporting the first refusal.
+    ///
+    /// `?` between the steps is the bug this replaces: a terminal that is out of raw mode and
+    /// still on the alternate screen, or the other way round, is no better than one that was
+    /// never restored, and the failing call says nothing about whether the next one would.
+    fn finish(&mut self) -> io::Result<()> {
+        let mut first = Ok(());
+        if std::mem::take(&mut self.raw) {
+            first = first.and(disable_raw_mode());
+        }
+        if std::mem::take(&mut self.alternate) {
+            first = first.and(execute!(io::stdout(), LeaveAlternateScreen));
+        }
+        first
+    }
+}
+
+impl Drop for Restore {
+    /// The path a `?` takes, and the one a panic takes. Nothing here can report a failure, so
+    /// nothing here tries — [`Restore::finish`] is what the ordinary return calls.
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
 /// Runs the view until the reader quits, then puts the terminal back.
 ///
 /// # Errors
@@ -105,28 +169,24 @@ enum Message {
 /// Anything the terminal refuses. A failure to *restore* it is reported even when the run
 /// itself succeeded, because a terminal left in raw mode is the one outcome a user cannot
 /// ignore and cannot easily undo.
-pub fn run(options: &Options, ruleset: Arc<Ruleset>) -> io::Result<()> {
+pub fn run(options: &Options, ruleset: Arc<Ruleset>) -> io::Result<Outcome> {
+    let mut restore = Restore::default();
     enable_raw_mode()?;
-    let mut out = io::stdout();
-    execute!(out, EnterAlternateScreen)?;
-    let terminal = Terminal::with_options(
-        CrosstermBackend::new(out),
+    restore.raw = true;
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    restore.alternate = true;
+
+    let mut terminal = Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
         TerminalOptions {
             viewport: Viewport::Fullscreen,
         },
-    );
-
-    let outcome = terminal.and_then(|mut terminal| {
-        let result = drive(&mut terminal, options, ruleset);
-        // Cursor position is the terminal's business and the alternate screen swallowed it.
-        terminal.show_cursor().and(result)
-    });
-
-    // Restoring runs whatever happened above, because the alternative is handing back a
-    // terminal with no echo and no line editing.
-    disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
-    outcome
+    )?;
+    let outcome = drive(&mut terminal, options, ruleset);
+    // Cursor position is the terminal's business and the alternate screen swallowed it.
+    let shown = terminal.show_cursor();
+    let restored = restore.finish();
+    outcome.and_then(|outcome| shown.and(restored).map(|()| outcome))
 }
 
 /// The event loop, with the terminal already set up.
@@ -134,18 +194,26 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>>(
     terminal: &mut Terminal<B>,
     options: &Options,
     ruleset: Arc<Ruleset>,
-) -> io::Result<()> {
+) -> io::Result<Outcome> {
     let (post, inbox) = channel();
     let mut view = View::new(Tree::new(&options.root));
 
     let walker = spawn_walk(options, ruleset, post.clone());
-    let mut errors: Vec<WalkError> = Vec::new();
+    let mut outcome = Outcome::default();
+    let mut deleter: Option<JoinHandle<()>> = None;
 
     loop {
-        drain(&mut view, &inbox, &mut errors);
+        drain(&mut view, &inbox, &mut outcome);
+        reap(&mut view, &inbox, &mut outcome, deleter.as_ref());
         view.sync();
-        terminal.draw(|frame| render::draw(frame, &mut view, &errors))?;
+        terminal.draw(|frame| render::draw(frame, &mut view, &outcome.errors))?;
 
+        // A quit that was held back while a removal ran, now that it is over. Checked here
+        // rather than where the key was pressed, because what the key produced was a promise
+        // to leave and this is the first frame on which it can be kept.
+        if view.wants_to_quit() {
+            break;
+        }
         if !event::poll(TICK)? {
             continue;
         }
@@ -157,6 +225,8 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>>(
         }
         match view.apply(action_for(&event, view.overlay())) {
             Effect::None => {}
+            // Only ever reached with nothing in flight: the view holds a quit back while it
+            // is deleting, and hands it over through `wants_to_quit` instead.
             Effect::Quit => break,
             Effect::Plan(batch) => {
                 let plan = Planner::new(&options.root)
@@ -165,33 +235,66 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>>(
                     .plan(batch);
                 view.ask(Pending::of(&plan));
             }
-            Effect::Delete(targets) => spawn_delete(options, targets, post.clone()),
+            Effect::Delete(targets) => deleter = Some(spawn_delete(options, targets, post.clone())),
         }
     }
 
+    // The removal is over by the time the loop breaks — that is what the view guarantees —
+    // but the thread that ran it has not necessarily been reaped, and leaving `main` would
+    // take it with us either way. Joining is what makes "the batch finished" true rather than
+    // merely likely.
+    if let Some(deleter) = deleter {
+        let _ = deleter.join();
+    }
     // The walk holds a `Sender`; dropping ours and letting the thread finish is what stops a
-    // half-written frame from being the last thing on the screen. The thread is not joined:
-    // a walk of a home directory can be seconds from finishing, and a reader who pressed `q`
-    // has said they are done waiting.
+    // half-written frame from being the last thing on the screen. It is deliberately NOT
+    // joined, where the removal is: a walk reads, so abandoning one costs nothing, and a
+    // reader who pressed `q` during a scan of a home directory has said they are done
+    // waiting.
     drop(walker);
-    Ok(())
+    Ok(outcome)
+}
+
+/// Notices a removal that ended without saying what it did.
+///
+/// Nothing in the deleter should panic, and if one ever does the cost is not the panic: the
+/// view would sit `is_deleting()` forever, and a view that will not quit is worse than the
+/// thing that made it. The thread posts its report *before* it finishes, so a finished thread
+/// with nothing on the channel really has gone without reporting.
+fn reap(
+    view: &mut View,
+    inbox: &Receiver<Message>,
+    outcome: &mut Outcome,
+    deleter: Option<&JoinHandle<()>>,
+) {
+    if !view.is_deleting() || !deleter.is_some_and(JoinHandle::is_finished) {
+        return;
+    }
+    drain(view, inbox, outcome);
+    if view.is_deleting() {
+        outcome.failures += 1;
+        view.deleted("the removal ended without reporting what it did".to_owned());
+    }
 }
 
 /// Empties the channel into the view.
 ///
 /// Everything on it, not one message: a breakdown reports 16,013 claims and as many prices,
 /// and taking one per frame would render a tree that fills up over four minutes.
-fn drain(view: &mut View, inbox: &Receiver<Message>, errors: &mut Vec<WalkError>) {
+fn drain(view: &mut View, inbox: &Receiver<Message>, outcome: &mut Outcome) {
     loop {
         match inbox.try_recv() {
             Ok(Message::Found(Found::Claim(hit))) => view.found(hit),
             Ok(Message::Found(Found::Priced(priced))) => view.priced(&priced.path, priced.size),
-            Ok(Message::Scanned(outcome)) => {
-                errors.extend(outcome.errors);
+            Ok(Message::Scanned(walk)) => {
+                outcome.errors.extend(walk.errors);
                 view.scanned();
             }
             Ok(Message::Removed { path, complete }) => view.removed(&path, complete),
-            Ok(Message::Deleted(removal)) => view.deleted(summarise(&removal)),
+            Ok(Message::Deleted(removal)) => {
+                outcome.failures += removal.failures.len();
+                view.deleted(summarise(&removal));
+            }
             // Disconnected as well as empty: the walk finishing drops its sender, and there
             // is nothing left to say either way.
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
@@ -200,11 +303,7 @@ fn drain(view: &mut View, inbox: &Receiver<Message>, errors: &mut Vec<WalkError>
 }
 
 /// Starts the walk. The returned handle is only held so its `Sender` outlives the loop.
-fn spawn_walk(
-    options: &Options,
-    ruleset: Arc<Ruleset>,
-    post: Sender<Message>,
-) -> std::thread::JoinHandle<()> {
+fn spawn_walk(options: &Options, ruleset: Arc<Ruleset>, post: Sender<Message>) -> JoinHandle<()> {
     let walker = Walker::new(&options.root, ruleset)
         .size_mode(options.size_mode.clone())
         .same_file_system(options.one_file_system)
@@ -221,7 +320,10 @@ fn spawn_walk(
 }
 
 /// Starts a removal, reporting each target as it finishes and the whole thing at the end.
-fn spawn_delete(options: &Options, targets: Vec<PathBuf>, post: Sender<Message>) {
+///
+/// The handle is kept by the loop, which will not leave until this thread is done: see
+/// [`View::wants_to_quit`].
+fn spawn_delete(options: &Options, targets: Vec<PathBuf>, post: Sender<Message>) -> JoinHandle<()> {
     let planner = Planner::new(&options.root)
         .one_file_system(options.one_file_system)
         .older_than(options.older_than);
@@ -240,8 +342,10 @@ fn spawn_delete(options: &Options, targets: Vec<PathBuf>, post: Sender<Message>)
                 });
             })
             .remove(&plan);
+        // Posted before the thread ends, which is what lets `reap` read a finished thread
+        // with an empty channel as "this one died without saying anything".
         let _ = post.send(Message::Deleted(Box::new(removal)));
-    });
+    })
 }
 
 /// One line about what a removal did, for the footer.
@@ -279,5 +383,175 @@ pub fn size_mode(asked: SizeMode) -> SizeMode {
     match asked {
         SizeMode::BreakdownUnder(scope) => SizeMode::BreakdownUnder(scope),
         SizeMode::Skip | SizeMode::Breakdown => SizeMode::Breakdown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Message, Outcome, Restore, drain, reap, summarise};
+    use crate::delete::{Failure, Refusal, Refused, Removal, Removed};
+    use crate::fixture::priced;
+    use crate::tree::Tree;
+    use crate::tui::state::View;
+    use crate::walk::{Found, WalkError, WalkOutcome};
+    use std::sync::mpsc::channel;
+
+    fn view() -> View {
+        View::new(Tree::new("/scan"))
+    }
+
+    fn removed(path: &str) -> Removed {
+        Removed {
+            path: path.into(),
+            bytes: 1024,
+            entries: 3,
+            complete: true,
+        }
+    }
+
+    #[test]
+    fn a_scan_that_could_not_read_a_path_is_not_a_whole_run() {
+        let (post, inbox) = channel();
+        let mut view = view();
+        let mut outcome = Outcome::default();
+        assert!(outcome.whole());
+
+        post.send(Message::Found(Found::Claim(priced("/scan/a/target", 8))))
+            .unwrap();
+        post.send(Message::Scanned(WalkOutcome {
+            errors: vec![WalkError {
+                path: Some("/scan/locked".into()),
+                message: "Permission denied".to_owned(),
+            }],
+            ..WalkOutcome::default()
+        }))
+        .unwrap();
+        drain(&mut view, &inbox, &mut outcome);
+
+        // The header says so on screen, and this is the same fact reaching a script. Tested
+        // through the real drain rather than through a terminal, because the terminal is the
+        // one part of this that a test cannot have.
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(!outcome.whole());
+        assert!(!view.is_scanning());
+    }
+
+    #[test]
+    fn a_removal_that_failed_is_not_a_whole_run_and_a_removal_that_was_refused_is() {
+        let (post, inbox) = channel();
+        let mut view = view();
+        let mut outcome = Outcome::default();
+
+        // A refusal is the safety model working, which is exactly the distinction
+        // `Removal::is_clean` draws — and the listing exits zero on one.
+        post.send(Message::Deleted(Box::new(Removal {
+            removed: vec![removed("/scan/a/target")],
+            kept: vec![Refused {
+                path: "/scan/b/node_modules".into(),
+                reason: Refusal::HoldsCheckout,
+            }],
+            failures: Vec::new(),
+        })))
+        .unwrap();
+        drain(&mut view, &inbox, &mut outcome);
+        assert!(outcome.whole());
+        assert!(view.notice().unwrap().contains("left alone"));
+
+        post.send(Message::Deleted(Box::new(Removal {
+            removed: Vec::new(),
+            kept: Vec::new(),
+            failures: vec![Failure {
+                path: "/scan/c/target".into(),
+                message: "Device or resource busy".to_owned(),
+            }],
+        })))
+        .unwrap();
+        drain(&mut view, &inbox, &mut outcome);
+        assert_eq!(outcome.failures, 1);
+        assert!(!outcome.whole());
+    }
+
+    #[test]
+    fn a_removal_that_ended_without_reporting_does_not_leave_the_view_unable_to_quit() {
+        let (post, inbox) = channel();
+        let mut view = view();
+        let mut outcome = Outcome::default();
+        // A thread that has already ended, having said nothing — which is what a panic on
+        // the pool would look like from here.
+        let dead = std::thread::spawn(|| {});
+        while !dead.is_finished() {
+            std::thread::yield_now();
+        }
+        view.deleting_for_test();
+
+        reap(&mut view, &inbox, &mut outcome, Some(&dead));
+
+        assert!(!view.is_deleting(), "the view would never quit again");
+        assert_eq!(outcome.failures, 1);
+        drop(post);
+    }
+
+    #[test]
+    fn a_removal_that_reported_on_its_way_out_is_read_rather_than_called_a_failure() {
+        let (post, inbox) = channel();
+        let mut view = view();
+        let mut outcome = Outcome::default();
+        let dead = std::thread::spawn(|| {});
+        while !dead.is_finished() {
+            std::thread::yield_now();
+        }
+        view.deleting_for_test();
+        // The report is posted before the thread ends, so a finished thread can still have
+        // something on the channel. Calling that a failure would fail every clean removal.
+        post.send(Message::Deleted(Box::default())).unwrap();
+
+        reap(&mut view, &inbox, &mut outcome, Some(&dead));
+
+        assert!(!view.is_deleting());
+        assert_eq!(outcome.failures, 0);
+        assert!(outcome.whole());
+    }
+
+    #[test]
+    fn a_summary_names_what_was_left_behind_as_well_as_what_went() {
+        let removal = Removal {
+            removed: vec![removed("/scan/a/target")],
+            kept: vec![Refused {
+                path: "/scan/b".into(),
+                reason: Refusal::HoldsCheckout,
+            }],
+            failures: vec![Failure {
+                path: "/scan/c".into(),
+                message: "busy".to_owned(),
+            }],
+        };
+        let said = summarise(&removal);
+        assert!(said.contains("removed 1.0 KiB from 1 directory"), "{said}");
+        assert!(said.contains("1 directory left alone"), "{said}");
+        assert!(said.contains("1 directory failed"), "{said}");
+    }
+
+    #[test]
+    fn restoring_the_terminal_attempts_every_step_that_was_reached() {
+        // The states are global to the process, so what is asserted here is the bookkeeping:
+        // `finish` undoes exactly what was entered, and having run it, `Drop` has nothing
+        // left to do. That is the whole of what the early-failure path depends on — a flag
+        // still set is a step Drop would take a second time, and a flag never set is a step
+        // neither of them would take at all.
+        //
+        // It really does call `disable_raw_mode` and leave the alternate screen, on a process
+        // that is in neither state. Both are no-ops there, and the escape sequence goes to
+        // the harness's captured stdout.
+        let mut restore = Restore::default();
+        assert!(restore.finish().is_ok(), "nothing was taken");
+
+        restore.raw = true;
+        restore.alternate = true;
+        assert!(restore.finish().is_ok());
+        assert!(!restore.raw, "raw mode would be disabled twice");
+        assert!(
+            !restore.alternate,
+            "the alternate screen would be left twice"
+        );
     }
 }

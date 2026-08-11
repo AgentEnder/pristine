@@ -399,7 +399,7 @@ fn sweep_with(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::er
         return run(cli, out);
     }
     let ruleset = Arc::new(Ruleset::load(None)?);
-    tui::run(
+    let outcome = tui::run(
         &tui::Options {
             root: cli.root.clone(),
             min_size: cli.min_size,
@@ -409,11 +409,17 @@ fn sweep_with(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::er
         },
         ruleset,
     )?;
-    // Nothing is left unsaid by the time the view closes: a scan that could not read a path
-    // says so in the header, and a removal that failed says so in the footer. Both are on
-    // screen while the reader is there to read them, which is what a live view has and an
-    // exit status is for.
-    Ok(true)
+    // A live view says everything it knows while the reader is there to read it — an
+    // unreadable path in the header, a failed removal in the footer — and a script reads none
+    // of that. The status is the one channel both front ends share, so it says the same thing
+    // in both: this run could not do everything it was asked.
+    for failure in &outcome.errors {
+        match &failure.path {
+            Some(path) => eprintln!("pristine: {}: {}", path.display(), failure.message),
+            None => eprintln!("pristine: {}", failure.message),
+        }
+    }
+    Ok(outcome.whole())
 }
 
 /// Returns whether everything asked for actually happened — both halves of it. A scan that
