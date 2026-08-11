@@ -15,15 +15,22 @@
 //! and never becomes expressible without a fifth mode. Modelled as two axes it already is, and
 //! the presets are a convenience over the top rather than the vocabulary itself.
 //!
-//! # There are three preset states wearing four names
+//! # Expressible has to mean expressible BY A READER
 //!
-//! The asked-for cycle was `default → dependencies → all-ignored → all`, and separating the
-//! axes is what shows that `default` and `all` are the same view: a filter that is **on**
-//! without having been asked for is the failure the age floor was already resolved against —
-//! "silently keeps" is "silently deletes" seen from the other side, and both make the screen
-//! disagree with what the reader asked for. So the cycle starts at [`Preset::All`], which hides
-//! nothing, and the fourth distinct state is the one the original list left implicit:
-//! [`Preset::Named`], everything a rule could put a name to.
+//! Two axes inside a struct that no key can move is a model with a claim it cannot cash. So the
+//! presets are shortcuts and the axes have keys of their own: `f`/`F` walk
+//! `default → dependencies → all-ignored → all`, `t` moves the tier axis on its own, and one
+//! key per [`Kind`] toggles that member of the other. Every combination of the two is reachable
+//! — "every cache a rule named" is `f` to default, then `d` and `b` — and none of them had to be
+//! anticipated as a mode.
+//!
+//! # `default` narrows, so the header says what it left out
+//!
+//! A run opens on [`Preset::Default`], which shows what rules named and hides the gitignore
+//! fallback. That is a filter that is on without having been asked for, which is the shape the
+//! age floor was resolved against — "silently keeps" is "silently deletes" seen from the other
+//! side. What makes it honest rather than silent is that the count it hides is on the header,
+//! beside the number it qualifies, from the first frame. See [`super::state::View::out_of_view`].
 //!
 //! # The pattern is part of the lens
 //!
@@ -110,6 +117,34 @@ impl Tiers {
             Tier::Ignored => self.ignored,
         }
     }
+
+    /// Every state this axis can be in, in the order `t` walks them.
+    ///
+    /// Three rather than four: the empty set shows no claims at all, which is not a view but a
+    /// blank screen, so the key steps over it rather than offering it. Every *other* combination
+    /// of the two axes is reachable, because the kind axis is toggled member by member.
+    pub const ALL: [Self; 3] = [Self::named(), Self::both(), Self::ignored()];
+
+    /// The next state of the axis.
+    #[must_use]
+    pub fn next(self) -> Self {
+        let at = Self::ALL
+            .iter()
+            .position(|&other| other == self)
+            .unwrap_or(0);
+        Self::ALL[(at + 1) % Self::ALL.len()]
+    }
+
+    /// What the footer calls this state of the axis.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match (self.named, self.ignored) {
+            (true, true) => "named + gitignored",
+            (true, false) => "named",
+            (false, true) => "gitignored",
+            (false, false) => "no tier",
+        }
+    }
 }
 
 /// Which kinds are on screen.
@@ -168,27 +203,72 @@ impl Kinds {
             Kind::Cache => self.cache,
         }
     }
+
+    /// The same set with one member turned on or off — one key, one axis member.
+    #[must_use]
+    pub const fn toggling(mut self, kind: Kind) -> Self {
+        match kind {
+            Kind::Dependencies => self.dependencies = !self.dependencies,
+            Kind::Build => self.build = !self.build,
+            Kind::Cache => self.cache = !self.cache,
+        }
+        self
+    }
+
+    /// The kinds on screen, named, or `none` when the axis is empty.
+    #[must_use]
+    pub fn label(self) -> String {
+        let said: Vec<&str> = Kind::ALL
+            .into_iter()
+            .filter(|&kind| self.has(kind))
+            .map(Kind::short)
+            .collect();
+        if said.is_empty() {
+            return "none".to_owned();
+        }
+        said.join(" + ")
+    }
 }
 
-/// A named point on the two axes, which is what a key cycles through.
+/// A named point on the two axes, which is what one key cycles through.
+///
+/// # The four asked for, in the order they were asked for
+///
+/// `default → dependencies → all-ignored → all`, with the tier axis reading exactly as the
+/// request states it: tier one, *versus also* tier two.
+///
+/// [`AllIgnored`](Self::AllIgnored) and [`All`](Self::All) therefore sit on the **same point**
+/// on the two axes, and that is a property of the asked-for set rather than of this encoding —
+/// once the axes are apart, "also show the gitignored tier" and "show everything" are the same
+/// sentence. They are kept as two steps because the cycle was specified with four, and `all` is
+/// given the one thing its name additionally claims: it drops the `/` pattern as well, so it is
+/// the honest "show me everything" reset rather than a relabelling of the step before it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Preset {
-    /// Everything the scan found. Where a run starts, because a view that is narrowed without
-    /// having been asked for is a tool disagreeing with its own report.
+    /// What a rule could put a name to: tier one, every kind. Where a run starts.
+    ///
+    /// It hides the gitignored tier, so [`super::render`] says how many claims that is on the
+    /// header — a view that narrows without saying what it dropped is the "silently keeps"
+    /// failure the age floor was already resolved against.
     #[default]
-    All,
-    /// Every claim a rule could put a name to, and none of the gitignore fallback's.
-    Named,
-    /// Installed third-party code, and only that: npkill's `vendor`.
+    Default,
+    /// Installed third-party code, and only that: npkill's `vendor`. One axis narrowed, the
+    /// other left exactly as `default` had it.
     Dependencies,
-    /// The gitignore fallback on its own — the tier no other tool has, and the one whose rows
-    /// say only that git knows about them.
-    Ignored,
+    /// Tier one **and also** tier two — the gitignore fallback alongside what rules named.
+    AllIgnored,
+    /// Everything, full stop: both tiers, every kind, and no pattern.
+    All,
 }
 
 impl Preset {
-    /// Every preset, in the order the key cycles through them: widest first, then narrowing.
-    pub const ALL: [Self; 4] = [Self::All, Self::Named, Self::Dependencies, Self::Ignored];
+    /// Every preset, in the order `f` walks them — the order the request names them in.
+    pub const ALL: [Self; 4] = [
+        Self::Default,
+        Self::Dependencies,
+        Self::AllIgnored,
+        Self::All,
+    ];
 
     /// The next one round.
     #[must_use]
@@ -210,14 +290,21 @@ impl Preset {
         Self::ALL[(at + by) % Self::ALL.len()]
     }
 
+    /// Whether this preset also clears the `/` pattern. Only [`All`](Self::All) does, because
+    /// only `all` claims to be everything.
+    #[must_use]
+    pub fn clears_pattern(self) -> bool {
+        matches!(self, Self::All)
+    }
+
     /// What the footer calls this view.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::All => "all",
-            Self::Named => "named",
+            Self::Default => "default",
             Self::Dependencies => "dependencies",
-            Self::Ignored => "gitignored",
+            Self::AllIgnored => "all-ignored",
+            Self::All => "all",
         }
     }
 
@@ -227,10 +314,10 @@ impl Preset {
     #[must_use]
     pub fn what(self) -> &'static str {
         match self {
-            Self::All => "everything the scan found",
-            Self::Named => "only what a rule named — the gitignored tier is hidden",
-            Self::Dependencies => "only installed dependencies",
-            Self::Ignored => "only the gitignored tier, which nothing has named",
+            Self::Default => "only what a rule named — the gitignored tier is hidden",
+            Self::Dependencies => "only installed dependencies a rule named",
+            Self::AllIgnored => "what rules named and the gitignored tier beside it",
+            Self::All => "everything the scan found, with no pattern",
         }
     }
 
@@ -238,10 +325,11 @@ impl Preset {
     #[must_use]
     pub fn axes(self) -> (Tiers, Kinds) {
         match self {
-            Self::All => (Tiers::both(), Kinds::all()),
-            Self::Named => (Tiers::named(), Kinds::all()),
+            Self::Default => (Tiers::named(), Kinds::all()),
             Self::Dependencies => (Tiers::named(), Kinds::only(Kind::Dependencies)),
-            Self::Ignored => (Tiers::ignored(), Kinds::none()),
+            // The same point, deliberately: see the type's own docs. `all` differs by dropping
+            // the pattern, which is a property of the *step* rather than of the axes.
+            Self::AllIgnored | Self::All => (Tiers::both(), Kinds::all()),
         }
     }
 }
@@ -309,16 +397,53 @@ impl Lens {
         self
     }
 
-    /// Which preset this lens is, if it is one of them.
+    /// Which tiers are on screen.
+    #[must_use]
+    pub fn tiers(&self) -> Tiers {
+        self.tiers
+    }
+
+    /// Which kinds are.
+    #[must_use]
+    pub fn kinds(&self) -> Kinds {
+        self.kinds
+    }
+
+    /// The same lens with the tier axis moved, and the kind axis untouched.
     ///
-    /// Derived rather than remembered, so a lens that arrived by any other door still names
-    /// itself the way the footer names it, and there is one statement of where each preset
-    /// sits.
+    /// The two editors exist so that the axes are independently reachable **by a reader**, not
+    /// only inside this file: a model that can express "every cache a rule named" while no key
+    /// can reach it is not expressible in any sense the request meant.
+    #[must_use]
+    pub fn with_tiers(mut self, tiers: Tiers) -> Self {
+        self.tiers = tiers;
+        self
+    }
+
+    /// The same lens with the kind axis moved, and the tier axis untouched.
+    #[must_use]
+    pub fn with_kinds(mut self, kinds: Kinds) -> Self {
+        self.kinds = kinds;
+        self
+    }
+
+    /// Which preset this lens sits on, if it sits on one.
+    ///
+    /// **Ambiguous by construction and that is honest**: `all-ignored` and `all` are one point
+    /// on the axes, so this answers with the first of them. What the footer prints is the
+    /// preset the reader last *asked for*, which [`super::state::View`] remembers, because two
+    /// names for one view is a fact about the asked-for cycle rather than about a lens.
     #[must_use]
     pub fn preset(&self) -> Option<Preset> {
         Preset::ALL
             .into_iter()
             .find(|preset| preset.axes() == (self.tiers, self.kinds))
+    }
+
+    /// How the footer spells the two axes when the reader has moved off every preset.
+    #[must_use]
+    pub fn axes_label(&self) -> String {
+        format!("{} · {}", self.tiers.label(), self.kinds.label())
     }
 
     /// The pattern in force, if any.
@@ -358,9 +483,10 @@ impl Lens {
     /// *by*. Both halves, because either can be the one doing the hiding.
     #[must_use]
     pub fn describe(&self) -> String {
-        let view = self
-            .preset()
-            .map_or_else(|| "a custom view".to_owned(), |preset| preset.to_string());
+        // The axes rather than a preset name, because this sentence has to be actionable: a
+        // reader told "hidden by all-ignored" still has to work out what that leaves out, and a
+        // reader told "named · dependencies + cache" does not.
+        let view = self.axes_label();
         match self.pattern() {
             Some(pattern) => format!("{view} · /{pattern}"),
             None => view,
@@ -375,17 +501,85 @@ mod tests {
     use crate::rules::Kind;
     use regex::Regex;
 
+    /// One claim of each kind, plus one only git knows about.
+    fn claims() -> (
+        crate::walk::Hit,
+        crate::walk::Hit,
+        crate::walk::Hit,
+        crate::walk::Hit,
+    ) {
+        (
+            of_kind("/scan/a/node_modules", Kind::Dependencies),
+            of_kind("/scan/a/dist", Kind::Build),
+            of_kind("/scan/a/.nx/cache", Kind::Cache),
+            gitignored("/scan/a/out"),
+        )
+    }
+
+    #[test]
+    fn the_presets_are_the_four_that_were_asked_for_in_the_order_they_were_asked_for() {
+        // `default → dependencies → all-ignored → all`, and the tier axis reads exactly as the
+        // request states it: tier one, versus ALSO tier two.
+        assert_eq!(
+            Preset::ALL.map(Preset::label),
+            ["default", "dependencies", "all-ignored", "all"]
+        );
+        let (deps, build, cache, ignored) = claims();
+        let shows = |preset: Preset| {
+            let lens = Lens::showing(preset);
+            [
+                lens.matches(&deps),
+                lens.matches(&build),
+                lens.matches(&cache),
+                lens.matches(&ignored),
+            ]
+        };
+
+        // default: everything a rule could put a name to, and not the fallback tier.
+        assert_eq!(shows(Preset::Default), [true, true, true, false]);
+        // dependencies: one axis narrowed, the other exactly as `default` had it.
+        assert_eq!(shows(Preset::Dependencies), [true, false, false, false]);
+        // all-ignored: the fallback tier ALONGSIDE what rules named, never instead of it.
+        assert_eq!(shows(Preset::AllIgnored), [true, true, true, true]);
+        assert_eq!(shows(Preset::All), [true, true, true, true]);
+    }
+
+    #[test]
+    fn all_ignored_and_all_are_one_view_and_all_is_the_one_that_resets() {
+        // The asked-for set has four names for three points on the axes — separating the axes
+        // is what shows that. They are kept as two steps because the cycle was specified with
+        // four, and `all` is given the one thing its name additionally claims: no pattern.
+        assert_eq!(Preset::AllIgnored.axes(), Preset::All.axes());
+        assert!(!Preset::AllIgnored.clears_pattern());
+        assert!(Preset::All.clears_pattern());
+        for preset in [Preset::Default, Preset::Dependencies] {
+            assert!(!preset.clears_pattern(), "{preset}");
+        }
+    }
+
+    #[test]
+    fn the_cycle_comes_back_round_and_goes_both_ways() {
+        let mut at = Preset::Default;
+        for _ in Preset::ALL {
+            at = at.next();
+        }
+        assert_eq!(at, Preset::Default);
+        assert_eq!(Preset::Default.prev(), Preset::All);
+        assert_eq!(Preset::All.next(), Preset::Default);
+    }
+
     #[test]
     fn the_axes_are_independent_of_each_other() {
-        // The property the whole model exists for: narrowing the kind axis says nothing about
-        // the tier axis, so "every cache a rule named" and "every cache, plus the gitignored
-        // tier" are both expressible without either being a mode somebody had to anticipate.
+        // The property the whole model exists for, and the one the presets alone cannot give:
+        // narrowing the kind axis says nothing about the tier axis, so "every cache a rule
+        // named" and "every cache, plus the gitignored tier" are both expressible without
+        // either being a mode somebody had to anticipate. Neither is a preset.
         let caches = Lens::of(Tiers::named(), Kinds::only(Kind::Cache));
         let caches_and_ignored = Lens::of(Tiers::both(), Kinds::only(Kind::Cache));
+        assert_eq!(caches.preset(), None);
+        assert_eq!(caches_and_ignored.preset(), None);
 
-        let cache = of_kind("/scan/a/.nx/cache", Kind::Cache);
-        let deps = of_kind("/scan/a/node_modules", Kind::Dependencies);
-        let ignored = gitignored("/scan/a/dist");
+        let (deps, _build, cache, ignored) = claims();
 
         assert!(caches.matches(&cache));
         assert!(!caches.matches(&deps));
@@ -397,77 +591,83 @@ mod tests {
     }
 
     #[test]
-    fn a_tier_two_claim_is_judged_by_the_tier_axis_and_never_by_the_kind_axis() {
-        // It has no kind to judge — that asymmetry is the tier's whole content — so the kind
-        // axis must not be able to hide it by accident. `Preset::Ignored` narrows the kinds to
-        // nothing precisely because kinds are not what it is about.
-        let ignored = gitignored("/scan/a/dist");
-        assert!(Lens::showing(Preset::Ignored).matches(&ignored));
-        assert!(
-            !Lens::showing(Preset::Ignored)
-                .matches(&of_kind("/scan/a/node_modules", Kind::Dependencies))
-        );
+    fn each_axis_moves_without_disturbing_the_other() {
+        // What the two editing keys are built on. Moving the tier axis must leave the kinds
+        // exactly as they were and the other way round, or "independent" is a word rather than
+        // a property.
+        let start = Lens::of(Tiers::named(), Kinds::only(Kind::Cache));
+
+        let widened = start.clone().with_tiers(Tiers::both());
+        assert_eq!(widened.kinds(), start.kinds());
+        assert_eq!(widened.tiers(), Tiers::both());
+
+        let narrowed = start
+            .clone()
+            .with_kinds(start.kinds().toggling(Kind::Build));
+        assert_eq!(narrowed.tiers(), start.tiers());
+        assert!(narrowed.kinds().has(Kind::Build));
+        assert!(narrowed.kinds().has(Kind::Cache));
+        assert!(!narrowed.kinds().has(Kind::Dependencies));
     }
 
     #[test]
-    fn the_default_preset_hides_nothing() {
-        // A filter that is on without being asked for is the failure the age floor was already
-        // resolved against. The reader's first frame has to be the whole scan.
-        let lens = Lens::default();
-        assert!(lens.is_everything());
-        assert_eq!(lens.preset(), Some(Preset::All));
-        for kind in [Kind::Dependencies, Kind::Build, Kind::Cache] {
-            assert!(lens.matches(&of_kind("/scan/a/x", kind)), "{kind}");
-        }
-        assert!(lens.matches(&gitignored("/scan/a/x")));
-    }
-
-    #[test]
-    fn every_preset_is_a_view_no_other_preset_is() {
-        // Four names for three states was the flaw in the asked-for set, and it is the one
-        // thing separating the axes was supposed to expose. If two presets ever collapse onto
-        // one point again, the cycle has a step that does nothing.
-        for (nth, preset) in Preset::ALL.into_iter().enumerate() {
-            for other in Preset::ALL.into_iter().skip(nth + 1) {
-                assert_ne!(preset.axes(), other.axes(), "{preset} and {other}");
-            }
-        }
-    }
-
-    #[test]
-    fn the_cycle_comes_back_round_and_goes_both_ways() {
-        let mut at = Preset::All;
-        for _ in Preset::ALL {
+    fn the_tier_axis_walks_its_three_states_and_never_the_empty_one() {
+        // An empty tier set shows no claims at all, which is a blank screen rather than a
+        // view, so the key steps over it. Every other combination stays reachable, because the
+        // kind axis is toggled member by member rather than cycled.
+        let mut at = Tiers::named();
+        let mut seen = Vec::new();
+        for _ in Tiers::ALL {
+            seen.push(at);
             at = at.next();
         }
-        assert_eq!(at, Preset::All);
-        assert_eq!(Preset::All.prev(), Preset::Ignored);
-        assert_eq!(Preset::Ignored.next(), Preset::All);
+        assert_eq!(seen, Tiers::ALL);
+        assert_eq!(at, Tiers::named(), "the cycle does not come back round");
+        for tiers in Tiers::ALL {
+            assert!(tiers.named || tiers.ignored, "{tiers:?} shows nothing");
+        }
+    }
+
+    #[test]
+    fn a_tier_two_claim_is_judged_by_the_tier_axis_and_never_by_the_kind_axis() {
+        // It has no kind to judge — that asymmetry is the tier's whole content — so narrowing
+        // the kinds must not be able to hide it by accident, and widening them must not be able
+        // to bring it back.
+        let ignored = gitignored("/scan/a/out");
+        let deps = of_kind("/scan/a/node_modules", Kind::Dependencies);
+
+        let no_kinds_at_all = Lens::of(Tiers::both(), Kinds::none());
+        assert!(no_kinds_at_all.matches(&ignored));
+        assert!(!no_kinds_at_all.matches(&deps));
+
+        let every_kind_but_no_fallback = Lens::of(Tiers::named(), Kinds::all());
+        assert!(!every_kind_but_no_fallback.matches(&ignored));
+        assert!(every_kind_but_no_fallback.matches(&deps));
     }
 
     #[test]
     fn a_pattern_narrows_whatever_the_axes_left() {
-        let lens = Lens::showing(Preset::All)
+        let lens = Lens::showing(Preset::AllIgnored)
             .matching(Some(Regex::new("nx").expect("a literal pattern compiles")));
         assert!(lens.matches(&gitignored("/scan/nx/dist")));
         assert!(!lens.matches(&gitignored("/scan/pua/dist")));
         assert!(!lens.is_everything());
-        // …and the preset it is built on is still what the footer names, because the pattern
-        // is a third narrowing rather than a fifth mode.
-        assert_eq!(lens.preset(), Some(Preset::All));
-        assert_eq!(lens.describe(), "all · /nx");
+        assert_eq!(
+            lens.describe(),
+            "named + gitignored · dependencies + build + cache · /nx"
+        );
     }
 
     #[test]
     fn two_lenses_are_the_same_when_they_show_the_same_things() {
         // Marks are deduplicated by lens, so this is load-bearing rather than a formality: a
         // lens that never compares equal to itself would leave a mark per keystroke.
-        let one = Lens::showing(Preset::Named)
+        let one = Lens::showing(Preset::Default)
             .matching(Some(Regex::new("nx").expect("a literal pattern compiles")));
-        let two = Lens::showing(Preset::Named)
+        let two = Lens::showing(Preset::Default)
             .matching(Some(Regex::new("nx").expect("a literal pattern compiles")));
         assert_eq!(one, two);
-        assert_ne!(one, Lens::showing(Preset::Named));
+        assert_ne!(one, Lens::showing(Preset::Default));
     }
 
     #[test]

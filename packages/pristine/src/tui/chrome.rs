@@ -862,6 +862,9 @@ mod tests {
 
         view.found(hit("/scan/a/node_modules", Size::Unmeasured, 0));
         view.found(priced("/scan/b/target", 2048));
+        // Synced first, exactly as the loop does before it asks: the rolled-up numbers are
+        // recomputed once per frame, so reading them without one is reading last frame's.
+        view.sync();
         // One of two priced, while the walk is still running.
         assert_eq!(Status::of(&view, 0), Status::Pricing(50));
 
@@ -869,6 +872,7 @@ mod tests {
             std::path::Path::new("/scan/a/node_modules"),
             Size::Measured(1024),
         );
+        view.sync();
         assert_eq!(Status::of(&view, 0), Status::Scanning(3072));
 
         view.scanned();
@@ -943,6 +947,7 @@ mod tests {
                 0,
             ));
         }
+        view.sync();
         assert_eq!(Status::of(&view, 0), Status::Pricing(0));
         view.scanned();
         assert_eq!(Status::of(&view, 0), Status::Idle(0));

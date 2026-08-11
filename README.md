@@ -40,9 +40,9 @@ every ancestor** — pruned to the paths that lead somewhere reclaimable, collap
 drilled into on demand.
 
 ```
- /Users/agentender/repos  165.9 GiB reclaimable in 10599 directories
+ /Users/agentender/repos  151.9 GiB reclaimable in 10524 directories · 75 out of view (default)
 directory                                            size ↓        age  what it is
-[▁] ▾ /Users/agentender/repos                     165.9 GiB         0h
+[▁] ▾ /Users/agentender/repos                     151.9 GiB         0h
 [▇]   ▾ definitely-typed                           22.2 GiB        3mo
 [x]     ▸ types                                    21.8 GiB        3mo
 [x]       node_modules                            320.3 MiB        3mo  Node Dependencies
@@ -51,7 +51,7 @@ directory                                            size ↓        age  what i
 [ ]   ▸ brain                                      14.3 GiB         0h
 [ ]   ▸ nx                                       > 14.0 GiB         4h
 [ ]   ▸ oss-secrets-requestor                      10.8 GiB        10d
- marked 21.9 GiB in 9092 directories · space mark · x delete · f view (all) · / filter · s sort (size) · ? help
+ marked 21.9 GiB in 9092 directories · space mark · x delete · f view (default) · / filter · s sort (size) · ? help
 ```
 
 A row's number is not "how big is this directory" — that is `du`'s question — but **"how much do I
@@ -75,16 +75,22 @@ one.
   and true the whole time it is up. Marking a directory marks whatever arrives under it
   afterwards, because a mark is a statement about a subtree rather than about the rows that
   happened to exist when you pressed the key.
-- `f` walks the views: **all**, **named** (what a rule could put a name to), **dependencies**, and
-  **gitignored** (the tier nothing has named). They are two independent axes — which tier, and
-  which kind — with those four as presets over the top, so narrowing one says nothing about the
-  other. A run opens on `all`, because a filter that is on without being asked for is a tool
-  disagreeing with its own headline.
-- **Changing the view never changes what is selected.** Hiding a row is not unselecting it, and a
-  mark keeps meaning the view it was made through: mark a directory under `dependencies`, widen to
-  `all`, and the build artefacts beside them are still unmarked. The box on a partly-marked
-  ancestor is filled against *the view you are looking through*, so what it says is a statement
-  about this screen rather than a global fact contradicting the rows underneath it.
+- `f` walks four views: **default** (what a rule could put a name to), **dependencies**,
+  **all-ignored** (the gitignore fallback alongside them) and **all**. Underneath they are two
+  independent axes — which *tier*, and which *kind* — and each has a key of its own: `t` moves the
+  tier axis, and `d`, `b` and `c` toggle dependencies, build output and caches. So a combination
+  nobody anticipated is still one a reader can ask for: "every cache a rule named" is `d` then `b`
+  from the default view, and no preset has to exist for it.
+
+  `default` narrows — it leaves out the gitignored tier — so the header says how many claims that
+  is, beside the number it qualifies. A filter that is on without saying what it dropped is the
+  same failure as one that silently keeps something back.
+- **Changing the view never changes what is selected**, by any of those keys. Hiding a row is not
+  unselecting it, and a mark keeps meaning the view it was made through: mark a directory under
+  `dependencies`, widen to `all-ignored`, and the build artefacts beside them are still unmarked.
+  The box on a partly-marked ancestor is filled against *the view you are looking through*, so what
+  it says is a statement about this screen rather than a global fact contradicting the rows
+  underneath it.
 - `x` deletes what is marked, after a confirmation that **lists the whole batch** — grouped by what
   each thing is, marked plainly where the current view is hiding one, with the safety model's
   refusals said here rather than in the report afterwards, and `space` on any line to take it out.

@@ -496,6 +496,17 @@ fn headline(view: &View, errors: &[WalkError]) -> Paragraph<'static> {
             Style::default().fg(Color::Cyan),
         ));
     }
+    // What the view is leaving out, beside the number it qualifies. A run opens on `default`,
+    // which hides the gitignored tier, so the headline is a narrowed answer to "how much do I
+    // get back" from the first frame — and a narrowed number that does not say so is the
+    // failure `--older-than` being off by default already avoids, wearing a different hat.
+    let out_of_view = view.out_of_view();
+    if out_of_view > 0 {
+        spans.push(Span::styled(
+            format!("· {out_of_view} out of view ({}) ", view.view_label()),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
     if let Some(pattern) = view.filter() {
         spans.push(Span::styled(
             format!("· /{pattern} "),
@@ -925,10 +936,10 @@ fn status(view: &View) -> Paragraph<'static> {
     spans.push(Span::styled(
         format!(
             "· space mark · x delete · f view ({}) · / filter · s sort ({}{}) · ? help",
-            // Named rather than left implicit: what a run opens on hides nothing, so a reader
-            // has to be able to tell at a glance that a *later* frame does.
-            view.preset()
-                .map_or_else(|| "custom".to_owned(), |preset| preset.label().to_owned()),
+            // Named rather than left implicit, and named as the *reader* left it: a view the
+            // axis keys built has no preset name, and rounding it to the nearest one would say
+            // they are somewhere they are not.
+            view.view_label(),
             view.sort().by.label(),
             if view.sort().reverse { " ↑" } else { "" }
         ),
@@ -1201,6 +1212,7 @@ mod tests {
     use super::{INDENT, MARKER, Placed, Spot, Zone, draw, hit as press_on};
     use crate::delete::{Refusal, Refused};
     use crate::fixture::{hit, priced};
+    use crate::rules::Kind;
     use crate::size::Size;
     use crate::tree::{Order, Tree};
     use crate::tui::keymap::{Action, Motion, Turn};
@@ -1407,11 +1419,10 @@ mod tests {
         // the warning at the top and the *which* is on the line, because a number a reader
         // cannot resolve to a directory is a number they can only accept.
         let mut view = view();
-        // All → named → dependencies → gitignored, which is the one view that hides every
-        // claim a rule put a name to, and the fixture's claims are both of those.
-        for _ in 0..3 {
-            view.apply(Action::CyclePreset(Turn::Next));
-        }
+        // One axis key, on its own: the fixture's claims are Dependencies, so turning that
+        // member off is the smallest view that hides them — and it is not a preset, which is
+        // the point of the key existing.
+        view.apply(Action::ToggleKind(Kind::Dependencies));
         view.asking(
             &[Planned::at(
                 "/scan/nx/node_modules",

@@ -397,6 +397,7 @@ mod tests {
             std::path::Path::new("/scan/pua/target"),
             Size::Measured(4096),
         );
+        view.sync();
         screen
             .show(&view, pane(), now + Duration::from_millis(30))
             .unwrap();

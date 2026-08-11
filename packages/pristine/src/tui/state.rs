@@ -767,9 +767,16 @@ pub struct View {
     /// What is on screen: the two visibility axes and the `/` pattern, together.
     ///
     /// One value rather than a filter beside a mode, because a mark stores the whole of it —
-    /// a mark made under `dependencies · /nx` has to keep meaning that when either half
-    /// changes.
+    /// a mark made under `named · dependencies · /nx` has to keep meaning that when any part
+    /// of it changes.
     lens: Lens,
+    /// Which preset the reader last asked for, and `None` once they have moved an axis by hand.
+    ///
+    /// Remembered rather than derived, for two reasons that are really one. `all-ignored` and
+    /// `all` are the same point on the axes, so a derived name could not tell the reader which
+    /// step of the cycle they are on — and a lens the axis keys built is not a preset at all,
+    /// which the footer has to be able to say rather than rounding to the nearest one.
+    preset: Option<Preset>,
     prompt: Option<Prompt>,
     help: Option<usize>,
     pending: Option<Pending>,
@@ -869,6 +876,7 @@ impl View {
             scroll: 0,
             page: 20,
             lens: Lens::default(),
+            preset: Some(Preset::default()),
             prompt: None,
             help: None,
             pending: None,
@@ -1587,10 +1595,26 @@ impl View {
             .map_or(0, |counts| counts.all.claims - counts.chosen.claims)
     }
 
-    /// The whole scan, as the header states it.
+    /// The whole scan, as the header states it — under the current view.
     #[must_use]
     pub fn total(&self) -> Roll {
         self.roll(self.tree.root())
+    }
+
+    /// How many claims the scan found that the current view is not showing.
+    ///
+    /// **The header says this, and that is what keeps a narrowed view honest.** The run opens
+    /// on `default`, which hides the gitignored tier — a real tier worth real bytes that no
+    /// other tool finds at all — so the headline count is not the whole answer to "how much do
+    /// I get back". A number that is narrowed without saying so is the "silently keeps" failure
+    /// the age floor was resolved against; saying so, on the line the number is on, is the
+    /// difference between a filter and a lie.
+    #[must_use]
+    pub fn out_of_view(&self) -> usize {
+        self.tree
+            .node(self.tree.root())
+            .claims
+            .saturating_sub(self.total().claims)
     }
 
     /// The applied filter's pattern, if there is one.
@@ -1599,10 +1623,22 @@ impl View {
         self.lens.pattern()
     }
 
-    /// Which of the two axes' named points the view is on.
+    /// Which named view the reader is on, or `None` once they have moved an axis by hand.
     #[must_use]
     pub fn preset(&self) -> Option<Preset> {
-        self.lens.preset()
+        self.preset
+    }
+
+    /// What the footer calls the view: a preset's name, or the two axes spelled out.
+    ///
+    /// A lens the axis keys built has no name, and inventing one — or rounding it to the
+    /// nearest preset — would tell the reader they are somewhere they are not.
+    #[must_use]
+    pub fn view_label(&self) -> String {
+        self.preset.map_or_else(
+            || self.lens.axes_label(),
+            |preset| preset.label().to_owned(),
+        )
     }
 
     /// The whole of what decides visibility, for anything that has to say what is hiding
@@ -1769,6 +1805,8 @@ impl View {
             }
             Action::Spare => self.spare_entry(),
             Action::CyclePreset(turn) => self.cycle_preset(turn),
+            Action::CycleTiers => self.cycle_tiers(),
+            Action::ToggleKind(kind) => self.toggle_kind(kind),
             Action::Cursor(motion) => self.move_cursor(motion),
             Action::ScrollRows(motion) => self.scroll_rows(motion),
             Action::Expand => self.expand(),
@@ -1858,8 +1896,9 @@ impl View {
             self.stale = true;
             return;
         }
-        if self.preset().is_some_and(|preset| preset != Preset::All) {
+        if self.lens != Lens::default() {
             self.lens = Lens::default();
+            self.preset = Some(Preset::default());
             self.stale = true;
             return;
         }
@@ -1912,22 +1951,75 @@ impl View {
     /// is still in the batch, and the reader has to be able to tell that from a claim that was
     /// never found.
     fn cycle_preset(&mut self, turn: Turn) {
-        let at = self.preset().unwrap_or_default();
+        // A reader who has moved an axis by hand is not *on* a preset, so the cycle starts from
+        // the nearest one they could have been on rather than from wherever `f` last left off.
+        let at = self
+            .preset
+            .or_else(|| self.lens.preset())
+            .unwrap_or_default();
         let next = match turn {
             Turn::Next => at.next(),
             Turn::Prev => at.prev(),
         };
-        let pattern = self.lens.pattern().and_then(|held| Regex::new(held).ok());
+        let pattern = self.held_pattern().filter(|_| !next.clears_pattern());
         self.lens = Lens::showing(next).matching(pattern);
+        self.preset = Some(next);
+        self.narrowed(format!("showing {}", next.what()));
+    }
+
+    /// `t`: the tier axis, on its own.
+    fn cycle_tiers(&mut self) {
+        let tiers = self.lens.tiers().next();
+        self.lens = self.lens.clone().with_tiers(tiers);
+        self.off_the_presets();
+    }
+
+    /// `d` `b` `c`: one member of the kind axis, on its own.
+    fn toggle_kind(&mut self, kind: Kind) {
+        let kinds = self.lens.kinds().toggling(kind);
+        self.lens = self.lens.clone().with_kinds(kinds);
+        self.off_the_presets();
+    }
+
+    /// Applies an axis edit: the view is now whatever the two axes say, and not a preset.
+    ///
+    /// It says what the *axes* are rather than what the step was called, because there is no
+    /// name to give — that is the whole point of the two keys, and rounding to the nearest
+    /// preset would report a view the reader is not on.
+    fn off_the_presets(&mut self) {
+        self.preset = self.lens.preset().filter(|preset| {
+            // A hand-edited lens that lands exactly on a preset's point is that preset, except
+            // where two presets share a point: naming one of them would be a coin toss.
+            Preset::ALL
+                .into_iter()
+                .filter(|other| other.axes() == preset.axes())
+                .count()
+                == 1
+        });
+        let said = self.lens.axes_label();
+        self.narrowed(format!("showing {said}"));
+    }
+
+    /// The `/` pattern as a fresh engine, for a lens being rebuilt around it.
+    fn held_pattern(&self) -> Option<Regex> {
+        self.lens.pattern().and_then(|held| Regex::new(held).ok())
+    }
+
+    /// Re-derives after a change of view and says what it left out.
+    ///
+    /// **The sentence names what is now missing**, which is the whole of what keeps a narrowed
+    /// view from being the "silently keeps" failure: a claim that has gone from the screen is
+    /// still in the batch, and a reader has no way to tell that from a claim that was never
+    /// found unless something says so.
+    fn narrowed(&mut self, said: String) {
         self.stale = true;
         self.sync();
         let hidden = self.hidden();
         self.notice = Some(if hidden == 0 {
-            format!("showing {}", next.what())
+            said
         } else {
             format!(
-                "showing {} · {} still marked and out of sight",
-                next.what(),
+                "{said} · {} still marked and out of sight",
                 plural(hidden, "directory", "directories")
             )
         });
@@ -2388,8 +2480,21 @@ impl View {
     }
 
     /// Whether a node survives the current view. Everything survives when it hides nothing.
+    ///
+    /// The one exception is the scan root of a tree with nothing in it yet, and it earns its
+    /// place now that the view a run opens on **narrows**: the root is the directory the reader
+    /// typed rather than a claim, so a view has nothing to say about it, and hiding it would
+    /// blank the pane for the first moments of every run and for the whole of a scan that finds
+    /// only the tier `default` leaves out. A filter that matches nothing still empties the pane
+    /// — that is a narrowing the reader asked for, and #602's deselection depends on it.
     fn shown(&self, id: NodeId) -> bool {
-        !self.is_sifted() || self.roll(id).claims > 0
+        if !self.is_sifted() {
+            return true;
+        }
+        if id == self.tree.root() && self.tree.node(id).claims == 0 {
+            return true;
+        }
+        self.roll(id).claims > 0
     }
 
     // ---- marking ----------------------------------------------------------------------
@@ -3093,6 +3198,17 @@ mod tests {
         made
     }
 
+    /// Every claim the current view shows, by path.
+    fn shown_claims(view: &View) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = (0..view.tree().minted())
+            .filter(|&id| view.tree().is_attached(id))
+            .filter(|&id| view.tree().node(id).hit.is_some() && view.roll(id).claims > 0)
+            .map(|id| view.tree().node(id).path.clone())
+            .collect();
+        found.sort();
+        found
+    }
+
     /// Presses `f` until the view is the one named.
     fn showing(view: &mut View, preset: Preset) {
         for _ in 0..Preset::ALL.len() {
@@ -3105,40 +3221,65 @@ mod tests {
     }
 
     #[test]
-    fn a_run_opens_on_a_view_that_hides_nothing() {
-        // A filter that is on without having been asked for is the failure the age floor was
-        // already resolved against, seen from the other side: a reader's first frame has to be
-        // the whole scan or the tool's own headline disagrees with its report.
+    fn a_run_opens_on_default_and_the_header_says_what_default_leaves_out() {
+        // `default` narrows: it shows what rules named and hides the gitignore fallback. That
+        // is a filter that is on without having been asked for, which is the shape the age
+        // floor was resolved against — so what makes it honest rather than *silent* is that
+        // the count it hides is on the header from the first frame, beside the number it
+        // qualifies. A narrowed headline that does not say it is narrowed is the failure.
         let view = mixed();
-        assert_eq!(view.preset(), Some(Preset::All));
-        assert_eq!(view.total().claims, 5);
+        assert_eq!(view.preset(), Some(Preset::Default));
+        assert_eq!(view.total().claims, 4);
+        assert_eq!(view.out_of_view(), 1);
+        assert_eq!(view.view_label(), "default");
     }
 
     #[test]
-    fn one_key_walks_the_named_views_and_each_shows_a_different_thing() {
+    fn one_key_walks_the_four_views_that_were_asked_for_in_that_order() {
         let mut view = mixed();
         let seen = |view: &View| view.total().claims;
 
-        assert_eq!(seen(&view), 5);
-        view.apply(Action::CyclePreset(Turn::Next));
-        // Named: everything a rule put a name to, which is all but the gitignored one.
-        assert_eq!(view.preset(), Some(Preset::Named));
+        // default: everything a rule put a name to, and not the gitignored one.
+        assert_eq!(view.preset(), Some(Preset::Default));
         assert_eq!(seen(&view), 4);
+
         view.apply(Action::CyclePreset(Turn::Next));
-        // Dependencies: one axis narrowed, the other left alone.
+        // dependencies: one axis narrowed, the other left exactly as default had it.
         assert_eq!(view.preset(), Some(Preset::Dependencies));
         assert_eq!(seen(&view), 1);
+
         view.apply(Action::CyclePreset(Turn::Next));
-        // Gitignored: the tier nothing else has, on its own.
-        assert_eq!(view.preset(), Some(Preset::Ignored));
-        assert_eq!(seen(&view), 1);
+        // all-ignored: the fallback tier ALONGSIDE what rules named, never instead of it.
+        assert_eq!(view.preset(), Some(Preset::AllIgnored));
+        assert_eq!(seen(&view), 5);
+        assert_eq!(view.out_of_view(), 0);
+
         view.apply(Action::CyclePreset(Turn::Next));
         assert_eq!(view.preset(), Some(Preset::All));
+        assert_eq!(seen(&view), 5);
+
+        view.apply(Action::CyclePreset(Turn::Next));
+        assert_eq!(view.preset(), Some(Preset::Default));
 
         // …and backwards, because a reader who overshoots by one keystroke should not have to
         // go all the way round.
         view.apply(Action::CyclePreset(Turn::Prev));
-        assert_eq!(view.preset(), Some(Preset::Ignored));
+        assert_eq!(view.preset(), Some(Preset::All));
+    }
+
+    #[test]
+    fn all_is_the_step_that_resets_where_all_ignored_is_the_step_that_widens() {
+        // The two sit on one point of the axes — that is a property of the asked-for set, which
+        // separating the axes is what exposes. They stay two steps because the cycle was
+        // specified with four, and `all` is given the one thing its name additionally claims.
+        let mut view = mixed();
+        filter(&mut view, "nx");
+        showing(&mut view, Preset::AllIgnored);
+        assert_eq!(view.filter(), Some("nx"), "all-ignored is about the tiers");
+
+        view.apply(Action::CyclePreset(Turn::Next));
+        assert_eq!(view.preset(), Some(Preset::All));
+        assert_eq!(view.filter(), None, "`all` did not mean all");
     }
 
     #[test]
@@ -3146,20 +3287,110 @@ mod tests {
         // The whole reason the filter is two axes rather than four modes: a pattern narrows
         // whatever the axes left, and neither has to know the other exists.
         let mut view = mixed();
-        showing(&mut view, Preset::Named);
+        showing(&mut view, Preset::Default);
         filter(&mut view, "nx");
         assert_eq!(
             view.total().claims,
             3,
             "the gitignored one is out either way"
         );
-        assert_eq!(view.lens().describe(), "named · /nx");
+        assert_eq!(
+            view.lens().describe(),
+            "named · dependencies + build + cache · /nx"
+        );
+    }
+
+    #[test]
+    fn each_axis_has_a_key_of_its_own_so_a_non_preset_view_is_reachable() {
+        // **Expressible has to mean expressible by a reader.** "Every cache a rule named" is
+        // not one of the four presets and never will be, and a model that can hold it while no
+        // keystroke can ask for it is a model with a claim it cannot cash. `d` and `b` take the
+        // other two kinds off `default`, and what is left is exactly that view.
+        let mut view = mixed();
+        view.apply(Action::ToggleKind(Kind::Dependencies));
+        view.apply(Action::ToggleKind(Kind::Build));
+
+        assert_eq!(view.preset(), None, "a hand-built view is not a preset");
+        assert_eq!(view.view_label(), "named · cache");
+        assert_eq!(shown_claims(&view), [PathBuf::from("/scan/nx/.nx/cache")]);
+
+        // …and the tier axis moves on its own, leaving the kind axis exactly where it was.
+        view.apply(Action::CycleTiers);
+        assert_eq!(view.view_label(), "named + gitignored · cache");
+        assert_eq!(
+            shown_claims(&view),
+            [
+                PathBuf::from("/scan/nx/.nx/cache"),
+                PathBuf::from("/scan/nx/out"),
+            ]
+        );
+
+        // Once more and the named tier goes, which is the third state of that axis and the one
+        // no preset names either.
+        view.apply(Action::CycleTiers);
+        assert_eq!(view.view_label(), "gitignored · cache");
+        assert_eq!(shown_claims(&view), [PathBuf::from("/scan/nx/out")]);
+    }
+
+    #[test]
+    fn moving_either_axis_by_hand_leaves_the_selection_exactly_where_it_was() {
+        // The orthogonality rule does not get to be true only for the presets. An axis key is a
+        // change to what is *visible*, so it must be as inert on the marks as `f` is.
+        let mut view = mixed();
+        showing(&mut view, Preset::AllIgnored);
+        point_at(&mut view, "/scan");
+        view.apply(Action::Mark);
+        let whole = batched(&view);
+        assert_eq!(whole.len(), 5);
+
+        for action in [
+            Action::ToggleKind(Kind::Dependencies),
+            Action::CycleTiers,
+            Action::ToggleKind(Kind::Cache),
+            Action::CycleTiers,
+            Action::ToggleKind(Kind::Build),
+        ] {
+            view.apply(action);
+            assert_eq!(batched(&view), whole, "{action:?} changed the batch");
+            assert_eq!(view.marked().claims, 5, "{action:?} changed the counter");
+        }
+        // …and by this point the view shows nothing at all, which is a legitimate place for
+        // the axes to be and changes nothing whatever about what is going to be deleted. That
+        // is the strongest form of the rule: a screen with no rows on it and a batch of five.
+        assert_eq!(view.total().claims, 0);
+        assert_eq!(view.hidden(), 5);
+        assert_eq!(batched(&view).len(), 5);
+    }
+
+    #[test]
+    fn a_hand_built_view_that_lands_on_a_preset_is_called_by_its_name() {
+        // The other half of naming the view honestly: a reader who toggles their way onto
+        // `dependencies` is on `dependencies`, and the footer should say so rather than
+        // spelling out axes that have a name.
+        let mut view = mixed();
+        view.apply(Action::ToggleKind(Kind::Build));
+        view.apply(Action::ToggleKind(Kind::Cache));
+        assert_eq!(view.preset(), Some(Preset::Dependencies));
+        assert_eq!(view.view_label(), "dependencies");
+
+        // …except where two presets share a point, which is a coin toss rather than a name.
+        view.apply(Action::ToggleKind(Kind::Build));
+        view.apply(Action::ToggleKind(Kind::Cache));
+        view.apply(Action::CycleTiers);
+        assert_eq!(view.preset(), None);
+        assert_eq!(
+            view.view_label(),
+            "named + gitignored · dependencies + build + cache"
+        );
     }
 
     #[test]
     fn toggling_what_is_visible_never_changes_what_is_selected() {
         // **The rule the whole model turns on.** Hiding a row is not unselecting it.
         let mut view = mixed();
+        // Marked through the widest view, so what follows is the whole scan being narrowed
+        // around a selection rather than a selection that was never that big.
+        showing(&mut view, Preset::AllIgnored);
         point_at(&mut view, "/scan");
         view.apply(Action::Mark);
         let whole = batched(&view);
@@ -3196,11 +3427,17 @@ mod tests {
     fn a_second_mark_through_a_second_view_adds_to_the_first() {
         // The axes are a way of saying what to select, not a mode the selection lives in, so
         // two passes over one directory under two views is a union rather than a replacement.
+        // The second view here is one the axis keys built and no preset names, which is the
+        // point: a mark carries whatever the reader could see, preset or not.
         let mut view = mixed();
         showing(&mut view, Preset::Dependencies);
         point_at(&mut view, "/scan/nx");
         view.apply(Action::Mark);
-        showing(&mut view, Preset::Ignored);
+
+        view.apply(Action::CycleTiers);
+        view.apply(Action::CycleTiers);
+        view.apply(Action::ToggleKind(Kind::Dependencies));
+        assert_eq!(view.view_label(), "gitignored · none");
         point_at(&mut view, "/scan/nx");
         view.apply(Action::Mark);
 
@@ -3345,6 +3582,7 @@ mod tests {
         // Deleting acts on everything that is marked, so the number a reader checks has to
         // describe the same set. What narrowing the view changes is the count beside it.
         let mut view = mixed();
+        showing(&mut view, Preset::AllIgnored);
         point_at(&mut view, "/scan");
         view.apply(Action::Mark);
         assert_eq!(view.marked().claims, 5);
@@ -3364,6 +3602,7 @@ mod tests {
     #[test]
     fn the_confirmation_lists_the_whole_batch_and_names_what_is_out_of_sight() {
         let mut view = mixed();
+        showing(&mut view, Preset::AllIgnored);
         point_at(&mut view, "/scan");
         view.apply(Action::Mark);
         showing(&mut view, Preset::Dependencies);
@@ -3403,6 +3642,7 @@ mod tests {
         // The answer to a surprise has to be better than "cancel and start again" — especially
         // when the surprising row is one the current view is not even showing.
         let mut view = mixed();
+        showing(&mut view, Preset::AllIgnored);
         point_at(&mut view, "/scan");
         view.apply(Action::Mark);
         showing(&mut view, Preset::Dependencies);
@@ -3481,7 +3721,7 @@ mod tests {
         assert_eq!(view.preset(), Some(Preset::Dependencies));
 
         view.apply(Action::Back);
-        assert_eq!(view.preset(), Some(Preset::All));
+        assert_eq!(view.preset(), Some(Preset::Default));
         assert!(!batched(&view).is_empty(), "the marks went with the view");
 
         view.apply(Action::Back);
@@ -4644,41 +4884,43 @@ mod scale {
     //!
     //! | | per frame |
     //! |---|---|
-    //! | a frame with nothing arriving | **2 µs** |
-    //! | a frame with a claim arriving, nothing marked | **817 µs** |
-    //! | the same, with everything marked | **1.9 ms** |
-    //! | the same, with one row spared out of it | **2.4 ms** |
-    //! | the same, under a view that hides most of the tree | **2.4 ms** |
+    //! | nothing arriving | **1 µs** |
+    //! | a claim arriving, on a view that hides nothing | **782 µs** |
+    //! | the same, on the narrowed view a run opens on | **1.7 ms** |
+    //! | the same, everything marked | **1.9 ms** |
+    //! | the same, one row spared out of it | **2.4 ms** |
     //!
-    //! Four things worth reading off that. The interpolation itself is the first row — two
-    //! microseconds, because it is one entry per row the *pane* drew and the pane is fifty
-    //! rows whatever the tree is. The second row is #602's own number: it is the sort and the
-    //! re-flatten of everything, which neither the animation nor the marks touched.
+    //! Five things worth reading off that. The interpolation itself is the first row — one
+    //! microsecond, because it is one entry per row the *pane* drew and the pane is fifty rows
+    //! whatever the tree holds. The second is #602's own number: the sort and the re-flatten of
+    //! everything, which neither the animation nor the marks touched.
     //!
-    //! The last three are the one thing #626 had to measure rather than argue. A mark is a
-    //! (directory, view) pair resolved on demand, and the partial glyph is computed against
-    //! the **current** view — so "what is selected here" is a walk of the whole tree once per
-    //! frame that does any work, where it used to be a fold over a handful of marks. 1.1 ms
-    //! for 32,634 nodes, and the narrowing on top is free: a lens test per claim disappears
-    //! into the traversal that was happening anyway.
+    //! The gap between the second row and the third is **what the narrowed default costs**, and
+    //! it is the one number #626 had to measure rather than argue. A view that hides something
+    //! has to be able to say what each row is worth *under it*, and a mark is a (directory,
+    //! view) pair whose partial glyph is computed against the **current** view — so "what is
+    //! visible and what of it is selected" is a walk of the whole tree once per frame that does
+    //! any work. The run opens on `default`, which hides the gitignored tier, so that walk
+    //! happens from the first frame: about 870 µs for 32,634 nodes, or 2.6% of the budget. On
+    //! `all-ignored` or `all` with nothing marked the pass is skipped outright, which is the
+    //! second row.
     //!
-    //! **That number is a `Vec` rather than a `HashMap`, and the difference was 3×.** The
-    //! first version hashed on [`NodeId`] and cost 7.2 ms — four `SipHash`es per node, for a key
-    //! that is already a dense arena index the tree never recycles. Indexing is what makes a
+    //! **That walk is a `Vec` rather than a `HashMap`, and the difference was 3×.** The first
+    //! version hashed on [`NodeId`] and cost 7.2 ms — four `SipHash`es per node, for a key that
+    //! is already a dense arena index the tree never recycles. Indexing is what makes a
     //! whole-tree pass per frame affordable at all, and it is worth knowing before the next
     //! per-node cache is added.
     //!
     //! Sparing a row out of a marked-everything used to be the expensive case rather than a
-    //! rounding error on it: the mark was pushed down onto every sibling along the path, one
-    //! of those levels is 8,660 wide, and the per-frame fold then ran over 8,661 marks.
-    //! #626 replaced the push-down with a single exclusion, so it is now **1 mark and 1
-    //! exclusion** — which was a correctness change first (a push-down silently spares
-    //! whatever streams in beside the spared row) and a performance one by accident.
+    //! rounding error on it: the mark was pushed down onto every sibling along the path, one of
+    //! those levels is 8,660 wide, and the per-frame fold then ran over 8,661 marks. #626
+    //! replaced the push-down with a single exclusion, so it is now **1 mark and 1 exclusion** —
+    //! which was a correctness change first (a push-down silently spares whatever streams in
+    //! beside the spared row) and a performance one by accident.
     //!
     //! And a frame only pays any of this when something moved. `sync` runs the pass behind the
-    //! same `stale` flag as the sort, and skips it entirely while nothing is marked and
-    //! nothing is hidden — which is the view a run opens on — so a reader sitting looking at a
-    //! still tree pays the 2 µs and nothing else.
+    //! same `stale` flag as the sort, so a reader sitting looking at a still tree pays the first
+    //! row and nothing else.
     //!
     //! `cargo test --release --lib scale -- --ignored --nocapture` re-runs it.
 
@@ -4774,13 +5016,25 @@ mod scale {
         }
         println!("frame during a scan:        {:?}", started.elapsed() / 100);
 
+        // The same frame on a view that hides nothing, which is the one case that skips the
+        // whole-tree pass. It is what the run *used* to open on, so the difference between
+        // this line and the one above is exactly what the narrowed default costs per frame.
+        showing(&mut view, super::Preset::All);
+        let started = Instant::now();
+        for tick in 201..=300u32 {
+            view.found(priced(&format!("/home/repos/wide{tick}/node_modules"), 1));
+            view.animate(epoch + super::super::moving::COUNT_UP * tick);
+        }
+        println!("frame, nothing hidden:      {:?}", started.elapsed() / 100);
+
         // And the expensive one, which is the whole reason this is measured rather than
         // assumed. A mark is a (directory, view) pair resolved on demand, so "what is
         // selected" is a walk of the whole tree rather than a fold over a handful of marks —
         // one pass per frame that does any work, over 32,634 nodes.
+        showing(&mut view, super::Preset::Default);
         view.apply(Action::MarkAll);
         let started = Instant::now();
-        for tick in 201..=300u32 {
+        for tick in 301..=400u32 {
             view.found(priced(&format!("/home/repos/later{tick}/node_modules"), 1));
             view.animate(epoch + super::super::moving::COUNT_UP * tick);
         }
@@ -4797,7 +5051,7 @@ mod scale {
             view.spared.len()
         );
         let started = Instant::now();
-        for tick in 301..=400u32 {
+        for tick in 401..=500u32 {
             view.found(priced(&format!("/home/repos/spared{tick}/node_modules"), 1));
             view.animate(epoch + super::super::moving::COUNT_UP * tick);
         }
@@ -4805,13 +5059,24 @@ mod scale {
 
         // …and with a view narrowing on top, which is the pass at its most expensive: every
         // claim is asked whether it survives the lens as well as whether a mark covers it.
-        view.apply(Action::CyclePreset(Turn::Next));
+        view.apply(Action::ToggleKind(crate::rules::Kind::Dependencies));
         let started = Instant::now();
-        for tick in 401..=500u32 {
+        for tick in 501..=600u32 {
             view.found(priced(&format!("/home/repos/lens{tick}/node_modules"), 1));
             view.animate(epoch + super::super::moving::COUNT_UP * tick);
         }
         println!("frame, marked and narrowed: {:?}", started.elapsed() / 100);
+    }
+
+    /// Presses `f` until the view is the one named.
+    fn showing(view: &mut View, preset: super::Preset) {
+        for _ in 0..super::Preset::ALL.len() {
+            if view.preset() == Some(preset) {
+                return;
+            }
+            view.apply(Action::CyclePreset(Turn::Next));
+        }
+        panic!("{preset} is not on the cycle");
     }
 
     /// Puts the cursor on a row by walking to it, which is all a reader can do.

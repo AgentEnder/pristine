@@ -44,6 +44,7 @@ use std::sync::LazyLock;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use super::render::{Spot, Zone};
+use crate::rules::Kind;
 use crate::tree::Order;
 
 /// Where a motion key wants the cursor.
@@ -163,6 +164,19 @@ pub enum Action {
     /// independent of what is visible, and the whole point of the pair is that a reader can
     /// narrow the screen without narrowing what they are about to delete.
     CyclePreset(Turn),
+    /// `t` — move the **tier** axis on its own: named, named + gitignored, gitignored.
+    ///
+    /// The presets are shortcuts through four points; this and [`ToggleKind`](Self::ToggleKind)
+    /// are what make every *other* point reachable. Without them "show me every cache a rule
+    /// named" is a combination the model can hold and no reader can ask for, which is not what
+    /// "stays expressible" can mean.
+    CycleTiers,
+    /// `d` `b` `c` — turn one **kind** on or off, leaving the other two and the tier axis
+    /// exactly as they were.
+    ///
+    /// One key per member rather than a cycle, because a set of three has eight states and a
+    /// cycle through eight is a key nobody can aim.
+    ToggleKind(Kind),
     /// A printable character, while the prompt has it.
     ///
     /// **Not in [`KEYMAP`]**, and it could not be: it stands for every character a terminal
@@ -391,6 +405,21 @@ fn globals() -> Vec<Binding> {
 fn tree_keys() -> Vec<Binding> {
     let mut map = tree_motion();
     map.extend(tree_verbs());
+    // One key per kind, derived rather than listed, so a fourth kind in #623's vocabulary
+    // arrives already filterable, already documented and already dispatched. The `match` is
+    // what makes that true rather than hopeful: adding a kind stops this compiling.
+    for kind in Kind::ALL {
+        map.push(bind(
+            Surface::Tree,
+            &[key(kind_key(kind))],
+            match kind {
+                Kind::Dependencies => "show or hide installed dependencies",
+                Kind::Build => "show or hide compiled output",
+                Kind::Cache => "show or hide caches",
+            },
+            Action::ToggleKind(kind),
+        ));
+    }
     // One digit per order, derived rather than listed, so the key, the help row and the
     // dispatch for a fourth ordering all arrive together.
     for (nth, order) in Order::ALL.iter().enumerate() {
@@ -515,7 +544,7 @@ fn tree_verbs() -> Vec<Binding> {
         bind(
             Tree,
             &[key('f')],
-            "the next view: all, named, dependencies, gitignored",
+            "the next view: default, dependencies, all-ignored, all",
             Action::CyclePreset(Turn::Next),
         ),
         bind(
@@ -523,6 +552,12 @@ fn tree_verbs() -> Vec<Binding> {
             &[key('F')],
             "the view before it",
             Action::CyclePreset(Turn::Prev),
+        ),
+        bind(
+            Tree,
+            &[key('t')],
+            "which tiers are shown, on its own: named, both, gitignored",
+            Action::CycleTiers,
         ),
         bind(Tree, &[key('s')], "the next sort key", Action::CycleSort),
         bind(
@@ -738,6 +773,18 @@ fn confirm_keys() -> Vec<Binding> {
             Action::Spare,
         ),
     ]
+}
+
+/// Which letter toggles this kind.
+///
+/// The initial of the word the help page prints for it, which is the only mnemonic worth having
+/// — and a `match` rather than a table, so a fourth kind cannot arrive without one.
+const fn kind_key(kind: Kind) -> char {
+    match kind {
+        Kind::Dependencies => 'd',
+        Kind::Build => 'b',
+        Kind::Cache => 'c',
+    }
 }
 
 /// The digit key for the `nth` member of a positional group, counting from 1.
@@ -1252,6 +1299,7 @@ mod tests {
         Action, Chord, Gesture, Motion, Overlay, Spot, Surface, Target, Turn, Zone, action_for,
         bindings, finish, help, lookup, pointer, pointing,
     };
+    use crate::rules::Kind;
     use crate::tree::{NodeId, Order};
     use crate::tui::state::Answer;
     use ratatui::crossterm::event::{
@@ -1416,7 +1464,12 @@ mod tests {
             ),
             Action::Cursor(Motion::PageDown)
         );
-        assert_eq!(action_for(&letter('d'), None), Action::Ignore);
+        // …and the bare letter is its own binding, which is exactly why the modifier has to
+        // be checked first: `d` toggles a kind and `Ctrl-d` moves half a page.
+        assert_eq!(
+            action_for(&letter('d'), None),
+            Action::ToggleKind(Kind::Dependencies)
+        );
     }
 
     #[test]
