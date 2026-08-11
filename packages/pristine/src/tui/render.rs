@@ -31,6 +31,8 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row as TableRow, 
 
 use super::keymap::help;
 use super::state::{Answer, Mark, Roll, View, plural};
+use super::treemap;
+use super::treemap::tiles;
 use crate::size::human;
 use crate::tree::{NodeId, Order, Sort};
 use crate::walk::WalkError;
@@ -64,6 +66,12 @@ pub fn draw(frame: &mut Frame, view: &mut View, errors: &[WalkError]) -> Placed 
     .areas(frame.area());
 
     frame.render_widget(headline(view, errors), header);
+    // The map takes its columns off the tree before anything else is laid out, so every
+    // rectangle below — the heading, the columns, the rows a press is resolved against — is
+    // of the tree's *own* pane rather than of the frame. Nothing is drawn into the map's
+    // cells here beyond its caption: the picture arrives afterwards, from outside ratatui,
+    // and cells this frame wrote would be cells the image covers.
+    let (body, map) = split_off_map(frame, view, body);
     // The heading is a line of the body, so it comes out of the body's height before the
     // view is told how many rows it has — a page size that counted the heading would scroll
     // one row further than the pane can draw. A body with no room for both is all rows: a
@@ -87,6 +95,7 @@ pub fn draw(frame: &mut Frame, view: &mut View, errors: &[WalkError]) -> Placed 
         columns: Some(columns),
         heading: head,
         rows,
+        map,
         scroll: view.scroll(),
         overlay: None,
         answers: None,
@@ -114,6 +123,41 @@ pub fn draw(frame: &mut Frame, view: &mut View, errors: &[WalkError]) -> Placed 
     placed.overlay = prompt_at.or(help_at).or(confirm_at.map(|(area, _)| area));
     placed.answers = confirm_at.map(|(_, answers)| answers);
     placed
+}
+
+/// Takes the map's columns off the right of the body, when there is a map and room for one.
+///
+/// The caption is drawn here as ordinary terminal text rather than painted into the image:
+/// it is the one line of the pane a reader might want to select or copy, and text the
+/// terminal drew is text at the terminal's own font size.
+fn split_off_map(frame: &mut Frame, view: &View, body: Rect) -> (Rect, Option<Rect>) {
+    if !view.maps() || body.height < treemap::MIN_HEIGHT {
+        return (body, None);
+    }
+    let Some(width) = treemap::Pane::width_in(body.width) else {
+        return (body, None);
+    };
+    let [tree, gap, map] = Layout::horizontal([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(width),
+    ])
+    .areas(body);
+    let _ = gap;
+    let [caption, picture] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(map);
+    let said = tiles::focus(view).map_or_else(String::new, |root| tiles::caption(view, root));
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            said,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .style(Style::default().bg(Color::Rgb(24, 24, 30))),
+        caption,
+    );
+    (tree, Some(picture))
 }
 
 /// The filter prompt, over the footer it borrows.
@@ -646,6 +690,9 @@ pub struct Placed {
     pub heading: Option<Rect>,
     /// The body rows.
     pub rows: Rect,
+    /// Where the treemap's image goes, when the pane is up. `None` is a frame with no map on
+    /// it, which is every frame in a terminal that cannot draw one.
+    pub map: Option<Rect>,
     /// Which row of the tree the top drawn row held.
     ///
     /// Recorded rather than re-read from the view, so a press maps `y` to a row through the
@@ -954,6 +1001,9 @@ mod tests {
             frame.contains("delete what is marked — asks first"),
             "{frame}"
         );
+        // …and the map's key is on the page by construction rather than by anyone remembering
+        // to add it, which is what the table is for.
+        assert!(frame.contains("show or hide the map"), "{frame}");
     }
 
     #[test]
@@ -1150,6 +1200,50 @@ mod tests {
         // …and there is no arrangement in which a press reaches the tree behind it. This is
         // the row `nx` is on, and it is not a row while the question is up.
         assert_eq!(press_on(&view, &placed, Position::new(1, 3)), Spot::Outside);
+    }
+
+    // ---- the map pane ------------------------------------------------------------------
+
+    #[test]
+    fn the_map_takes_its_columns_off_the_tree_and_only_when_there_is_room_for_both() {
+        let mut view = view();
+        // A terminal that cannot draw one never reserves the space, whatever the width.
+        let (_, plain) = frame_of(&mut view, 140, 20);
+        assert_eq!(plain.map, None);
+        assert_eq!(plain.rows.width, 140);
+
+        view.allow_maps(true);
+        let (frame, placed) = frame_of(&mut view, 140, 20);
+        let map = placed.map.unwrap();
+        assert!(map.width >= 32, "{map:?}");
+        // The tree gave up exactly those columns and no more, and every rectangle a press is
+        // resolved against is of the *tree's* pane rather than of the frame.
+        assert_eq!(placed.rows.right() + 1 + map.width, 140);
+        assert_eq!(placed.columns.unwrap().name.x, placed.rows.x);
+        // The caption is terminal text above the picture, one row down from the header.
+        assert!(frame[1].contains("/scan"), "{:?}", frame[1]);
+
+        // …and a press in the map is a press on nothing: the picture is not a button in this
+        // spike, and a hit test that guessed otherwise would act on a rectangle nobody could
+        // aim at yet.
+        assert_eq!(
+            press_on(&view, &placed, Position::new(map.x + 2, map.y + 2)),
+            Spot::Nowhere
+        );
+    }
+
+    #[test]
+    fn a_terminal_with_no_room_for_a_map_is_all_tree() {
+        let mut view = view();
+        view.allow_maps(true);
+        // Too narrow: the map costs the tree the columns it takes, and the tree is the
+        // interface.
+        assert_eq!(frame_of(&mut view, 99, 30).1.map, None);
+        // Too short: rectangles in a pane eight rows tall are a shape, not an answer.
+        assert_eq!(frame_of(&mut view, 140, 8).1.map, None);
+        // And the reader can always say no.
+        view.apply(Action::ToggleMap);
+        assert_eq!(frame_of(&mut view, 140, 30).1.map, None);
     }
 
     #[test]

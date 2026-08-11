@@ -1,6 +1,6 @@
 //! Everything the terminal shows that is not a cell of the frame.
 //!
-//! Four decorations, one rule. The rule first, because it is the whole design: **every one of
+//! Five decorations, one rule. The rule first, because it is the whole design: **every one of
 //! these degrades to nothing.** Nothing here probes a capability, waits for an answer, or
 //! sniffs a version beyond reading two environment variables; a terminal that does not know a
 //! sequence ignores it, and a terminal this cannot identify is simply told less. None of it
@@ -23,11 +23,18 @@
 //!   somebody for *and* they are demonstrably looking elsewhere. A notification for a 200 ms
 //!   scan is spam.
 //!
-//! # Why three of the four are allowlisted, and one is not
+//! - **The kitty graphics protocol** is the one decoration that is *cells* rather than
+//!   chrome: it is what puts [`super::treemap`]'s picture on the screen. It is decided here
+//!   anyway, because what decides it is which terminal this is, which is this table's
+//!   subject — and two tables reading one environment are two tables that can disagree.
+//!
+//! # Why four of the five are allowlisted, and one is not
 //!
 //! **Only the synchronized update goes everywhere**, because it is the only one that leaves
 //! nothing behind: an unknown private mode is dropped by every parser that understands `CSI`,
-//! and there is no state to give back afterwards. The other three all fail by *persisting*.
+//! and there is no state to give back afterwards. The other four all fail by *persisting* —
+//! an image most loudly of all, since a terminal that does not decode `APC G` prints a
+//! megabyte of base64 into the reader's scrollback.
 //!
 //! Two of them fail by being misread, and OSC 9 colliding with itself is why.
 //! `OSC 9 ; <text>` is a desktop notification in iTerm2, `WezTerm` and Ghostty;
@@ -101,6 +108,18 @@ pub struct Decor {
     pub progress: bool,
     /// How to raise a desktop notification, if this terminal can.
     pub notify: Option<Notify>,
+    /// Read the kitty graphics protocol — which is how the treemap pane gets on the screen.
+    ///
+    /// A column of this table rather than a second one keyed on the same two environment
+    /// variables, because two tables read from one environment are two tables that can
+    /// disagree about which terminal this is. It is also the only decoration here that is
+    /// *cells* rather than chrome, and it is here anyway for that reason: what decides it is
+    /// the terminal's identity, which is this table's whole subject.
+    ///
+    /// Absence is a refusal to guess, as everywhere else. The protocol does define a query
+    /// for "do you read this", and it is a round trip with no bound on the silence — the
+    /// blocking probe this module exists to avoid. See [`super::treemap`].
+    pub graphics: bool,
 }
 
 /// The spelling of a desktop notification that a given terminal reads.
@@ -148,6 +167,7 @@ const KNOWN: &[Known] = &[
             title: Some(XTERM_STACK),
             progress: true,
             notify: Some(Notify::Osc9),
+            graphics: true,
         },
     },
     Known {
@@ -158,6 +178,7 @@ const KNOWN: &[Known] = &[
             title: Some(XTERM_STACK),
             progress: true,
             notify: Some(Notify::Osc9),
+            graphics: true,
         },
     },
     Known {
@@ -170,6 +191,10 @@ const KNOWN: &[Known] = &[
             // reader as a pop-up saying `4;1;41`.
             progress: false,
             notify: Some(Notify::Osc9),
+            // iTerm2's inline images are its own OSC 1337, not this protocol. That is the
+            // obvious next terminal to reach and it is a different encoder, so it is a
+            // follow-on rather than a row that can be flipped.
+            graphics: false,
         },
     },
     Known {
@@ -181,6 +206,7 @@ const KNOWN: &[Known] = &[
             progress: false,
             // kitty's notification is OSC 99, which nothing here speaks.
             notify: None,
+            graphics: true,
         },
     },
     Known {
@@ -193,6 +219,7 @@ const KNOWN: &[Known] = &[
             title: None,
             progress: false,
             notify: None,
+            graphics: false,
         },
     },
 ];
@@ -592,6 +619,7 @@ mod tests {
             title: Some(XTERM_STACK),
             progress: true,
             notify: Some(Notify::Osc9),
+            graphics: true,
         }
     }
 
@@ -876,9 +904,10 @@ mod tests {
         assert_eq!(Decor::read(&env(&[("TERM", "dumb")])), Decor::silent());
         assert_eq!(Decor::read(&env(&[])), Decor::silent());
 
-        // A private mode is the only one of the four an unidentified terminal can be sent
+        // A private mode is the only one of the five an unidentified terminal can be sent
         // safely: anything that parses `CSI` drops it, and it leaves no state behind. A title
-        // would be left standing, and the two OSCs can be misread as each other.
+        // would be left standing, the two OSCs can be misread as each other, and an image
+        // sent to a terminal that cannot decode it is a screenful of base64.
         assert_eq!(
             Decor::read(&env(&[("TERM", "xterm-256color")])),
             Decor {
@@ -886,6 +915,7 @@ mod tests {
                 title: None,
                 progress: false,
                 notify: None,
+                graphics: false,
             }
         );
     }
@@ -937,6 +967,17 @@ mod tests {
         let kitty = Decor::read(&env(&[("TERM", "xterm-kitty")]));
         assert_eq!(kitty.title, Some(XTERM_STACK));
         assert!(!kitty.progress);
+        assert!(kitty.graphics, "the terminal the protocol is named after");
+
+        // …and the one that has inline images of a different spelling gets none, because a
+        // row here is a claim that the terminal reads *this* sequence.
+        assert!(
+            !Decor::read(&env(&[
+                ("TERM_PROGRAM", "iTerm.app"),
+                ("TERM", "xterm-256color")
+            ]))
+            .graphics
+        );
 
         let iterm = Decor::read(&env(&[
             ("TERM", "xterm-256color"),
