@@ -20,6 +20,8 @@ reclaimable and all invisible to a tool that only knows about npm.
 
 ```sh
 pristine ~/repos                       # list what is reclaimable, and what regenerates each
+pristine ~/repos --breakdown           # ...and what each one is worth, by walking every one
+pristine ~/repos --breakdown-under ~/repos/nx    # ...or one subtree, at that subtree's price
 pristine ~/repos --dry-run             # the plan it would execute, and what it would refuse
 pristine ~/repos --delete              # the same plan, then a confirmation that defaults to no
 pristine ~/repos --delete --yes --older-than 30d
@@ -37,14 +39,26 @@ $ pristine ~/repos/pua
          —  target                    cargo build
 
 5 directories reclaimable, 59.1 MiB priced, 4 not priced
+not priced: nothing looked inside. --breakdown prices every claim, --breakdown-under <PATH> just
+one subtree; both walk what they price.
 fallback tier: 1 directory found in 1 work tree above a 10.0 MiB floor
 ```
 
 A dash is not a zero: nothing looked inside, because a matched directory is never enumerated by
 the scan that found it. Pruning at `node_modules` and then walking it to size it would give back
-everything the pruning saved, so sizes read `—` until something asks for a breakdown, and a removal
-reports the bytes it actually freed. The fallback tier's rows do carry a size, because that tier
-cannot claim a directory without walking it.
+everything the pruning saved. No platform offers a recursive directory size — a directory inode's
+block count describes its own entry table, not the tree below it, which is why `du` walks — so a
+price is a full enumeration and it costs what it costs. The fallback tier's rows do carry a size,
+because that tier cannot claim a directory without walking it anyway.
+
+`--breakdown` pays that price for every claim. Over one real `~/repos`: **4.6 s and 14.0 GiB
+priced without it, 55.8 s and 165.1 GiB with**. The default is not caution, it is that most runs
+do not need all 165 GiB accounted for to a byte — but the tenfold gap between the two numbers is
+why the flag has to exist.
+
+`--breakdown-under <PATH>` prices one subtree instead, and the rest of the scan still appears,
+still unpriced. The same tree scoped to a single repository takes 3.5 s — a default scan, plus
+that repository. It is how you ask "how much is in *here*" without paying for everywhere else.
 
 A scan that could not read everything it was pointed at says `scan incomplete` and exits
 non-zero, so a listing that is a lower bound never looks — to a script — like the whole truth.
