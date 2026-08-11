@@ -199,8 +199,18 @@ impl<W: Write> Screen<W> {
         let canvas = paint::paint(&map, width, height);
         let at = (pane.cells.y + 1, pane.cells.x + 1);
         let cells = (pane.cells.width, pane.cells.height);
-        self.put(&Image::shown(&canvas, at, cells))?;
+        // Armed **before** the write, which is [`super::chrome::Chrome::enter`]'s rule and
+        // is load-bearing here for a sharper version of its reason. `put` writes the whole
+        // image and then flushes, so a flush that fails has left a megabyte in the
+        // terminal's memory — and a flag set afterwards would still say there is nothing to
+        // take back. Of the two ways to be wrong, deleting an image that never landed costs
+        // twenty bytes at a terminal already being restored, while skipping the delete
+        // leaves the picture there after this process has gone, with nothing alive to notice.
         self.up = true;
+        self.put(&Image::shown(&canvas, at, cells))?;
+        // The fingerprints only afterwards, and that is the other half: a write that failed
+        // has left the screen in a state this cannot describe, so the next `show` has to
+        // treat it as a picture it has not drawn and send it again.
         self.picture = picture;
         self.steering = steering;
         self.since = Some(now);
@@ -219,13 +229,20 @@ impl<W: Write> Screen<W> {
     ///
     /// Anything the terminal refuses.
     pub fn hide(&mut self) -> io::Result<()> {
-        if !std::mem::take(&mut self.up) {
+        if !self.up {
             return Ok(());
         }
         self.picture = 0;
         self.steering = 0;
         self.since = None;
-        self.put(&Image::gone())
+        self.put(&Image::gone())?;
+        // Cleared only once the delete has actually gone out, which is the mirror of the
+        // arming in [`Screen::show`]. A terminal that refused thirty bytes once will often
+        // take them a moment later, and this runs twice by design — the ordinary way out and
+        // then the guard's `Drop` — so the second pass is a free retry. Clearing the flag
+        // first would spend it on a delete that never left.
+        self.up = false;
+        Ok(())
     }
 
     /// Puts back everything this took, and can be called twice.
@@ -271,6 +288,8 @@ mod tests {
     use crate::tui::state::View;
     use crate::tui::treemap::tiles::Area;
     use ratatui::layout::Rect;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     fn view() -> View {
@@ -385,6 +404,84 @@ mod tests {
 
         screen.show(&view, pane(), now + SETTLE).unwrap();
         assert!(screen.sink().len() > first, "the map never caught up");
+    }
+
+    /// A terminal that takes every byte and then refuses to flush them.
+    ///
+    /// The narrowest injection that reaches the finding: `write_all` succeeds, so the image
+    /// really is in the terminal's memory, and only the flush fails.
+    struct Unflushable {
+        written: Vec<u8>,
+        refusing: Arc<AtomicBool>,
+    }
+
+    impl std::io::Write for Unflushable {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.refusing.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("the terminal stopped listening"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_image_the_terminal_took_but_would_not_flush_is_still_taken_back() {
+        // The one failure that would leave a megabyte in somebody's terminal after this
+        // process has gone. `write_all` puts the whole image there and the flush then fails,
+        // so a `show` that armed the cleanup *after* the write would report the error and
+        // leave `restore` with nothing to undo — the image outliving the run that made it,
+        // with nothing alive to notice.
+        let refusing = Arc::new(AtomicBool::new(true));
+        let mut screen = Screen::new(
+            Unflushable {
+                written: Vec::new(),
+                refusing: Arc::clone(&refusing),
+            },
+            true,
+        );
+        let view = view();
+
+        assert!(
+            screen.show(&view, pane(), Instant::now()).is_err(),
+            "the flush was supposed to fail"
+        );
+        let sent = String::from_utf8_lossy(&screen.sink().written).into_owned();
+        assert!(
+            sent.contains("\x1b_Ga=T,"),
+            "the image never reached the terminal, so there is nothing to prove"
+        );
+
+        // The way out, while the terminal is still refusing: the delete is attempted and
+        // reported rather than swallowed, and — the half that matters — it is not written off
+        // as done. This runs twice by design, so a refusal on the first pass has to leave
+        // something for the second.
+        assert!(
+            screen.restore().is_err(),
+            "a refused delete was called done"
+        );
+
+        // The terminal comes back, which is the ordinary shape of a transient write failure
+        // on a pty whose buffer was full for a moment.
+        refusing.store(false, Ordering::SeqCst);
+        screen.restore().unwrap();
+
+        let said = String::from_utf8_lossy(&screen.sink().written).into_owned();
+        assert!(
+            said.ends_with("d=I,i=1976622,q=2\x1b\\"),
+            "the image was left in the terminal: {:?}",
+            &said[said.len() - 60..]
+        );
+        // One in the placement's own prologue, then the two attempts on the way out.
+        assert_eq!(said.matches("a=d,d=I").count(), 3, "unbalanced");
+        // …and once it has genuinely gone, saying so again writes nothing.
+        let settled = screen.sink().written.len();
+        screen.restore().unwrap();
+        assert_eq!(screen.sink().written.len(), settled, "deleted twice");
     }
 
     #[test]
