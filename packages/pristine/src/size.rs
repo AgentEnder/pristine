@@ -68,13 +68,47 @@ impl Size {
 }
 
 /// How much work a scan may do to size what it claims.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SizeMode {
     /// Record claims without enumerating them. The default, and the performance thesis.
     #[default]
     Skip,
-    /// Sum each claim's subtree. What "show me a breakdown" costs.
+    /// Sum each claim's subtree. What "show me a breakdown" costs — an order of magnitude over
+    /// the scan it prices (4.6 s to 55.8 s over one real `~/repos`), which is why nothing does
+    /// it unasked.
     Breakdown,
+    /// Sum the subtree of every claim the named path touches, and nothing else.
+    ///
+    /// The whole-tree breakdown is the only honest answer to "how much do I get back from all
+    /// of this", and it is also the one nobody wants to wait for twice. Scoping it is what
+    /// makes the number reachable at a price the user chooses: pay for the one subtree in
+    /// question and leave the rest reading `Unmeasured`, which it already was.
+    ///
+    /// It is also the shape the TUI needs. Drilling into a node is exactly a request to price
+    /// that subtree, and this is the mode a re-price of it runs under.
+    ///
+    /// The scope has to be spelled the way the walk spells its hits — the scan root's own
+    /// prefix and all — because the comparison is by path. Anchoring it is the caller's job;
+    /// see the command line's `anchor`.
+    BreakdownUnder(PathBuf),
+}
+
+impl SizeMode {
+    /// Whether a claim at `dir` is one this mode pays to measure.
+    ///
+    /// A scope *containing* the claim is the obvious case. A scope *inside* it counts too, and
+    /// that is not a courtesy: a claim is the smallest thing that can be priced, since the walk
+    /// pruned there and nothing below it was ever enumerated. Reading "under" strictly would
+    /// mean `--breakdown-under repo/node_modules/.pnpm` prices nothing at all and says so with
+    /// a straight face — a confident empty answer, which is the failure shape this crate keeps
+    /// meeting in other clothes.
+    fn prices(&self, dir: &Path) -> bool {
+        match self {
+            Self::Skip => false,
+            Self::Breakdown => true,
+            Self::BreakdownUnder(scope) => dir.starts_with(scope) || scope.starts_with(dir),
+        }
+    }
 }
 
 /// The result of measuring one directory.
@@ -111,7 +145,7 @@ pub struct Survey {
 }
 
 /// Measures directories under a fixed policy.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Measurer {
     mode: SizeMode,
     same_file_system: bool,
@@ -135,6 +169,18 @@ impl Measurer {
         self
     }
 
+    /// Whether measuring `dir` means traversing it.
+    ///
+    /// This is what decides whether a claim goes to the pricing pool instead of being sized on
+    /// the walker thread that found it. Two things are false here and both matter: a claim
+    /// this mode does not price at all, and a *symlink*, whose one `lstat` the walk has
+    /// already done. Queueing either would trade a constant-time answer for a thread handoff
+    /// and delay the claim's own publication for nothing.
+    #[must_use]
+    pub fn traverses(&self, dir: &Path, metadata: &fs::Metadata) -> bool {
+        metadata.is_dir() && self.mode.prices(dir)
+    }
+
     /// Measures `dir`, whose metadata the caller already has from the walk.
     ///
     /// Returns without touching the filesystem under [`SizeMode::Skip`], which is the point.
@@ -149,7 +195,7 @@ impl Measurer {
                 unreadable: Vec::new(),
             };
         }
-        if self.mode == SizeMode::Skip {
+        if !self.mode.prices(dir) {
             return Measurement::default();
         }
 
@@ -203,7 +249,7 @@ impl Measurer {
     ///
     /// With `watch_for_repos` it also stops the moment it finds a `.git`, because whatever
     /// asked for that has no further use for the total.
-    fn walk(self, dir: &Path, metadata: &fs::Metadata, watch_for_repos: bool) -> Walked {
+    fn walk(&self, dir: &Path, metadata: &fs::Metadata, watch_for_repos: bool) -> Walked {
         let mut pass = Pass {
             bytes: allocated(metadata),
             boundary: device(metadata),
@@ -232,7 +278,7 @@ impl Measurer {
     /// iterator. `readdir` failing part-way through a directory it had already opened is not
     /// something a test can arrange on a real filesystem, and it is the branch that most needs
     /// one.
-    fn absorb<I>(self, current: &Path, entries: I, pass: &mut Pass) -> Option<PathBuf>
+    fn absorb<I>(&self, current: &Path, entries: I, pass: &mut Pass) -> Option<PathBuf>
     where
         I: IntoIterator<Item = io::Result<fs::DirEntry>>,
     {
@@ -564,6 +610,40 @@ mod tests {
     }
 
     #[test]
+    fn a_scoped_breakdown_prices_what_is_under_the_scope_and_leaves_the_rest_alone() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp, "wanted/big.bin", 256 * 1024);
+        write(&tmp, "elsewhere/big.bin", 256 * 1024);
+        let wanted = tmp.path().join("wanted");
+        let elsewhere = tmp.path().join("elsewhere");
+
+        let measurer = Measurer::new(SizeMode::BreakdownUnder(wanted.clone()));
+
+        let priced = measurer.measure(&wanted, &wanted.symlink_metadata().unwrap());
+        assert!(priced.size.bytes().unwrap() >= 256 * 1024, "{priced:?}");
+        // The whole point of the scope: everything outside it costs nothing, so a user can
+        // price one subtree without paying for the tree.
+        let untouched = measurer.measure(&elsewhere, &elsewhere.symlink_metadata().unwrap());
+        assert_eq!(untouched.size, Size::Unmeasured);
+    }
+
+    #[test]
+    fn a_scope_inside_a_claim_prices_that_claim_rather_than_nothing() {
+        // Drilling into `node_modules/.pnpm` and being told the whole scan is unpriced is the
+        // failure this codebase keeps finding in other clothes: a confident empty answer. A
+        // claim is the smallest thing that can be priced, so a scope that lands inside one is
+        // a request to price it.
+        let tmp = TempDir::new().unwrap();
+        write(&tmp, "claim/deep/big.bin", 256 * 1024);
+        let claim = tmp.path().join("claim");
+
+        let measurer = Measurer::new(SizeMode::BreakdownUnder(claim.join("deep")));
+        let priced = measurer.measure(&claim, &claim.symlink_metadata().unwrap());
+
+        assert!(priced.size.bytes().unwrap() >= 256 * 1024, "{priced:?}");
+    }
+
+    #[test]
     fn a_survey_prices_the_whole_subtree_whatever_the_mode() {
         let tmp = TempDir::new().unwrap();
         write(&tmp, "a/one.bin", 256 * 1024);
@@ -571,7 +651,7 @@ mod tests {
 
         let metadata = tmp.path().symlink_metadata().unwrap();
         for mode in [SizeMode::Skip, SizeMode::Breakdown] {
-            let surveyed = Measurer::new(mode).survey(tmp.path(), &metadata);
+            let surveyed = Measurer::new(mode.clone()).survey(tmp.path(), &metadata);
             assert!(surveyed.nested_repo.is_none());
             assert!(
                 surveyed.size.bytes().unwrap() >= 512 * 1024,

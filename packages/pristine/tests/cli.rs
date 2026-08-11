@@ -200,6 +200,109 @@ fn outside_a_work_tree_the_output_reports_inertness_rather_than_an_empty_result(
 }
 
 // ---------------------------------------------------------------------------------------
+// Asking for sizes. A scan leaves tier one unpriced by design, so "how much do I get back"
+// has to be a question the command line can ask.
+// ---------------------------------------------------------------------------------------
+
+/// The row for `path`, whatever the listing put on it. Matched by containment rather than by
+/// suffix because a listing row carries the regeneration command after the path.
+fn row<'a>(printed: &'a str, path: &str) -> &'a str {
+    printed
+        .lines()
+        .find(|line| line.contains(path))
+        .unwrap_or_else(|| panic!("no row for {path}:\n{printed}"))
+}
+
+#[test]
+fn a_default_scan_leaves_a_claim_unpriced_and_says_how_to_price_it() {
+    let (_tmp, base) = fixture();
+    project(&base, "app");
+
+    let printed = succeeds(&base, &[]);
+
+    // The dash is not a zero, and a reader with no way to turn it into a number is being
+    // told the headline question is unanswerable rather than unasked.
+    assert!(row(&printed, "app/node_modules").contains('—'), "{printed}");
+    assert!(printed.contains("1 not priced"), "{printed}");
+    assert!(printed.contains("--breakdown"), "{printed}");
+    assert!(printed.contains("--breakdown-under"), "{printed}");
+}
+
+#[test]
+fn a_breakdown_prices_what_the_scan_pruned_at() {
+    let (_tmp, base) = fixture();
+    project(&base, "app");
+
+    let printed = succeeds(&base, &["--breakdown"]);
+
+    assert!(
+        !row(&printed, "app/node_modules").contains('—'),
+        "{printed}"
+    );
+    assert!(printed.contains("0 not priced"), "{printed}");
+    // Nothing left to explain, so the hint stays out of the way.
+    assert!(!printed.contains("--breakdown-under"), "{printed}");
+}
+
+#[test]
+fn a_scoped_breakdown_prices_one_subtree_and_lists_the_rest_unpriced() {
+    let (_tmp, base) = fixture();
+    project(&base, "wanted");
+    project(&base, "elsewhere");
+
+    let printed = succeeds(
+        &base,
+        &["--breakdown-under", base.join("wanted").to_str().unwrap()],
+    );
+
+    // The point of the flag: a number for the subtree in question, at that subtree's price,
+    // with the rest of the scan still listed rather than hidden.
+    assert!(
+        !row(&printed, "wanted/node_modules").contains('—'),
+        "{printed}"
+    );
+    assert!(
+        row(&printed, "elsewhere/node_modules").contains('—'),
+        "{printed}"
+    );
+    assert!(printed.contains("1 not priced"), "{printed}");
+}
+
+#[test]
+fn a_breakdown_scope_the_scan_does_not_cover_is_refused() {
+    let (_tmp, base) = fixture();
+    project(&base, "app");
+    let elsewhere = TempDir::new().unwrap();
+
+    // Honoured silently, this would price nothing and print a listing of dashes — which reads
+    // exactly like a subtree that is worth nothing.
+    let (_, complaints) = fails(
+        &base,
+        &["--breakdown-under", elsewhere.path().to_str().unwrap()],
+    );
+
+    assert!(
+        complaints.contains("not inside the scan root"),
+        "{complaints}"
+    );
+}
+
+#[test]
+fn a_breakdown_reaches_the_plan_as_well_as_the_listing() {
+    let (_tmp, base) = fixture();
+    let modules = project(&base, "app");
+
+    let printed = succeeds(&base, &["--dry-run", "--breakdown"]);
+
+    assert!(modules.exists(), "a dry run deleted something");
+    assert!(printed.contains("0 not priced"), "{printed}");
+    assert!(
+        !printed.contains("plan: 1 directory, 0 B priced"),
+        "the plan took the listing's sizes but not the breakdown's:\n{printed}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
 // Both tiers reach one plan. This is the property the #588/#594 merge creates, and neither
 // side could have had a test for it.
 // ---------------------------------------------------------------------------------------
