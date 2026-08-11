@@ -43,6 +43,7 @@
 
 pub mod chrome;
 pub mod keymap;
+pub mod moving;
 pub mod render;
 pub mod state;
 
@@ -75,6 +76,15 @@ use state::{Effect, Pending, View, plural};
 /// thinking: `event::poll` returns the moment a key is pressed, so this only bounds how stale
 /// a *number* can be, not how long a keystroke waits.
 const TICK: Duration = Duration::from_millis(100);
+
+/// The same, while something on screen is actually moving.
+///
+/// Ten frames a second is enough to keep a number from going stale and not enough to make one
+/// climb smoothly, so the loop draws faster exactly when there is something to see and drops
+/// straight back to [`TICK`] when there is not — which is most of the time a reader spends in
+/// here, deciding. A frame is 1.5 ms in release against this budget, so the difference is a
+/// few percent of one core during a scan and nothing at all while one is being read.
+const FRAME: Duration = Duration::from_millis(33);
 
 /// Everything the front end needs from the command line.
 #[derive(Debug, Clone)]
@@ -321,7 +331,9 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
     loop {
         drain(&mut view, &inbox, &mut outcome);
         reap(&mut view, &inbox, &mut outcome, batch.0.as_ref());
-        view.sync();
+        // The one place a clock enters the view, and it syncs on the way through. Every
+        // interpolated number on screen moves exactly once per frame, here.
+        view.animate(Instant::now());
 
         // A phase that has just ended is the only thing worth interrupting anybody for, and
         // the chrome decides whether it is: long enough to matter, and nobody watching. Both
@@ -355,7 +367,7 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
         if view.wants_to_quit() {
             break;
         }
-        if !events.poll(TICK)? {
+        if !events.poll(if view.is_moving() { FRAME } else { TICK })? {
             continue;
         }
         let event = events.read()?;
@@ -421,6 +433,8 @@ fn reap(
     drain(view, inbox, outcome);
     if view.is_deleting() {
         outcome.failures += 1;
+        // The freed total is left where it stands: a removal that said nothing is a removal
+        // that gave no figure, and inventing one is the opposite of what this branch is for.
         view.deleted("the removal ended without reporting what it did".to_owned());
     }
 }
@@ -433,6 +447,7 @@ fn drain(view: &mut View, inbox: &Receiver<Message>, outcome: &mut Outcome) {
     loop {
         match inbox.try_recv() {
             Ok(Message::Found(Found::Claim(hit))) => view.found(hit),
+            Ok(Message::Found(Found::Pricing(path))) => view.pricing(&path),
             Ok(Message::Found(Found::Priced(priced))) => view.priced(&priced.path, priced.size),
             Ok(Message::Scanned(walk)) => {
                 outcome.errors.extend(walk.errors);
@@ -442,6 +457,10 @@ fn drain(view: &mut View, inbox: &Receiver<Message>, outcome: &mut Outcome) {
             Ok(Message::Deleted(removal)) => {
                 outcome.failures += removal.failures.len();
                 outcome.freed += removal.bytes_freed();
+                // The rows the safety model left standing, so each one can say so where it
+                // is. The footer's count says how many; only the row can say which.
+                view.refused(&removal.kept);
+                view.freed(outcome.freed);
                 view.deleted(summarise(&removal));
             }
             // Disconnected as well as empty: the walk finishing drops its sender, and there

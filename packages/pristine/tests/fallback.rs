@@ -91,6 +91,7 @@ fn scan_with(walker: &Walker) -> Vec<Hit> {
     let sizes = Mutex::new(Vec::new());
     let outcome = walker.run(|found| match found {
         Found::Claim(hit) => hits.lock().unwrap().push(hit),
+        Found::Pricing(_) => {}
         Found::Priced(priced) => sizes.lock().unwrap().push(priced),
     });
     assert!(

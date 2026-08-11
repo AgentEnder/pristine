@@ -129,6 +129,16 @@ pub enum Found {
     /// A directory was claimed. Published the moment the claim is judged, whatever the size
     /// mode: nothing here ever waits for a measurement.
     Claim(Hit),
+    /// A pricing thread has gone into this claim and has not come back yet.
+    ///
+    /// The pool is bounded, so the number of these outstanding at any instant is the number
+    /// of threads in it — which is what makes it worth reporting at all. A live view can show
+    /// exactly which of its dashes are being worked on *now*, where before it could only show
+    /// that some of them would be worked on eventually. Followed by exactly one
+    /// [`Found::Priced`] for the same path, whatever the measurement turns out to be.
+    ///
+    /// A consumer that only wants totals ignores it, as the command line does.
+    Pricing(PathBuf),
     /// A claim that was published without a size now has one.
     ///
     /// Arrives after the [`Found::Claim`] it belongs to — always, because the claim is
@@ -444,6 +454,9 @@ impl Walker {
                     });
                 }
             }
+            // Nothing to file: it says a thread is busy, which a finished tree has no way to
+            // be interested in. The live view is the only consumer that is.
+            Found::Pricing(_) => {}
             // A price for a row the tree does not hold, or holds priced already, would be
             // double-counted rather than absorbed — so `price` refuses it and it is reported,
             // on the same rule as a claim from outside the root.
@@ -663,6 +676,10 @@ where
             let job = lock(queue).recv();
             let Ok(job) = job else { return };
 
+            // Announced before the traversal rather than after it, which is the only ordering
+            // that makes the event mean anything: it says "a thread is in here", and a thread
+            // that has already come out is not.
+            (self.on_found)(Found::Pricing(job.path.clone()));
             let measured = self.measurer.measure(&job.path, &job.metadata);
             self.report_blind_spots(
                 measured.unreadable,

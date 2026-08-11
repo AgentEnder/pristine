@@ -101,6 +101,7 @@ fn scan_with(walker: &Walker) -> Vec<Hit> {
     let sizes = Mutex::new(Vec::new());
     let outcome = walker.run(|found| match found {
         Found::Claim(hit) => hits.lock().unwrap().push(hit),
+        Found::Pricing(_) => {}
         Found::Priced(priced) => sizes.lock().unwrap().push(priced),
     });
     assert!(
@@ -549,6 +550,7 @@ fn claims_keep_arriving_while_a_price_is_stuck() {
         threads.spawn(|| {
             walker.run(|found| match found {
                 Found::Claim(hit) => claims.send(hit).unwrap(),
+                Found::Pricing(_) => {}
                 Found::Priced(priced) => {
                     let (open, bell) = &*gate;
                     let mut open = open.lock().unwrap();
@@ -587,6 +589,59 @@ fn claims_keep_arriving_while_a_price_is_stuck() {
     assert_eq!(sizes.len(), 3, "{sizes:?}");
     assert_eq!(sizes[0].path, tmp.path().join("a/node_modules"));
     assert!(sizes[0].size.bytes().unwrap() >= 64 * 1024, "{sizes:?}");
+}
+
+#[test]
+fn a_claim_is_announced_as_being_priced_before_its_price_arrives() {
+    // The property the live view's pricing shimmer is built on, and it only means anything if
+    // it holds: a row that shimmers is a row a thread is *inside*. So the announcement has to
+    // come before the traversal it announces, exactly once per claim, and be followed by that
+    // claim's price. Announced afterwards it would name work that was already over, and the
+    // shimmer would be decoration.
+    let tmp = TempDir::new().unwrap();
+    for name in ["a", "b", "c"] {
+        touch(&tmp.path().join(name).join("package.json"));
+        write(&tmp.path().join(name).join("node_modules/big.bin"), 4096);
+    }
+
+    let order = Mutex::new(Vec::new());
+    breakdown(tmp.path()).run(|found| match found {
+        Found::Claim(_) => {}
+        Found::Pricing(path) => order.lock().unwrap().push((path, true)),
+        Found::Priced(priced) => order.lock().unwrap().push((priced.path, false)),
+    });
+
+    let order = order.into_inner().unwrap();
+    for name in ["a", "b", "c"] {
+        let path = tmp.path().join(name).join("node_modules");
+        let mine: Vec<bool> = order
+            .iter()
+            .filter(|(at, _)| *at == path)
+            .map(|(_, starting)| *starting)
+            .collect();
+        // Once each way, in that order. Twice would mean two threads shimmering one row;
+        // never would mean a dash nobody ever announced work on.
+        assert_eq!(mine, [true, false], "{name}: {order:?}");
+    }
+}
+
+#[test]
+fn a_default_scan_announces_nothing_as_being_priced_because_nothing_is() {
+    // The pool does not exist under the default size mode — see `Walker::run` — so there is
+    // no thread for a shimmer to stand for, and the event a front end would draw one from
+    // must not arrive either.
+    let tmp = TempDir::new().unwrap();
+    touch(&tmp.path().join("app/package.json"));
+    write(&tmp.path().join("app/node_modules/big.bin"), 4096);
+
+    let announced = Mutex::new(0usize);
+    Walker::new(tmp.path(), ruleset()).run(|found| {
+        if matches!(found, Found::Pricing(_)) {
+            *announced.lock().unwrap() += 1;
+        }
+    });
+
+    assert_eq!(announced.into_inner().unwrap(), 0);
 }
 
 #[test]

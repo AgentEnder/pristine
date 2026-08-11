@@ -436,6 +436,18 @@ impl Tree {
         self.live
     }
 
+    /// How many [`NodeId`]s have ever been handed out.
+    ///
+    /// Every id below this has named a directory at some point and no id above it has, so a
+    /// caller holding the value from a moment ago knows exactly which nodes appeared since:
+    /// they are the ids in between. That is what lets the front end light a newly found row
+    /// without the tree having to report arrivals, and it works because ids are minted in
+    /// order and [`Tree::remove`] detaches rather than recycles.
+    #[must_use]
+    pub fn minted(&self) -> usize {
+        self.nodes.len()
+    }
+
     /// Whether there is nothing left to reclaim — either the walk found nothing, or
     /// everything it found has been deleted.
     #[must_use]
