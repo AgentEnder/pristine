@@ -74,6 +74,14 @@ one.
   over the whole path, and a filtered row's number counts only what the filter shows, so a mark
   can never delete what you cannot see.
 - `?` lists every key, generated from the keymap rather than maintained beside it.
+- A long sweep stays readable from outside the terminal: the window title carries the live figure
+  (`pristine — pricing 41%`, `pristine — freed 41.2 GiB`), the dock or taskbar carries a real
+  progress bar, and a run that took long enough raises one notification if you have looked away.
+  Frames go out as one synchronized update, so a redraw does not tear over ssh. All of it is put
+  back on the way out, including the error path. Each part is sent only to a terminal known to
+  read it — the title only where the old one can be handed back, since a title nobody can clear is
+  worse than none — so an unrecognised terminal gets the tear-free redraw and nothing else, and a
+  pipe gets not one escape byte.
 
 The keys are deliberately close to [pua](https://github.com/AgentEnder/pua)'s, which is the same
 shape of tool pointed at processes.

@@ -41,16 +41,17 @@
 //! reader marks and deletes throughout. `--breakdown-under <PATH>` still means what it says,
 //! for a reader who wants one subtree priced and the rest left alone.
 
+pub mod chrome;
 pub mod keymap;
 pub mod render;
 pub mod state;
 
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{self, Event};
 use ratatui::crossterm::execute;
@@ -64,6 +65,7 @@ use crate::size::{SizeMode, human};
 use crate::tree::Tree;
 use crate::walk::{Found, WalkOutcome, Walker};
 use crate::{Ruleset, WalkError};
+use chrome::{Chrome, Decor, Status};
 use keymap::action_for;
 use state::{Effect, Pending, View, plural};
 
@@ -113,6 +115,12 @@ pub struct Outcome {
     /// Targets a removal could not finish. **Not** the ones it refused: a refusal is the
     /// safety model working, which is exactly the distinction [`Removal::is_clean`] draws.
     pub failures: usize,
+    /// What the session actually got back, across every batch it ran.
+    ///
+    /// Not part of the exit status — a run that freed nothing is a perfectly whole run — but
+    /// it is the number the reader who walked away came back for, so it is what the window
+    /// title says once there is one. See [`Status::Freed`].
+    pub freed: u64,
 }
 
 impl Outcome {
@@ -130,20 +138,38 @@ impl Outcome {
 /// the two setup steps skips a cleanup that had not been written yet, and a `?` on the first
 /// cleanup step skips the second. Each flag is set the moment its state is genuinely entered,
 /// so [`Restore::finish`] and [`Drop`] both undo exactly what happened and nothing else.
-#[derive(Debug, Default)]
-struct Restore {
+///
+/// The [`Chrome`] is a **field** rather than a second guard beside this one, and that is the
+/// point of it being here: a window title, a taskbar bar and an open synchronized update are
+/// three more things a `?` can walk away from, and three guards that each undo a third of the
+/// terminal are three chances to miss one. One owner, one order — innermost first.
+#[derive(Debug)]
+struct Restore<W: Write> {
     raw: bool,
     alternate: bool,
+    chrome: Chrome<W>,
 }
 
-impl Restore {
+impl<W: Write> Restore<W> {
+    /// A guard that has taken nothing yet, holding the decorations it will hand back.
+    fn new(chrome: Chrome<W>) -> Self {
+        Self {
+            raw: false,
+            alternate: false,
+            chrome,
+        }
+    }
+
     /// Puts back what was taken, attempting **every** step and reporting the first refusal.
     ///
     /// `?` between the steps is the bug this replaces: a terminal that is out of raw mode and
     /// still on the alternate screen, or the other way round, is no better than one that was
     /// never restored, and the failing call says nothing about whether the next one would.
     fn finish(&mut self) -> io::Result<()> {
-        let mut first = Ok(());
+        // The decorations first: they were taken last, and the one that matters most —
+        // closing a synchronized update — is the difference between a terminal that repaints
+        // and one that shows a frozen frame forever.
+        let mut first = self.chrome.restore();
         if std::mem::take(&mut self.raw) {
             first = first.and(disable_raw_mode());
         }
@@ -154,7 +180,7 @@ impl Restore {
     }
 }
 
-impl Drop for Restore {
+impl<W: Write> Drop for Restore<W> {
     /// The path a `?` takes, and the one a panic takes. Nothing here can report a failure, so
     /// nothing here tries — [`Restore::finish`] is what the ordinary return calls.
     fn drop(&mut self) {
@@ -234,11 +260,14 @@ impl Events for Keyboard {
 /// itself succeeded, because a terminal left in raw mode is the one outcome a user cannot
 /// ignore and cannot easily undo.
 pub fn run(options: &Options, ruleset: Arc<Ruleset>) -> io::Result<Outcome> {
-    let mut restore = Restore::default();
+    // Detected once, from the environment and a `is_terminal`, and never probed for: see
+    // [`chrome`] for why nothing here asks the terminal a question it has to wait for.
+    let mut restore = Restore::new(Chrome::new(io::stdout(), Decor::detect()));
     enable_raw_mode()?;
     restore.raw = true;
     execute!(io::stdout(), EnterAlternateScreen)?;
     restore.alternate = true;
+    restore.chrome.enter()?;
 
     let mut terminal = Terminal::with_options(
         CrosstermBackend::new(io::stdout()),
@@ -246,7 +275,18 @@ pub fn run(options: &Options, ruleset: Arc<Ruleset>) -> io::Result<Outcome> {
             viewport: Viewport::Fullscreen,
         },
     )?;
-    let outcome = drive(&mut terminal, &mut Keyboard, options, ruleset);
+    let outcome = drive(
+        &mut terminal,
+        &mut Keyboard,
+        &mut restore.chrome,
+        options,
+        ruleset,
+    );
+    // The taskbar says how the run ended as well as how far it got. The reader who wanted a
+    // bar is by definition the one who is not watching the exit status go past.
+    if !outcome.as_ref().is_ok_and(Outcome::whole) {
+        restore.chrome.failed();
+    }
     // Cursor position is the terminal's business and the alternate screen swallowed it.
     let shown = terminal.show_cursor();
     let restored = restore.finish();
@@ -254,9 +294,10 @@ pub fn run(options: &Options, ruleset: Arc<Ruleset>) -> io::Result<Outcome> {
 }
 
 /// The event loop, with the terminal already set up.
-fn drive<B: ratatui::backend::Backend<Error = io::Error>>(
+fn drive<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
     terminal: &mut Terminal<B>,
     events: &mut dyn Events,
+    chrome: &mut Chrome<W>,
     options: &Options,
     ruleset: Arc<Ruleset>,
 ) -> io::Result<Outcome> {
@@ -268,12 +309,45 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>>(
     // Dropped at the end of this function however it ends — the bottom of the loop, a `?`, or
     // a panic — and dropping it waits for the removal. See [`Batch`].
     let mut batch = Batch::default();
+    // Two clocks rather than one, because either phase can finish while the other is running:
+    // a reader can mark and delete a subtree the moment it appears, long before the walk is
+    // over, and a scan timed from the start of the removal it overlapped would be a scan
+    // reported as having taken seconds.
+    let scan_since = Instant::now();
+    let mut batch_since = Instant::now();
+    let mut scanning = view.is_scanning();
+    let mut deleting = view.is_deleting();
 
     loop {
         drain(&mut view, &inbox, &mut outcome);
         reap(&mut view, &inbox, &mut outcome, batch.0.as_ref());
         view.sync();
-        terminal.draw(|frame| render::draw(frame, &mut view, &outcome.errors))?;
+
+        // A phase that has just ended is the only thing worth interrupting anybody for, and
+        // the chrome decides whether it is: long enough to matter, and nobody watching. Both
+        // of these mirror the view rather than being told separately when a phase begins —
+        // two records of one fact is how a notification ends up describing a removal that is
+        // still running.
+        if scanning && !view.is_scanning() {
+            chrome.announce(&scanned(&view), scan_since.elapsed())?;
+        }
+        if deleting && !view.is_deleting() {
+            // The footer's own sentence, so a notification can never describe a removal
+            // differently from the screen behind it.
+            let said = view.notice().unwrap_or("the removal finished").to_owned();
+            chrome.announce(&said, batch_since.elapsed())?;
+        }
+        scanning = view.is_scanning();
+        deleting = view.is_deleting();
+        chrome.show(Status::of(&view, outcome.freed))?;
+
+        chrome.begin_frame()?;
+        let drawn = terminal.draw(|frame| render::draw(frame, &mut view, &outcome.errors));
+        // Ended before the draw's failure is reported, never after: a terminal left inside a
+        // synchronized update keeps showing the frame before last, so a `?` here would trade
+        // a reported error for a screen that is silently frozen.
+        let ended = chrome.end_frame();
+        drawn.and(ended)?;
 
         // A quit that was held back while a removal ran, now that it is over. Checked here
         // rather than where the key was pressed, because what the key produced was a promise
@@ -285,10 +359,21 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>>(
             continue;
         }
         let event = events.read()?;
-        // A resize is not a keystroke and produces no action; the redraw above is the whole
-        // of what it needs.
-        if matches!(event, Event::Resize(..)) {
-            continue;
+        match &event {
+            // A resize is not a keystroke and produces no action; the redraw above is the
+            // whole of what it needs.
+            Event::Resize(..) => continue,
+            // Focus reporting was asked for by the chrome and is answered to it: it is the
+            // one thing that can tell a notification whether anybody is there to read it.
+            Event::FocusGained => {
+                chrome.focused(true);
+                continue;
+            }
+            Event::FocusLost => {
+                chrome.focused(false);
+                continue;
+            }
+            _ => {}
         }
         match view.apply(action_for(&event, view.overlay())) {
             Effect::None => {}
@@ -303,6 +388,7 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>>(
                 view.ask(Pending::of(&plan));
             }
             Effect::Delete(targets) => {
+                batch_since = Instant::now();
                 batch.takes_over(spawn_delete(options, targets, post.clone()));
             }
         }
@@ -355,6 +441,7 @@ fn drain(view: &mut View, inbox: &Receiver<Message>, outcome: &mut Outcome) {
             Ok(Message::Removed { path, complete }) => view.removed(&path, complete),
             Ok(Message::Deleted(removal)) => {
                 outcome.failures += removal.failures.len();
+                outcome.freed += removal.bytes_freed();
                 view.deleted(summarise(&removal));
             }
             // Disconnected as well as empty: the walk finishing drops its sender, and there
@@ -410,6 +497,19 @@ fn spawn_delete(options: &Options, targets: Vec<PathBuf>, post: Sender<Message>)
     })
 }
 
+/// One line about what the scan found, for the notification that says it is over.
+///
+/// The header's own numbers rather than a second phrasing of them: somebody who comes back to
+/// a notification and then looks at the screen has to be able to see the same run described.
+fn scanned(view: &View) -> String {
+    let total = view.total();
+    format!(
+        "{} reclaimable in {}",
+        human(total.bytes),
+        plural(total.claims, "directory", "directories")
+    )
+}
+
 /// One line about what a removal did, for the footer.
 ///
 /// Failures and refusals are named as counts rather than swallowed: a batch where half the
@@ -450,10 +550,11 @@ pub fn size_mode(asked: SizeMode) -> SizeMode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Batch, Message, Outcome, Restore, drain, reap, summarise};
+    use super::{Batch, Chrome, Decor, Message, Outcome, Restore, drain, reap, summarise};
     use crate::delete::{Failure, Refusal, Refused, Removal, Removed};
     use crate::fixture::priced;
     use crate::tree::Tree;
+    use crate::tui::chrome::XTERM_STACK;
     use crate::tui::state::View;
     use crate::walk::{Found, WalkError, WalkOutcome};
     use std::sync::mpsc::channel;
@@ -625,7 +726,7 @@ mod tests {
         // It really does call `disable_raw_mode` and leave the alternate screen, on a process
         // that is in neither state. Both are no-ops there, and the escape sequence goes to
         // the harness's captured stdout.
-        let mut restore = Restore::default();
+        let mut restore = Restore::new(Chrome::new(Vec::new(), Decor::silent()));
         assert!(restore.finish().is_ok(), "nothing was taken");
 
         restore.raw = true;
@@ -635,6 +736,39 @@ mod tests {
         assert!(
             !restore.alternate,
             "the alternate screen would be left twice"
+        );
+    }
+
+    #[test]
+    fn the_decorations_are_handed_back_by_the_same_guard_and_not_a_second_one() {
+        // The reason the chrome is a field of `Restore` rather than a guard beside it. What
+        // is asserted is that the ordinary way out and the drop path are one path: `finish`
+        // does the whole undoing, and `Drop` afterwards has nothing left to write.
+        let mut restore = Restore::new(Chrome::new(
+            Vec::new(),
+            Decor {
+                sync: true,
+                title: Some(XTERM_STACK),
+                progress: true,
+                notify: None,
+            },
+        ));
+        restore.chrome.enter().unwrap();
+        restore.chrome.begin_frame().unwrap();
+        restore.finish().unwrap();
+
+        let said = String::from_utf8(restore.chrome.sink().clone()).unwrap();
+        assert!(said.contains("\x1b[?2026l"), "a frozen screen: {said:?}");
+        assert!(said.contains("\x1b]9;4;0;0\x07"), "the bar was left up");
+        assert!(said.ends_with("\x1b[23;2t"), "the title was not put back");
+
+        // And this is exactly what `Drop` runs a moment later, on every path that returns
+        // through a `?`. Undoing it twice would pop a title this run never pushed.
+        restore.finish().unwrap();
+        assert_eq!(
+            restore.chrome.sink().len(),
+            said.len(),
+            "the undoing was written a second time"
         );
     }
 }
@@ -647,9 +781,10 @@ mod tests {
 /// seams, which is exactly why they are here.
 #[cfg(test)]
 mod loop_tests {
-    use super::{Events, Options, drive};
+    use super::{Chrome, Decor, Events, Options, drive};
     use crate::Ruleset;
     use crate::size::SizeMode;
+    use crate::tui::chrome::XTERM_STACK;
     use ratatui::Terminal;
     use ratatui::backend::{Backend, TestBackend, WindowSize};
     use ratatui::buffer::Cell;
@@ -824,6 +959,7 @@ mod loop_tests {
         let outcome = drive(
             &mut terminal,
             &mut keys,
+            &mut Chrome::new(Vec::new(), Decor::silent()),
             &Options {
                 root: tmp.path().to_path_buf(),
                 min_size: crate::DEFAULT_MIN_SIZE,
@@ -870,9 +1006,19 @@ mod loop_tests {
             at: 0,
         };
 
+        let mut chrome = Chrome::new(
+            Vec::new(),
+            Decor {
+                sync: true,
+                title: Some(XTERM_STACK),
+                progress: true,
+                notify: None,
+            },
+        );
         let outcome = drive(
             &mut terminal,
             &mut keys,
+            &mut chrome,
             &Options {
                 root: tmp.path().to_path_buf(),
                 min_size: crate::DEFAULT_MIN_SIZE,
@@ -890,5 +1036,29 @@ mod loop_tests {
             tmp.path().join("app/package.json").exists(),
             "too much went"
         );
+
+        // The decorations, through the real loop rather than through the chrome on its own.
+        // Balance is the property that matters: an update begun once more than it is ended is
+        // a terminal that stops repainting, and it is a *run*'s worth of frames that proves
+        // that rather than one call and its pair.
+        let said = String::from_utf8(chrome.sink().clone()).unwrap();
+        assert!(said.contains("\x1b[?2026h"), "nothing was ever wrapped");
+        // Counting the two halves would pass on a run that opened every frame and then closed
+        // them all at the end. What has to hold is that they alternate: one open, one close,
+        // never two of either in a row.
+        let mut open = 0i32;
+        for frame in said.split("\x1b[?2026").skip(1) {
+            match frame.as_bytes().first() {
+                Some(b'h') => open += 1,
+                Some(b'l') => open -= 1,
+                other => panic!("a private mode nobody wrote: {other:?}"),
+            }
+            assert!((0..=1).contains(&open), "the frames did not alternate");
+        }
+        assert_eq!(open, 0, "a frame was left open");
+        assert!(said.contains("\x1b]0;pristine — "), "{said:?}");
+        // The bar reaches 0 only when the guard restores it, which this test does not use, so
+        // what the run itself must not do is leave it at a percentage it never got to.
+        assert!(said.contains("\x1b]9;4;"), "no progress was ever reported");
     }
 }

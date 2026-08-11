@@ -606,6 +606,36 @@ fn a_run_whose_output_is_not_a_terminal_prints_the_listing_rather_than_opening_a
 }
 
 #[test]
+fn a_terminal_named_in_the_environment_does_not_get_decorations_written_into_a_pipe() {
+    let tmp = TempDir::new().unwrap();
+    write(&tmp.path().join("app/package.json"), 2);
+    write(&tmp.path().join("app/node_modules/dep/index.js"), OVER);
+
+    // The test above proves the listing carries no escapes on whatever machine ran it. This
+    // one names the most capable terminal there is — a synchronized update, a taskbar bar, a
+    // title and a notification are all things this environment says are available — and
+    // asserts the pipe wins anyway. Both facts are needed: the environment is what turns the
+    // decorations on, and it is inherited by every run in CI as easily as by one at a desk.
+    let piped = Command::new(env!("CARGO_BIN_EXE_pristine"))
+        .arg(tmp.path())
+        .env("TERM", "xterm-ghostty")
+        .env("TERM_PROGRAM", "ghostty")
+        .env("WT_SESSION", "1")
+        .output()
+        .unwrap();
+    assert!(piped.status.success());
+
+    let said = String::from_utf8_lossy(&piped.stdout);
+    assert!(said.contains("app/node_modules"), "{said}");
+    for stream in [&said, &String::from_utf8_lossy(&piped.stderr)] {
+        assert!(
+            !stream.contains('\u{1b}') && !stream.contains('\u{7}'),
+            "an escape or a bell reached a pipe: {stream:?}"
+        );
+    }
+}
+
+#[test]
 fn the_sweep_has_a_name_as_well_as_being_the_default() {
     let tmp = TempDir::new().unwrap();
     write(&tmp.path().join("app/package.json"), 2);
