@@ -4,8 +4,8 @@ A language-agnostic reclaimable-space finder and cleaner.
 
 `du` tells you where the bytes are. It cannot tell you which of them you are allowed to delete.
 pristine answers the second question: it finds build artifacts and vendored dependency directories
-across every ecosystem on the machine, shows you what each costs, and tells you the command that
-regenerates it before you decide.
+across every ecosystem on the machine, shows you what each costs, and names what each one is before
+you decide.
 
 `node_modules` is one ecosystem's answer to a question every ecosystem answers. The same disk is also
 carrying `target/`, `.venv/`, `bin/`, `obj/`, `_build/`, `.gradle/` and `vendor/`, all equally
@@ -41,11 +41,11 @@ drilled into on demand.
 
 ```
  /Users/agentender/repos  165.9 GiB reclaimable in 10599 directories
-directory                                            size ↓        age  how to get it back
+directory                                            size ↓        age  what it is
 [~] ▾ /Users/agentender/repos                     165.9 GiB         0h
 [~]   ▾ definitely-typed                           22.2 GiB        3mo
 [x]     ▸ types                                    21.8 GiB        3mo
-[ ]       node_modules                            320.3 MiB        3mo  pnpm install
+[ ]       node_modules                            320.3 MiB        3mo  Node Dependencies
 [x]     ▸ scripts                                  29.2 MiB        3mo
 [ ]   ▸ craigory-dev                               14.7 GiB         2h
 [ ]   ▸ brain                                      14.3 GiB         0h
@@ -101,10 +101,11 @@ script wants and what the rest of this section describes.
 
 ```console
 $ pristine ~/repos/pua > pua.txt
-  59.1 MiB  .nx                       no known way to regenerate this
-         —  dist                      nx reset, then rebuild
-         —  node_modules              pnpm install
-         —  target                    cargo build
+  59.1 MiB  .nx                       Gitignored, kind unknown
+         —  dist                      Nx Build Artifacts
+         —  docs-site/node_modules    Node Dependencies
+         —  node_modules              Node Dependencies
+         —  target                    Rust Build Artifacts
 
 5 directories reclaimable, 59.1 MiB priced, 4 not priced
 not priced: nothing looked inside. --breakdown prices every claim, --breakdown-under <PATH> just
@@ -163,8 +164,17 @@ holding a checkout. Outside a git work tree the tier is **inert**, and says so r
 reporting an empty result. With no repository the only signal left would be the directory's name,
 and a name is not evidence — guessing from one is how a cleaner deletes somebody's source.
 
-A tier-two hit reports that it does not know how to regenerate what it found. That asymmetry
-against tier one is the point: it tells you which deletions are cheap.
+A tier-one hit is named — the ecosystem it belongs to and what kind of directory it is, from a
+closed vocabulary of three: **Dependencies**, **Build Artifacts**, **Cache**. That is the fact that
+prices the decision without pretending to know your machine: a cache is free to lose, an output is a
+compile, dependencies are a network fetch. A tier-two hit says `Gitignored, kind unknown`, which is
+all it honestly knows. The asymmetry against a named row is the point: it tells you which deletions
+are cheap.
+
+There is deliberately no field for the command that rebuilds a directory. `npm install` is a guess
+about a package manager nothing checked — the repo may use pnpm or yarn — and half the ruleset could
+only fill that field in with a sentence ("rebuilt on the next import"), which is not a command
+anybody can run. A label is a fact; a rebuild command was two things at once and reliably neither.
 
 ## Two modes
 
