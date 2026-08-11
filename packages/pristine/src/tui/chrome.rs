@@ -605,8 +605,8 @@ mod tests {
     use crate::fixture::{hit, priced};
     use crate::size::Size;
     use crate::tree::Tree;
-    use crate::tui::keymap::Action;
-    use crate::tui::state::{Answer, Pending, View};
+    use crate::tui::keymap::{Action, Turn};
+    use crate::tui::state::{Planned, View};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -891,16 +891,19 @@ mod tests {
         view.found(priced("/scan/c/node_modules", 1024));
         view.found(priced("/scan/d/node_modules", 1024));
         view.scanned();
-        view.ask(Pending {
-            targets: ["a", "b", "c", "d"]
+        view.asking(
+            &["a", "b", "c", "d"]
                 .iter()
-                .map(|name| PathBuf::from(format!("/scan/{name}/node_modules")))
-                .collect(),
-            bytes: 4096,
-            unpriced: 0,
-            kept: Vec::new(),
-            answer: Answer::Delete,
-        });
+                .map(|name| {
+                    Planned::at(
+                        PathBuf::from(format!("/scan/{name}/node_modules")),
+                        Size::Measured(1024),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            &[],
+        );
+        view.apply(Action::Highlight(Turn::Next));
         view.apply(Action::Answer);
 
         // A bar rather than the indeterminate throbber the walk gets: the denominator was

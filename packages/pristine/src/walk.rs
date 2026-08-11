@@ -36,7 +36,7 @@ use ignore::{DirEntry, WalkBuilder, WalkState};
 
 use crate::detect::Detector;
 use crate::fallback::{DEFAULT_MIN_SIZE, Fallback, FallbackReport};
-use crate::rules::{Rule, Ruleset};
+use crate::rules::{Kind, Rule, Ruleset};
 use crate::size::{Measurer, Size, SizeMode};
 use crate::tree::Tree;
 
@@ -113,6 +113,16 @@ impl Hit {
             Claim::Rule(claim) => Cow::Owned(claim.rule.label()),
             Claim::Ignored(_) => Cow::Borrowed(UNLABELLED),
         }
+    }
+
+    /// What kind of artefact this is, or `None` when only git knows the directory at all.
+    ///
+    /// The half of a label a machine can act on, which is what the closed vocabulary bought:
+    /// "show me every cache" is a question the front end can answer, and the `None` is not a
+    /// gap to be filled in but the tier-two claim's own content — see [`IgnoredClaim`].
+    #[must_use]
+    pub fn kind(&self) -> Option<Kind> {
+        self.rule().map(|rule| rule.kind)
     }
 
     /// The rule that claimed this directory, or `None` when no rule did.

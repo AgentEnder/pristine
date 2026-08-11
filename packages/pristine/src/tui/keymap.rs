@@ -156,6 +156,13 @@ pub enum Action {
     ScrollRows(Motion),
     /// `/` — open the filter prompt.
     OpenFilter,
+    /// `f` `F` — the next named view, or the one before.
+    ///
+    /// A view is the two axes of [`super::lens`] together, and this key walks the presets over
+    /// them. Deliberately **not** a key that changes the selection: what is marked is
+    /// independent of what is visible, and the whole point of the pair is that a reader can
+    /// narrow the screen without narrowing what they are about to delete.
+    CyclePreset(Turn),
     /// A printable character, while the prompt has it.
     ///
     /// **Not in [`KEYMAP`]**, and it could not be: it stands for every character a terminal
@@ -189,6 +196,17 @@ pub enum Action {
     Answer,
     /// `↑` `↓` inside the help overlay.
     Scroll(Motion),
+    /// `↑` `↓` on a confirmation — move down the batch it is listing.
+    ///
+    /// Distinct from [`Scroll`](Self::Scroll), which moves a document with no cursor in it:
+    /// here the line under the cursor is a directory, and [`Spare`](Self::Spare) acts on it.
+    Listing(Motion),
+    /// `space` on a confirmation — take the highlighted directory out of the batch.
+    ///
+    /// The tree's own mark key, on the one screen where a reader can see everything they
+    /// marked at once. It is what makes the listing an answer to a surprise rather than a
+    /// notification of one.
+    Spare,
     /// A key with no meaning here, or a resize. Any event redraws, so this is genuinely
     /// nothing — the resize included, which needs only the frame.
     Ignore,
@@ -494,6 +512,18 @@ fn tree_verbs() -> Vec<Binding> {
             "show or hide the map beside the tree",
             Action::ToggleMap,
         ),
+        bind(
+            Tree,
+            &[key('f')],
+            "the next view: all, named, dependencies, gitignored",
+            Action::CyclePreset(Turn::Next),
+        ),
+        bind(
+            Tree,
+            &[key('F')],
+            "the view before it",
+            Action::CyclePreset(Turn::Prev),
+        ),
         bind(Tree, &[key('s')], "the next sort key", Action::CycleSort),
         bind(
             Tree,
@@ -659,6 +689,53 @@ fn confirm_keys() -> Vec<Binding> {
             &[Chord::plain(KeyCode::Enter)],
             "answer with the highlighted one",
             Action::Answer,
+        ),
+        // ---- and the batch it is listing -----------------------------
+        //
+        // `↑`/`↓` rather than `←`/`→`, which are the answers: the two are a list and a pair of
+        // buttons, and a modal that made one key mean both would be worst in the one place a
+        // reader is being asked to be careful.
+        bind(
+            Confirm,
+            &[Chord::plain(KeyCode::Up), key('k')],
+            "up the batch it is listing",
+            Action::Listing(Motion::Up),
+        ),
+        bind(
+            Confirm,
+            &[Chord::plain(KeyCode::Down), key('j')],
+            "down the batch",
+            Action::Listing(Motion::Down),
+        ),
+        bind(
+            Confirm,
+            &[Chord::plain(KeyCode::PageUp)],
+            "up a page of it",
+            Action::Listing(Motion::PageUp),
+        ),
+        bind(
+            Confirm,
+            &[Chord::plain(KeyCode::PageDown)],
+            "down a page",
+            Action::Listing(Motion::PageDown),
+        ),
+        bind(
+            Confirm,
+            &[Chord::plain(KeyCode::Home), key('g')],
+            "to the first entry",
+            Action::Listing(Motion::Top),
+        ),
+        bind(
+            Confirm,
+            &[Chord::plain(KeyCode::End), key('G')],
+            "to the last",
+            Action::Listing(Motion::Bottom),
+        ),
+        bind(
+            Confirm,
+            &[key(' ')],
+            "take the highlighted directory out of the batch",
+            Action::Spare,
         ),
     ]
 }
@@ -1010,6 +1087,17 @@ static POINTER: LazyLock<Vec<Pointing>> = LazyLock::new(|| {
             "scroll the page",
             scroll_page,
         ),
+        // A confirmation used to be eight static lines, and a wheel over it was rightly
+        // nothing: it is not a way past something that swallowed the keyboard. It now lists
+        // the whole batch, which is a document with a cursor in it, and a list nothing can
+        // scroll while everything beside it scrolls is a list a reader will believe is short.
+        point(
+            Gesture::Wheel(Motion::Down),
+            &[Target::Question, Target::Answer],
+            "a confirmation",
+            "move down the batch it is listing",
+            walk_listing,
+        ),
     ]
 });
 
@@ -1118,6 +1206,10 @@ fn scroll_rows(gesture: Gesture, _: Spot) -> Action {
 
 fn scroll_page(gesture: Gesture, _: Spot) -> Action {
     gesture.motion().map_or(Action::Ignore, Action::Scroll)
+}
+
+fn walk_listing(gesture: Gesture, _: Spot) -> Action {
+    gesture.motion().map_or(Action::Ignore, Action::Listing)
 }
 
 /// The help page, as headed groups of `(keys, sentence)`.
@@ -1496,13 +1588,21 @@ mod tests {
             pointer(Gesture::Wheel(Motion::Down), Spot::Help),
             Action::Scroll(Motion::Down)
         );
-        for spot in [Spot::Confirm, Spot::Answer(Answer::Delete), Spot::Nowhere] {
+        // Over a confirmation it moves down the batch the box is listing. That is not a way
+        // past something that swallowed the keyboard — the answers are untouched — it is the
+        // one verb a list of eight thousand directories has, and a list nothing can scroll
+        // while everything beside it scrolls is a list a reader will believe is short.
+        for spot in [Spot::Confirm, Spot::Answer(Answer::Delete)] {
             assert_eq!(
                 pointer(Gesture::Wheel(Motion::Down), spot),
-                Action::Ignore,
+                Action::Listing(Motion::Down),
                 "{spot:?}"
             );
         }
+        assert_eq!(
+            pointer(Gesture::Wheel(Motion::Down), Spot::Nowhere),
+            Action::Ignore
+        );
     }
 
     #[test]

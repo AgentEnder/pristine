@@ -63,6 +63,7 @@
 
 pub mod chrome;
 pub mod keymap;
+pub mod lens;
 pub mod moving;
 pub mod render;
 pub mod state;
@@ -93,7 +94,7 @@ use crate::{Ruleset, WalkError};
 use chrome::{Chrome, Decor, Status};
 use keymap::{Action, Gesture, Motion, action_for, finish};
 use render::{Placed, Spot};
-use state::{Effect, Pending, View, plural};
+use state::{Effect, View, plural};
 use treemap::{Pane, Screen};
 
 /// How long the loop waits on the terminal before repainting anyway.
@@ -619,7 +620,7 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
                     .one_file_system(options.one_file_system)
                     .older_than(options.older_than)
                     .plan(targets);
-                view.ask(Pending::of(&plan));
+                view.ask(&plan);
             }
             Effect::Delete(targets) => {
                 batch_since = Instant::now();
