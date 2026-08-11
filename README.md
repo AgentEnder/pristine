@@ -11,19 +11,18 @@ regenerates it before you decide.
 carrying `target/`, `.venv/`, `bin/`, `obj/`, `_build/`, `.gradle/` and `vendor/`, all equally
 reclaimable and all invisible to a tool that only knows about npm.
 
-> **Status: early.** The parallel walker, both detection tiers, the deleter and both modes work
-> and are tested. The rollup tree TUI does not exist yet, so in the sweep there is nothing to
-> select with: `--delete` means everything the scan found. The design is settled and lives outside
-> this repo.
+> **Status: early.** The parallel walker, both detection tiers, the deleter, both modes and the
+> rollup tree all work and are tested. Not published yet. The design lives outside this repo.
 
 ## Using it
 
 ```sh
-pristine ~/repos                       # list what is reclaimable, and what regenerates each
-pristine ~/repos --breakdown           # ...and what each one is worth, by walking every one
+pristine ~/repos                       # the rollup tree: drill in, mark subtrees, delete
+pristine ~/repos > out.txt             # not a terminal, so the listing instead
+pristine ~/repos --no-tui              # ...or ask for the listing at a terminal
+pristine ~/repos --breakdown           # the listing, with a number on every claim
 pristine ~/repos --breakdown-under ~/repos/nx    # ...or one subtree, at that subtree's price
 pristine ~/repos --dry-run             # the plan it would execute, and what it would refuse
-pristine ~/repos --delete              # the same plan, then a confirmation that defaults to no
 pristine ~/repos --delete --yes --older-than 30d
 
 pristine repo                          # one checkout: ask what to clean, then clean it
@@ -31,8 +30,61 @@ pristine repo --untracked --ignored --dry-run
 pristine repo --reset=hard --untracked --ignored --yes
 ```
 
+`pristine sweep ~/repos` is the same thing as `pristine ~/repos`, spelled out for when it stands
+next to `pristine repo`.
+
+## The tree
+
+At a terminal, `pristine <path>` opens the filesystem tree with **reclaimable bytes rolled up into
+every ancestor** — pruned to the paths that lead somewhere reclaimable, collapsed by default,
+drilled into on demand.
+
+```
+ /Users/agentender/repos  165.9 GiB reclaimable in 10599 directories
+[~] ▾ /Users/agentender/repos                     165.9 GiB         0h
+[~]   ▾ definitely-typed                           22.2 GiB        3mo
+[x]     ▸ types                                    21.8 GiB        3mo
+[ ]       node_modules                            320.3 MiB        3mo  pnpm install
+[x]     ▸ scripts                                  29.2 MiB        3mo
+[ ]   ▸ craigory-dev                               14.7 GiB         2h
+[ ]   ▸ brain                                      14.3 GiB         0h
+[ ]   ▸ nx                                         14.0 GiB         4h
+[ ]   ▸ oss-secrets-requestor                      10.8 GiB        10d
+ marked 21.9 GiB in 9092 directories · space mark · x delete · / filter · s sort (size) · ? help
+```
+
+A row's number is not "how big is this directory" — that is `du`'s question — but **"how much do I
+get back by emptying this subtree"**. A directory with nothing reclaimable under it never appears.
+
+That is what the marker on `types` is worth: **one keystroke, 9,092 directories, 21.8 GiB**, on a
+row that is still closed. Every other tool in this space is a flat list or a prompt, so the same
+selection is 9,092 decisions — which is why kondo's own README describes it as "essentially
+`rm -rf` with a prompt", and why npkill grew a range-select that is a tree approximated without
+one.
+
+- `space` marks a row's whole subtree. An ancestor shows `[~]` when only part of it is marked, and
+  unmarking one row out of a marked subtree spares just that row.
+- Rows appear as the walk finds them, and prices land behind them. Marking a directory marks
+  whatever arrives under it afterwards, because a mark is a statement about a subtree rather than
+  about the rows that happened to exist when you pressed the key.
+- `x` deletes what is marked, after a confirmation that opens on **cancel**. Rows disappear one at
+  a time as the deleter finishes each target, and the cursor follows the *directory* it was on
+  rather than the row number — a target that could not be finished keeps its row.
+- Sorting is per level, because children have to stay under their parent. `/` filters on a regex
+  over the whole path, and a filtered row's number counts only what the filter shows, so a mark
+  can never delete what you cannot see.
+- `?` lists every key, generated from the keymap rather than maintained beside it.
+
+The keys are deliberately close to [pua](https://github.com/AgentEnder/pua)'s, which is the same
+shape of tool pointed at processes.
+
+## The listing
+
+Send the output anywhere but a terminal and you get the flat listing instead, which is what a
+script wants and what the rest of this section describes.
+
 ```console
-$ pristine ~/repos/pua
+$ pristine ~/repos/pua > pua.txt
   59.1 MiB  .nx                       no known way to regenerate this
          —  dist                      nx reset, then rebuild
          —  node_modules              pnpm install
@@ -63,8 +115,10 @@ that repository. It is how you ask "how much is in *here*" without paying for ev
 Pricing does not hold the scan up. Claims are published as they are found and a pool of threads
 prices them behind, so on that same tree the last row is known at 7.5 s while the numbers keep
 landing for another minute. Measured on the walker thread instead, the last row does not exist
-until 60.1 s — nothing to show, for the whole run. This command line still waits, because it
-sorts by size and paints once; the point of the split is the TUI, which will not.
+until 60.1 s — nothing to show, for the whole run. This listing still waits, because it sorts by
+size and paints once. **The tree is what the split was for**, which is also why the tree prices
+everything by default and the listing does not: unpriced, a rollup has nothing to roll up, and a
+tree of dashes answers no question at all.
 
 A scan that could not read everything it was pointed at says `scan incomplete` and exits
 non-zero, so a listing that is a lower bound never looks — to a script — like the whole truth.
