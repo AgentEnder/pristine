@@ -162,6 +162,70 @@ impl Drop for Restore {
     }
 }
 
+/// The removal thread, joined however the loop ends.
+///
+/// A guard rather than a `join` at the bottom of the loop, and the difference is every exit
+/// that is not the bottom of the loop: a draw that fails, a terminal that stops answering, a
+/// panic. Each of those returns through a `?` that no amount of care at the end can catch, and
+/// what it abandons is a thread half way through unlinking a directory tree the reader
+/// confirmed. Leaving `main` then kills it mid-batch — the same hazard `q` had, reached by a
+/// path nobody presses.
+///
+/// So there is no bare [`JoinHandle`] anywhere in the loop. Owning one *is* the guarantee.
+#[derive(Default)]
+struct Batch(Option<JoinHandle<()>>);
+
+impl Batch {
+    /// Takes over from whatever ran before, which the view guarantees has finished — joined
+    /// rather than dropped anyway, because dropping a handle detaches it and detaching is the
+    /// whole bug.
+    fn takes_over(&mut self, removal: JoinHandle<()>) {
+        self.join();
+        self.0 = Some(removal);
+    }
+
+    /// Waits for the removal, if there is one. A failure to join is a thread that panicked,
+    /// which the loop already learns about from `reap` — there is nothing to do here but stop
+    /// waiting.
+    fn join(&mut self) {
+        if let Some(removal) = self.0.take() {
+            let _ = removal.join();
+        }
+    }
+}
+
+impl Drop for Batch {
+    fn drop(&mut self) {
+        self.join();
+    }
+}
+
+/// Where keystrokes come from.
+///
+/// A seam with exactly one implementation in the shipped binary, and it exists so the event
+/// loop can be tested at all: the guarantees worth having here are about what happens when a
+/// *terminal* fails half way through a removal, and a test cannot press a key on a real one.
+trait Events {
+    /// Whether an event is waiting, within `timeout`.
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
+
+    /// The next event. Only called once [`Events::poll`] has said there is one.
+    fn read(&mut self) -> io::Result<Event>;
+}
+
+/// The real terminal.
+struct Keyboard;
+
+impl Events for Keyboard {
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+        event::poll(timeout)
+    }
+
+    fn read(&mut self) -> io::Result<Event> {
+        event::read()
+    }
+}
+
 /// Runs the view until the reader quits, then puts the terminal back.
 ///
 /// # Errors
@@ -182,7 +246,7 @@ pub fn run(options: &Options, ruleset: Arc<Ruleset>) -> io::Result<Outcome> {
             viewport: Viewport::Fullscreen,
         },
     )?;
-    let outcome = drive(&mut terminal, options, ruleset);
+    let outcome = drive(&mut terminal, &mut Keyboard, options, ruleset);
     // Cursor position is the terminal's business and the alternate screen swallowed it.
     let shown = terminal.show_cursor();
     let restored = restore.finish();
@@ -192,6 +256,7 @@ pub fn run(options: &Options, ruleset: Arc<Ruleset>) -> io::Result<Outcome> {
 /// The event loop, with the terminal already set up.
 fn drive<B: ratatui::backend::Backend<Error = io::Error>>(
     terminal: &mut Terminal<B>,
+    events: &mut dyn Events,
     options: &Options,
     ruleset: Arc<Ruleset>,
 ) -> io::Result<Outcome> {
@@ -200,11 +265,13 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>>(
 
     let walker = spawn_walk(options, ruleset, post.clone());
     let mut outcome = Outcome::default();
-    let mut deleter: Option<JoinHandle<()>> = None;
+    // Dropped at the end of this function however it ends — the bottom of the loop, a `?`, or
+    // a panic — and dropping it waits for the removal. See [`Batch`].
+    let mut batch = Batch::default();
 
     loop {
         drain(&mut view, &inbox, &mut outcome);
-        reap(&mut view, &inbox, &mut outcome, deleter.as_ref());
+        reap(&mut view, &inbox, &mut outcome, batch.0.as_ref());
         view.sync();
         terminal.draw(|frame| render::draw(frame, &mut view, &outcome.errors))?;
 
@@ -214,10 +281,10 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>>(
         if view.wants_to_quit() {
             break;
         }
-        if !event::poll(TICK)? {
+        if !events.poll(TICK)? {
             continue;
         }
-        let event = event::read()?;
+        let event = events.read()?;
         // A resize is not a keystroke and produces no action; the redraw above is the whole
         // of what it needs.
         if matches!(event, Event::Resize(..)) {
@@ -228,24 +295,19 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>>(
             // Only ever reached with nothing in flight: the view holds a quit back while it
             // is deleting, and hands it over through `wants_to_quit` instead.
             Effect::Quit => break,
-            Effect::Plan(batch) => {
+            Effect::Plan(targets) => {
                 let plan = Planner::new(&options.root)
                     .one_file_system(options.one_file_system)
                     .older_than(options.older_than)
-                    .plan(batch);
+                    .plan(targets);
                 view.ask(Pending::of(&plan));
             }
-            Effect::Delete(targets) => deleter = Some(spawn_delete(options, targets, post.clone())),
+            Effect::Delete(targets) => {
+                batch.takes_over(spawn_delete(options, targets, post.clone()));
+            }
         }
     }
 
-    // The removal is over by the time the loop breaks — that is what the view guarantees —
-    // but the thread that ran it has not necessarily been reaped, and leaving `main` would
-    // take it with us either way. Joining is what makes "the batch finished" true rather than
-    // merely likely.
-    if let Some(deleter) = deleter {
-        let _ = deleter.join();
-    }
     // The walk holds a `Sender`; dropping ours and letting the thread finish is what stops a
     // half-written frame from being the last thing on the screen. It is deliberately NOT
     // joined, where the removal is: a walk reads, so abandoning one costs nothing, and a
@@ -388,7 +450,7 @@ pub fn size_mode(asked: SizeMode) -> SizeMode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Message, Outcome, Restore, drain, reap, summarise};
+    use super::{Batch, Message, Outcome, Restore, drain, reap, summarise};
     use crate::delete::{Failure, Refusal, Refused, Removal, Removed};
     use crate::fixture::priced;
     use crate::tree::Tree;
@@ -513,6 +575,27 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_waits_for_its_removal_however_the_scope_ends() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker = Arc::clone(&finished);
+        {
+            let mut batch = Batch::default();
+            batch.takes_over(std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                worker.store(true, Ordering::SeqCst);
+            }));
+            // …and here the scope ends, which is what a `?`, a `break` and a panic all do.
+        }
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the removal was abandoned rather than waited for"
+        );
+    }
+
+    #[test]
     fn a_summary_names_what_was_left_behind_as_well_as_what_went() {
         let removal = Removal {
             removed: vec![removed("/scan/a/target")],
@@ -552,6 +635,260 @@ mod tests {
         assert!(
             !restore.alternate,
             "the alternate screen would be left twice"
+        );
+    }
+}
+
+/// Driving the event loop itself, which needs a terminal that can be made to fail and a
+/// keyboard that can be made to type.
+///
+/// The findings this exists for were all in the loop, and all of the same shape: an exit the
+/// happy path does not take. There is no way to reach one from outside without these two
+/// seams, which is exactly why they are here.
+#[cfg(test)]
+mod loop_tests {
+    use super::{Events, Options, drive};
+    use crate::Ruleset;
+    use crate::size::SizeMode;
+    use ratatui::Terminal;
+    use ratatui::backend::{Backend, TestBackend, WindowSize};
+    use ratatui::buffer::Cell;
+    use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::layout::{Position, Size};
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    /// A result from a backend that cannot fail, in the shape of one that can.
+    fn never<T>(result: Result<T, std::convert::Infallible>) -> io::Result<T> {
+        result.map_err(|never| match never {})
+    }
+
+    /// A terminal that stops working the moment something else says so.
+    ///
+    /// Every method delegates; only `draw` reads the flag. That is the narrowest injection
+    /// that reaches the `?` under test, and it is a real `io::Error` on the real code path
+    /// rather than a branch added for the test.
+    struct Flaky {
+        inner: TestBackend,
+        broken: Arc<AtomicBool>,
+    }
+
+    impl Backend for Flaky {
+        type Error = io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            if self.broken.load(Ordering::SeqCst) {
+                return Err(io::Error::other("the terminal went away"));
+            }
+            never(self.inner.draw(content))
+        }
+
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            never(self.inner.hide_cursor())
+        }
+
+        fn show_cursor(&mut self) -> io::Result<()> {
+            never(self.inner.show_cursor())
+        }
+
+        fn get_cursor_position(&mut self) -> io::Result<Position> {
+            never(self.inner.get_cursor_position())
+        }
+
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+            never(self.inner.set_cursor_position(position))
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            never(self.inner.clear())
+        }
+
+        fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> io::Result<()> {
+            never(self.inner.clear_region(clear_type))
+        }
+
+        fn size(&self) -> io::Result<Size> {
+            never(self.inner.size())
+        }
+
+        fn window_size(&mut self) -> io::Result<WindowSize> {
+            never(self.inner.window_size())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            never(self.inner.flush())
+        }
+    }
+
+    /// A keyboard that types the same short phrase over and over.
+    ///
+    /// Repeated rather than sequenced because the loop and the walk are concurrent: the row
+    /// to mark does not exist until the walker finds it, and a script that fired once would
+    /// be racing that. Every key in this cycle is harmless before it is useful — `x` with an
+    /// empty batch says "nothing is marked", and `→`/`Enter` on a childless row do nothing.
+    struct Script {
+        keys: Vec<KeyCode>,
+        at: usize,
+    }
+
+    impl Events for Script {
+        fn poll(&mut self, _timeout: Duration) -> io::Result<bool> {
+            Ok(true)
+        }
+
+        fn read(&mut self) -> io::Result<Event> {
+            let code = self.keys[self.at % self.keys.len()];
+            self.at += 1;
+            Ok(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+        }
+    }
+
+    fn files_under(dir: &Path) -> usize {
+        let mut count = 0;
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(at) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&at) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    stack.push(entry.path());
+                } else {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// A project whose `node_modules` takes long enough to remove that a failure can land in
+    /// the middle of it.
+    fn fixture() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("app/node_modules");
+        std::fs::create_dir_all(tmp.path().join("app")).unwrap();
+        std::fs::write(tmp.path().join("app/package.json"), "{}").unwrap();
+        for n in 0..40 {
+            let dir = target.join(format!("p{n}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in 0..50 {
+                std::fs::write(dir.join(format!("f{f}.js")), "x").unwrap();
+            }
+        }
+        (tmp, target)
+    }
+
+    #[test]
+    fn a_terminal_that_fails_mid_removal_still_waits_for_the_batch() {
+        let (tmp, target) = fixture();
+        let whole = files_under(&target);
+        assert_eq!(whole, 2000);
+
+        let broken = Arc::new(AtomicBool::new(false));
+        // Breaks the terminal as soon as the removal is *demonstrably* under way — a real
+        // condition rather than a sleep, and the exact moment the finding is about.
+        let arming = Arc::clone(&broken);
+        let counting = target.clone();
+        let watcher = std::thread::spawn(move || {
+            while files_under(&counting) == whole {
+                std::thread::yield_now();
+            }
+            arming.store(true, Ordering::SeqCst);
+        });
+
+        let mut terminal = Terminal::new(Flaky {
+            inner: TestBackend::new(100, 24),
+            broken: Arc::clone(&broken),
+        })
+        .unwrap();
+        // Mark the scan root, then ask-highlight-confirm, on repeat. The root row exists from
+        // the first frame, and a mark on it covers whatever the walk finds underneath —
+        // which is the streaming property doing the test's synchronisation for it.
+        let mut keys = Script {
+            keys: vec![
+                KeyCode::Char(' '),
+                KeyCode::Char('x'),
+                KeyCode::Right,
+                KeyCode::Enter,
+            ],
+            at: 0,
+        };
+
+        let outcome = drive(
+            &mut terminal,
+            &mut keys,
+            &Options {
+                root: tmp.path().to_path_buf(),
+                min_size: crate::DEFAULT_MIN_SIZE,
+                size_mode: SizeMode::Skip,
+                one_file_system: true,
+                older_than: None,
+            },
+            Arc::new(Ruleset::builtin().unwrap()),
+        );
+        watcher.join().unwrap();
+
+        // The loop left through a `?`, which is the path that used to abandon the thread…
+        assert!(outcome.is_err(), "the terminal was supposed to fail");
+        // …and the batch the reader confirmed is finished rather than half done. Without the
+        // join this is 2,000 files minus however many fitted into a few microseconds.
+        assert!(
+            !target.exists(),
+            "{} survived a removal that was abandoned",
+            target.display()
+        );
+    }
+
+    #[test]
+    fn a_marked_batch_is_removed_through_the_real_loop() {
+        // The same machinery, ending the ordinary way: it is worth one test that the keys, the
+        // planner and the deleter meet correctly, because everything else about the loop is
+        // asserted through the pieces.
+        let (tmp, target) = fixture();
+        // The same wrapper with the flag never set — a terminal that works, whose `Error` is
+        // the `io::Error` the loop is written against.
+        let mut terminal = Terminal::new(Flaky {
+            inner: TestBackend::new(100, 24),
+            broken: Arc::new(AtomicBool::new(false)),
+        })
+        .unwrap();
+        let mut keys = Script {
+            keys: vec![
+                KeyCode::Char(' '),
+                KeyCode::Char('x'),
+                KeyCode::Right,
+                KeyCode::Enter,
+                KeyCode::Char('q'),
+            ],
+            at: 0,
+        };
+
+        let outcome = drive(
+            &mut terminal,
+            &mut keys,
+            &Options {
+                root: tmp.path().to_path_buf(),
+                min_size: crate::DEFAULT_MIN_SIZE,
+                size_mode: SizeMode::Skip,
+                one_file_system: true,
+                older_than: None,
+            },
+            Arc::new(Ruleset::builtin().unwrap()),
+        )
+        .unwrap();
+
+        assert!(!target.exists(), "nothing was removed");
+        assert!(outcome.whole(), "{outcome:?}");
+        assert!(
+            tmp.path().join("app/package.json").exists(),
+            "too much went"
         );
     }
 }
