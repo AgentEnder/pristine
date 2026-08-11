@@ -59,9 +59,10 @@ use std::time::Duration;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use pristine::delete::confirm;
 use pristine::repo::{Class, Repo, Reset, Selected, Selection};
+use pristine::size::human;
 use pristine::{
     DEFAULT_MIN_SIZE, Deleter, Enumeration, FallbackReport, Found, Hit, Plan, Planner, Removal,
-    Ruleset, Size, SizeMode, Target, WalkOutcome, Walker,
+    Ruleset, SizeMode, Target, WalkOutcome, Walker,
 };
 
 /// A language-agnostic reclaimable-space finder and cleaner.
@@ -771,7 +772,7 @@ fn row(hit: &Hit, root: &Path) -> String {
     );
     format!(
         "{:>10}  {:<60}  {regenerate}",
-        size(hit.size),
+        hit.size.label(),
         path.display()
     )
 }
@@ -851,7 +852,7 @@ fn write_plan(out: &mut impl Write, plan: &Plan, unit: Noun) -> std::io::Result<
     let root = plan.root();
     for target in plan.targets() {
         let path = target.path.strip_prefix(root).unwrap_or(&target.path);
-        writeln!(out, "{:>10}  {}", size(target.size), path.display())?;
+        writeln!(out, "{:>10}  {}", target.size.label(), path.display())?;
     }
     writeln!(
         out,
@@ -950,35 +951,6 @@ const WORK_TREE: Noun = ("work tree", "work trees");
 
 fn plural(count: usize, (one, many): Noun) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
-}
-
-/// A claim's size, or a dash when nothing has looked. Not zero and not an error: measuring a
-/// tier-one claim means enumerating the subtree the scan deliberately pruned at.
-fn size(size: Size) -> String {
-    match size {
-        Size::Measured(bytes) => human(bytes),
-        Size::Unmeasured => "—".to_owned(),
-    }
-}
-
-/// Bytes in the units a person reads, binary because that is what the sizes are.
-fn human(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "a display rounded to one decimal place has none to lose"
-    )]
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
 }
 
 /// A size as a person writes one.

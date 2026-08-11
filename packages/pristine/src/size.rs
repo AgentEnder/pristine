@@ -65,6 +65,44 @@ impl Size {
             Self::Measured(bytes) => Some(bytes),
         }
     }
+
+    /// What a person reads: a size, or a dash when nothing has looked.
+    ///
+    /// Not zero and not an error. Measuring a tier-one claim means enumerating the subtree the
+    /// scan deliberately pruned at, so "no number yet" is the ordinary state of a claim rather
+    /// than a fault — and a row of dashes has to be legible as *unpriced* rather than as
+    /// empty, in the listing and in the tree alike.
+    #[must_use]
+    pub fn label(self) -> String {
+        match self {
+            Self::Measured(bytes) => human(bytes),
+            Self::Unmeasured => UNPRICED.to_owned(),
+        }
+    }
+}
+
+/// What an unpriced row shows instead of a number.
+pub const UNPRICED: &str = "—";
+
+/// Bytes in the units a person reads, binary because that is what the sizes are.
+#[must_use]
+pub fn human(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a display rounded to one decimal place has none to lose"
+    )]
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 /// How much work a scan may do to size what it claims.
@@ -84,8 +122,8 @@ pub enum SizeMode {
     /// makes the number reachable at a price the user chooses: pay for the one subtree in
     /// question and leave the rest reading `Unmeasured`, which it already was.
     ///
-    /// It is also the shape the TUI needs. Drilling into a node is exactly a request to price
-    /// that subtree, and this is the mode a re-price of it runs under.
+    /// It is also what `--breakdown-under` hands the tree: a reader who wants one subtree
+    /// priced and the rest left alone gets exactly that, and every other row keeps its dash.
     ///
     /// The scope has to be spelled the way the walk spells its hits — the scan root's own
     /// prefix and all — because the comparison is by path. Anchoring it is the caller's job;
