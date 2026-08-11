@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use pristine::{Deleter, Plan, Planner, Refusal, Removed, Target};
+use pristine::{Deleter, Freeing, Plan, Planner, Refusal, Removed, Step, Target};
 use tempfile::TempDir;
 
 /// Creates `path` and every parent, then writes `bytes` bytes of filler into it.
@@ -824,7 +824,11 @@ fn a_watcher_is_told_about_each_target_as_it_finishes_and_is_told_the_same_thing
     let watched = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&watched);
     let removal = Deleter::new()
-        .watching(move |removed| sink.lock().unwrap().push(removed.clone()))
+        .watching(move |step| {
+            if let Step::Finished(removed) = step {
+                sink.lock().unwrap().push(removed.clone());
+            }
+        })
         .remove(&plan_for(&base, &targets));
 
     // The live view drops a row on each of these, and the report printed afterwards lists
@@ -840,6 +844,146 @@ fn a_watcher_is_told_about_each_target_as_it_finishes_and_is_told_the_same_thing
 }
 
 #[test]
+fn a_watcher_is_told_how_far_a_target_has_got_while_it_is_still_going() {
+    // The event a row's number falls on. Without it the front end knows only that a directory
+    // has already gone, and anything it draws between the keystroke and that moment is an
+    // animation over a fact rather than a report of one.
+    let (_tmp, base) = fixture();
+    let target = base.join("app/node_modules");
+    for pkg in 0..40 {
+        for file in 0..50 {
+            write(&target.join(format!("p{pkg}/f{file}.js")), 1024);
+        }
+    }
+
+    let steps = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&steps);
+    let removal = Deleter::new()
+        .threads(1)
+        .watching(move |step| sink.lock().unwrap().push(step.clone()))
+        .remove(&plan_for(&base, std::slice::from_ref(&target)));
+
+    let steps = steps.lock().unwrap();
+    let progress: Vec<&Freeing> = steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::Freeing(freeing) => Some(freeing),
+            Step::Finished(_) | Step::Swept(_) => None,
+        })
+        .collect();
+
+    // 2,000 files at 64 entries apiece, so a target worth watching reports many times over —
+    // enough for a 30fps view to draw a number that actually moves.
+    assert!(progress.len() > 10, "{} reports", progress.len());
+    assert!(progress.iter().all(|freeing| freeing.path == target));
+
+    // Cumulative and monotonic, which is what makes a consumer that keeps the latest per
+    // target exact rather than approximate: it can never double-count and never go backwards.
+    for pair in progress.windows(2) {
+        assert!(pair[1].bytes >= pair[0].bytes, "{:?}", (pair[0], pair[1]));
+        assert!(
+            pair[1].entries > pair[0].entries,
+            "{:?}",
+            (pair[0], pair[1])
+        );
+    }
+
+    // The last word is the final report's own figure, reached rather than restated: the
+    // progress and the `Removal` are the same running total read at different moments, so a
+    // counter climbing on one and then handed the other does not jump.
+    let last = progress.last().expect("progress was reported");
+    assert!(last.bytes <= removal.bytes_freed());
+    assert_eq!(removal.removed.len(), 1);
+    assert_eq!(removal.removed[0].bytes, removal.bytes_freed());
+
+    // …and it is genuinely progress rather than one report at the end.
+    assert!(
+        last.entries < removal.entries_removed(),
+        "the last progress report was the whole job"
+    );
+    let finished = steps
+        .iter()
+        .filter(|step| matches!(step, Step::Finished(_)))
+        .count();
+    assert_eq!(finished, 1);
+    // The pool moving off the target is the last word on it, and it comes after the report of
+    // what was removed — a consumer that drops a row on `Finished` and advances a position on
+    // `Swept` must never see the position move first.
+    assert!(
+        matches!(steps.last(), Some(Step::Swept(path)) if path == &target),
+        "the sweep reported progress after it had finished"
+    );
+    let order: Vec<&str> = steps
+        .iter()
+        .rev()
+        .take(2)
+        .map(|step| match step {
+            Step::Freeing(_) => "freeing",
+            Step::Finished(_) => "finished",
+            Step::Swept(_) => "swept",
+        })
+        .collect();
+    assert_eq!(order, ["swept", "finished"]);
+}
+
+#[test]
+fn a_watcher_is_told_the_pool_moved_on_even_from_a_target_nothing_happened_to() {
+    // The batch's position and the batch's outcome are different facts, and this is the case
+    // that separates them: a target the deleter worked through and could not touch at all.
+    // Counted as a removal it is nothing — `Removal::removed` must not claim it and no row may
+    // disappear for it — but the deleter has demonstrably moved past it, so a progress
+    // indicator that ignored it would sit below where the deleter is for the rest of the run.
+    let (_tmp, base) = fixture();
+    let doomed = base.join("vanishes/node_modules");
+    let survives = base.join("app/node_modules");
+    write(&doomed.join("dep/index.js"), 1024);
+    write(&survives.join("dep/index.js"), 1024);
+
+    let plan = plan_for(&base, &[doomed.clone(), survives.clone()]);
+    // Planned, then the ground moves: the directory holding the target is gone by the time the
+    // sweep tries to open its way down to it, so it fails before unlinking a single entry.
+    fs::remove_dir_all(base.join("vanishes")).unwrap();
+
+    let steps = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&steps);
+    let removal = Deleter::new()
+        .watching(move |step| sink.lock().unwrap().push(step.clone()))
+        .remove(&plan);
+
+    let steps = steps.lock().unwrap();
+    let swept: Vec<&PathBuf> = steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::Swept(path) => Some(path),
+            Step::Freeing(_) | Step::Finished(_) => None,
+        })
+        .collect();
+    let finished: Vec<&Removed> = steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::Finished(removed) => Some(removed),
+            Step::Freeing(_) | Step::Swept(_) => None,
+        })
+        .collect();
+
+    // Every target in the plan, whatever became of it — which is what makes the count reach
+    // its total rather than stopping one short for the rest of the run.
+    assert_eq!(swept.len(), 2, "{swept:?}");
+    assert!(
+        swept.contains(&&doomed) && swept.contains(&&survives),
+        "{swept:?}"
+    );
+
+    // And the existing rule is untouched: only the target something happened to is reported,
+    // and it is the same one the final report lists.
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].path, survives);
+    assert_eq!(removal.removed.len(), 1);
+    assert_eq!(removal.removed[0].path, survives);
+    assert_eq!(removal.failures.len(), 1, "{:?}", removal.failures);
+}
+
+#[test]
 fn a_watcher_is_told_when_a_target_was_only_partly_removed() {
     let (_tmp, base) = fixture();
     let target = base.join("checkout/node_modules");
@@ -849,7 +993,11 @@ fn a_watcher_is_told_when_a_target_was_only_partly_removed() {
     let watched = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&watched);
     let removal = Deleter::new()
-        .watching(move |removed| sink.lock().unwrap().push(removed.clone()))
+        .watching(move |step| {
+            if let Step::Finished(removed) = step {
+                sink.lock().unwrap().push(removed.clone());
+            }
+        })
         .remove(&plan_for(&base, std::slice::from_ref(&target)));
 
     // The sweep refused the checkout inside, so the target itself is still standing — and a

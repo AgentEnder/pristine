@@ -63,6 +63,7 @@
 
 pub mod chrome;
 pub mod keymap;
+pub mod moving;
 pub mod render;
 pub mod state;
 pub mod treemap;
@@ -84,7 +85,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::Position;
 use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend};
 
-use crate::delete::{Deleter, Planner, Removal, Target};
+use crate::delete::{Deleter, Planner, Removal, Step, Target};
 use crate::size::{Measurer, SizeMode, human};
 use crate::tree::Tree;
 use crate::walk::{Found, Priced, WalkOutcome, Walker};
@@ -101,6 +102,15 @@ use treemap::{Pane, Screen};
 /// thinking: `event::poll` returns the moment a key is pressed, so this only bounds how stale
 /// a *number* can be, not how long a keystroke waits.
 const TICK: Duration = Duration::from_millis(100);
+
+/// The same, while something on screen is actually moving.
+///
+/// Ten frames a second is enough to keep a number from going stale and not enough to make one
+/// climb smoothly, so the loop draws faster exactly when there is something to see and drops
+/// straight back to [`TICK`] when there is not — which is most of the time a reader spends in
+/// here, deciding. A frame is 1.5 ms in release against this budget, so the difference is a
+/// few percent of one core during a scan and nothing at all while one is being read.
+const FRAME: Duration = Duration::from_millis(33);
 
 /// How close together two presses on one row have to be to make a double click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
@@ -126,10 +136,10 @@ pub struct Options {
 enum Message {
     Found(Found),
     Scanned(WalkOutcome),
-    Removed {
-        path: PathBuf,
-        complete: bool,
-    },
+    /// A removal reporting on itself as it happens: see [`crate::delete::Step`]. Carried
+    /// through rather than flattened, because the two halves land on the view differently —
+    /// bytes as they leave, the row when the sweep is finished with it.
+    Removing(Step),
     Deleted(Box<Removal>),
     /// A subtree the reader double-clicked, now that it has been priced.
     ///
@@ -526,7 +536,9 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
     loop {
         drain(&mut view, &inbox, &mut outcome);
         reap(&mut view, &inbox, &mut outcome, batch.0.as_ref());
-        view.sync();
+        // The one place a clock enters the view, and it syncs on the way through. Every
+        // interpolated number on screen moves exactly once per frame, here.
+        view.animate(Instant::now());
 
         // A phase that has just ended is the only thing worth interrupting anybody for, and
         // the chrome decides whether it is: long enough to matter, and nobody watching. Both
@@ -570,7 +582,7 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
         if view.wants_to_quit() {
             break;
         }
-        if !events.poll(TICK)? {
+        if !events.poll(if view.is_moving() { FRAME } else { TICK })? {
             continue;
         }
         let event = events.read()?;
@@ -701,9 +713,14 @@ fn reap(
     drain(view, inbox, outcome);
     if view.is_deleting() {
         outcome.failures += 1;
-        view.deleted(Notice::standing(
-            "the removal ended without reporting what it did",
-        ));
+        // The freed total is left where it stands: a removal that said nothing is a removal
+        // that gave no figure, and inventing one is the opposite of what this branch is for.
+        // Standing, for the same reason: a thread that died mid-batch is counted as a failure
+        // on the line above, and this sentence is where a reader learns of it.
+        view.deleted(
+            Notice::standing("the removal ended without reporting what it did"),
+            outcome.freed,
+        );
     }
 }
 
@@ -715,12 +732,24 @@ fn drain(view: &mut View, inbox: &Receiver<Message>, outcome: &mut Outcome) {
     loop {
         match inbox.try_recv() {
             Ok(Message::Found(Found::Claim(hit))) => view.found(hit),
+            Ok(Message::Found(Found::Pricing(path))) => view.pricing(&path),
             Ok(Message::Found(Found::Priced(priced))) => view.priced(&priced.path, priced.size),
             Ok(Message::Scanned(walk)) => {
                 outcome.errors.extend(walk.errors);
                 view.scanned();
             }
-            Ok(Message::Removed { path, complete }) => view.removed(&path, complete),
+            // Both halves reach the view, and both carry the deleter's own running byte
+            // total — which is what lets a row's number fall on bytes that have genuinely
+            // left the disk rather than on a timer started once they already had.
+            Ok(Message::Removing(Step::Freeing(freeing))) => {
+                view.freeing(&freeing.path, freeing.bytes);
+            }
+            Ok(Message::Removing(Step::Finished(removed))) => {
+                view.removed(&removed.path, removed.bytes, removed.complete);
+            }
+            // Where the batch has got to, which is a different question from what happened to
+            // any row — a target that failed before unlinking anything still counts here.
+            Ok(Message::Removing(Step::Swept(_))) => view.swept(),
             Ok(Message::Repriced { claims, errors }) => {
                 // The walk's rule, kept: a pass that could not read everything makes every
                 // total it fed a lower bound, and the header says so beside the numbers.
@@ -736,7 +765,13 @@ fn drain(view: &mut View, inbox: &Receiver<Message>, outcome: &mut Outcome) {
             Ok(Message::Deleted(removal)) => {
                 outcome.failures += removal.failures.len();
                 outcome.freed += removal.bytes_freed();
-                view.deleted(summarise(&removal));
+                // The rows the safety model left standing, so each one can say so where it
+                // is. The footer's count says how many; only the row can say which.
+                view.refused(&removal.kept);
+                // The batch's own arithmetic replaces the per-target figures the counter has
+                // been climbing on, rather than being added to them: they are the same bytes
+                // counted by the same code, so adding would double every one of them.
+                view.deleted(summarise(&removal), outcome.freed);
             }
             // Disconnected as well as empty: the walk finishing drops its sender, and there
             // is nothing left to say either way.
@@ -778,11 +813,8 @@ fn spawn_delete(options: &Options, targets: Vec<PathBuf>, post: Sender<Message>)
         let plan = planner.plan(targets.iter().map(Target::at));
         let reporting = post.clone();
         let removal = Deleter::new()
-            .watching(move |removed| {
-                let _ = reporting.send(Message::Removed {
-                    path: removed.path.clone(),
-                    complete: removed.complete,
-                });
+            .watching(move |step| {
+                let _ = reporting.send(Message::Removing(step.clone()));
             })
             .remove(&plan);
         // Posted before the thread ends, which is what lets `reap` read a finished thread
@@ -928,6 +960,7 @@ mod tests {
     use crate::tui::chrome::XTERM_STACK;
     use crate::tui::state::View;
     use crate::walk::{Found, WalkError, WalkOutcome};
+    use std::path::Path;
     use std::sync::mpsc::channel;
 
     fn view() -> View {
@@ -968,6 +1001,86 @@ mod tests {
         assert_eq!(outcome.errors.len(), 1);
         assert!(!outcome.whole());
         assert!(!view.is_scanning());
+    }
+
+    #[test]
+    fn a_removals_progress_reaches_the_rows_and_the_freed_counter_from_one_event() {
+        use crate::delete::{Freeing, Step};
+        use crate::size::Size;
+        use std::time::Instant;
+
+        let (post, inbox) = channel();
+        let mut tree = Tree::new("/scan");
+        tree.insert(crate::fixture::hit(
+            "/scan/app/node_modules",
+            Size::Measured(1000),
+            0,
+        ));
+        let mut view = View::new(tree);
+        view.viewport(20);
+        let mut outcome = Outcome::default();
+        let start = Instant::now();
+        view.animate(start);
+        assert_eq!(view.drawn_total().bytes, 1000);
+        assert!(!view.has_freed());
+
+        // What the deleter says while it is working. The wiring is the point of this test:
+        // the same event has to reach the row's number and the freed counter, because the
+        // two moving in opposite directions is only true if they are the same bytes.
+        post.send(Message::Removing(Step::Freeing(Freeing {
+            path: "/scan/app/node_modules".into(),
+            bytes: 600,
+            entries: 12,
+        })))
+        .unwrap();
+        drain(&mut view, &inbox, &mut outcome);
+        view.animate(start);
+
+        assert_eq!(view.drawn_total().bytes, 400);
+        assert_eq!(view.drawn_freed(), 600);
+        // Still on disk, still on screen, and not yet dimmed — it is emptying, not emptied.
+        let row = view
+            .tree()
+            .find(Path::new("/scan/app/node_modules"))
+            .unwrap();
+        assert!(view.is_freeing(row));
+        assert!(!view.is_spent(row));
+
+        post.send(Message::Removing(Step::Finished(Removed {
+            path: "/scan/app/node_modules".into(),
+            bytes: 1000,
+            entries: 20,
+            complete: true,
+        })))
+        .unwrap();
+        drain(&mut view, &inbox, &mut outcome);
+        view.animate(start);
+
+        assert_eq!(view.drawn_total().bytes, 0);
+        assert_eq!(view.drawn_freed(), 1000);
+        assert!(view.is_spent(row));
+    }
+
+    #[test]
+    fn the_batchs_position_advances_on_a_target_the_deleter_could_not_touch() {
+        use crate::delete::Step;
+
+        let (post, inbox) = channel();
+        let mut view = view();
+        let mut outcome = Outcome::default();
+        // One target, and the deleter fails on it before unlinking anything — so there is no
+        // `Finished` and no row to move, only the pool saying it has moved on.
+        view.deleting_for_test();
+        assert_eq!(view.removing().unwrap().counted(), (0, 1));
+
+        post.send(Message::Removing(Step::Swept("/scan/a/target".into())))
+            .unwrap();
+        drain(&mut view, &inbox, &mut outcome);
+
+        // The wiring is the point: a missing arm here would leave the bar at zero for the
+        // whole run and say nothing about it.
+        assert_eq!(view.removing().unwrap().counted(), (1, 1));
+        assert_eq!(view.removing().unwrap().percent(), 100);
     }
 
     #[test]
@@ -1473,6 +1586,13 @@ mod loop_tests {
         }
     }
 
+    /// How many events a script will perform before it gives up and quits anyway.
+    ///
+    /// Only reached by a run that never satisfies its `until`, which is a real failure — the
+    /// point of the ceiling is that such a run *ends*, so the test reports what it found
+    /// instead of hanging with no output.
+    const PATIENCE: usize = 10_000;
+
     /// A reader who performs the same short phrase over and over.
     ///
     /// Repeated rather than sequenced because the loop and the walk are concurrent: the row
@@ -1482,6 +1602,18 @@ mod loop_tests {
     struct Script {
         events: Vec<Event>,
         at: usize,
+        /// Presses `q` instead of the next key, once this says the run has done its job.
+        ///
+        /// A `q` *inside* the cycle would undo the repetition the cycle exists for: the first
+        /// pass would end the run whether or not the walker had published anything yet, so on
+        /// a machine under load the `x` lands on an empty batch, nothing is removed, and the
+        /// assertion fires on scheduling rather than on a fault. Measured, not guessed — the
+        /// test failed that way under three spinning cores, on this commit and on the one
+        /// before any of this work.
+        ///
+        /// So the quit is a condition, which is the discipline the sibling test already
+        /// applies to breaking the terminal: wait for the thing to have actually happened.
+        until: Option<Box<dyn Fn() -> bool + Send>>,
     }
 
     impl Events for Script {
@@ -1490,7 +1622,13 @@ mod loop_tests {
         }
 
         fn read(&mut self) -> io::Result<Event> {
-            let event = self.events[self.at % self.events.len()].clone();
+            let leaving =
+                self.at >= PATIENCE || self.until.as_ref().is_some_and(|finished| finished());
+            let event = if leaving {
+                key(KeyCode::Char('q'))
+            } else {
+                self.events[self.at % self.events.len()].clone()
+            };
             self.at += 1;
             Ok(event)
         }
@@ -1578,6 +1716,9 @@ mod loop_tests {
                 key(KeyCode::Enter),
             ],
             at: 0,
+            // Nothing to wait for: this run is ended by the terminal failing, which is the
+            // whole subject of the test.
+            until: None,
         };
 
         let outcome = drive(
@@ -1629,6 +1770,7 @@ mod loop_tests {
         // a repeat of the cycle is never read as a double click. That gesture has its own
         // tests; this one is about a click.
         let name_of_root = (10, 2);
+        let gone = target.clone();
         let mut hand = Script {
             events: vec![
                 at(
@@ -1644,7 +1786,6 @@ mod loop_tests {
                 key(KeyCode::Char('x')),
                 key(KeyCode::Right),
                 key(KeyCode::Enter),
-                key(KeyCode::Char('q')),
                 at(
                     MouseEventKind::Down(MouseButton::Left),
                     name_of_root.0,
@@ -1657,6 +1798,11 @@ mod loop_tests {
                 ),
             ],
             at: 0,
+            // The same condition the sibling test quits on, and for the same reason: a `q`
+            // inside the cycle would end the run whether or not the walker had published the
+            // row the pointer is aiming at, so the assertion would fire on scheduling rather
+            // than on a fault.
+            until: Some(Box::new(move || !gone.exists())),
         };
 
         let outcome = drive(
@@ -1696,15 +1842,20 @@ mod loop_tests {
             broken: Arc::new(AtomicBool::new(false)),
         })
         .unwrap();
+        let gone = target.clone();
         let mut keys = Script {
             events: vec![
                 key(KeyCode::Char(' ')),
                 key(KeyCode::Char('x')),
                 key(KeyCode::Right),
                 key(KeyCode::Enter),
-                key(KeyCode::Char('q')),
             ],
             at: 0,
+            // The target is `rmdir`ed only once every child under it is gone, so this becomes
+            // true exactly when the batch the test is about has finished. A `q` before then
+            // would be the script racing the walker rather than the loop doing its job — and
+            // a `q` after it is held by the view anyway until the removal reports.
+            until: Some(Box::new(move || !gone.exists())),
         };
 
         let mut chrome = Chrome::new(

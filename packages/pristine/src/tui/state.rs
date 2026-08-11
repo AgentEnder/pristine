@@ -47,14 +47,30 @@
 //! furniture: the footer, which otherwise carries the keys. So a report with no way out is a
 //! stale claim sitting on the one line that tells a reader what they can do — and the older it
 //! gets the less of the tree it still describes. See [`Notice`] for how long one lasts and why.
+//!
+//! # The clock is handed in, like everything else
+//!
+//! This file animates ([`super::moving`]) and still has no terminal and no filesystem in it,
+//! because time arrives the same way a keystroke does: [`View::animate`] is given the instant
+//! and everything else reads it off [`View`]. So "a removed row empties for a third of a
+//! second and then collapses away" is an assertion with three `advance`s in it rather than a
+//! test that sleeps, and the drain's *consequences* — a row that can no longer be marked,
+//! deleted a second time, or counted into a batch — are assertions too.
+//!
+//! The one thing on screen that is deliberately **not** on that clock is the notice. Everything
+//! the clock drives is a number moving towards a fact the reader can still go and check; a
+//! report of what was destroyed is the one thing they cannot, so its lifetime is a reader's
+//! action instead. See [`Notice`].
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use regex::Regex;
 
 use super::keymap::{Action, Motion, Overlay, Turn};
-use crate::delete::{Plan, Target};
+use super::moving::Moving;
+use crate::delete::{Plan, Refused, Target};
 use crate::size::{Size, human};
 use crate::tree::{NodeId, Order, Sort, Tree};
 use crate::walk::Hit;
@@ -108,14 +124,97 @@ impl Roll {
     /// The distinction the performance thesis forces onto the front end. A default scan
     /// prices 8% of what it finds, so `0` and "not looked" are wildly different facts about a
     /// row and rendering both as `0 B` would report a 40 GiB `node_modules` as empty.
+    ///
+    /// There is a **third** state between those two, and it is the ordinary one for an
+    /// ancestor while the pool works: some of what is under here is priced and some is not.
+    /// `4.2 GiB` for a row that is really worth 4.9 GiB is wrong in the direction a cleaner
+    /// must not be wrong in, so it is spelled `> 4.2 GiB`. The `>` is true the whole time it
+    /// is up, it costs nothing, and it is what turns the number climbing underneath it into
+    /// information rather than a number that cannot make its mind up.
     #[must_use]
     pub fn label(&self) -> String {
-        if self.bytes == 0 && self.unpriced > 0 {
-            Size::Unmeasured.label()
-        } else {
-            human(self.bytes)
+        match (self.bytes, self.unpriced) {
+            (0, 1..) => Size::Unmeasured.label(),
+            (bytes, 1..) => format!("> {}", human(bytes)),
+            (bytes, 0) => human(bytes),
         }
     }
+}
+
+/// How far through its batch a running removal is.
+///
+/// A running byte total is the wrong thing on its own, and real use is what showed it: bytes
+/// say how much has gone but not how much is left to go, so a reader watching a long delete
+/// cannot tell a third of the way through from nearly finished. A **count of targets against
+/// the batch's own total** can, and this is the one phase of the run where the denominator is
+/// honest without qualification — it is fixed the instant the reader answers the confirmation,
+/// where the pricing bar's denominator grows as the walk finds claims faster than the pool can
+/// price them.
+///
+/// It is a lower bound, and deliberately so. The deleter speaks only for a target something
+/// actually *happened* to, so a batch where one turned out to be gone already ends at eleven of
+/// twelve rather than counting a directory nobody touched. The state ends when the batch
+/// reports, not when the count reaches its total.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Removing {
+    /// Targets the confirmed plan handed to the deleter.
+    total: usize,
+    /// Targets the deleter has reported finishing with, whole or in part.
+    done: usize,
+}
+
+impl Removing {
+    /// The start of a batch of `total` targets.
+    fn new(total: usize) -> Self {
+        Self { total, done: 0 }
+    }
+
+    /// Notes one more target the deleter has come back out of.
+    ///
+    /// Capped at the total rather than allowed past it: the count is a position in a batch of
+    /// known size, and a `13 of 12` would say the batch was not what the confirmation said it
+    /// was — which is the one thing the dialog promises.
+    fn finished(&mut self) {
+        self.done = self.done.saturating_add(1).min(self.total);
+    }
+
+    /// Targets done, and how many there are.
+    #[must_use]
+    pub fn counted(self) -> (usize, usize) {
+        (self.done, self.total)
+    }
+
+    /// How far through, for the footer and for the dock.
+    #[must_use]
+    pub fn percent(self) -> u8 {
+        percent(self.done, self.total)
+    }
+
+    /// What the footer says, which is where the deleter is rather than only what it has given
+    /// back. The freed counter beside it already carries the bytes.
+    #[must_use]
+    pub fn label(self) -> String {
+        format!(
+            "removing {} of {} · {}%",
+            self.done,
+            plural(self.total, "directory", "directories"),
+            self.percent()
+        )
+    }
+}
+
+/// `part` of `whole` as a percentage, saturating rather than wrapping.
+///
+/// Lives here rather than beside its other caller in [`super::chrome`] so that the dependency
+/// runs the way the layering does: the chrome reads the view, and the view knows nothing about
+/// a terminal. One implementation, because a footer and a taskbar bar that rounded differently
+/// would be two claims about the same run.
+pub(super) fn percent(part: usize, whole: usize) -> u8 {
+    if whole == 0 {
+        return 0;
+    }
+    let scaled = part.saturating_mul(100) / whole;
+    u8::try_from(scaled.min(100)).unwrap_or(100)
 }
 
 /// The question the delete key asks, and everything it is holding while it asks.
@@ -428,9 +527,17 @@ pub struct View {
     expanded: HashSet<NodeId>,
     /// The roots of the marked subtrees. See the module docs.
     marks: HashSet<NodeId>,
-    /// How many marks sit strictly below each node — what makes a partial state O(1) to ask
-    /// about instead of a subtree walk per row per frame.
-    below: HashMap<NodeId, usize>,
+    /// What is marked strictly below each node — what makes a partial state O(1) to ask about
+    /// instead of a subtree walk per row per frame.
+    ///
+    /// A [`Roll`] rather than a count, because a partial ancestor now says *how* partial it
+    /// is: the glyph is a block filled in proportion to the marked share of that subtree's
+    /// bytes, which is a real number put in one character. Recomputed whole from the marks
+    /// rather than adjusted as they change, for the reason the filter states about its own
+    /// rolls — bytes move under a mark as prices land and rows are deleted, and an
+    /// incremental count would have to be right about all of that. It costs one walk up the
+    /// ancestors per mark, and a reader has a handful of marks.
+    below: HashMap<NodeId, Roll>,
     rows: Vec<Row>,
     cursor: Option<usize>,
     /// Whether the cursor was deselected by something vanishing under it.
@@ -455,8 +562,9 @@ pub struct View {
     pricing: HashSet<PathBuf>,
     /// Whether the walk is still running, for the header.
     scanning: bool,
-    /// Whether a removal is in flight. A second one would race the first over the same tree.
-    deleting: bool,
+    /// The removal in flight, and where it has got to. A second one would race the first over
+    /// the same tree, so its presence is also what refuses one.
+    removing: Option<Removing>,
     /// Whether the reader has asked to leave and is waiting on a removal to finish.
     ///
     /// `q` is reserved everywhere, and it stays reserved — but it cannot *end* a run that is
@@ -472,6 +580,36 @@ pub struct View {
     stale: bool,
     /// Whether the tree's levels are in the current sort order.
     sorted: bool,
+    /// What is in flight on screen: see [`Moving`].
+    moving: Moving,
+    /// What has already left the disk from at or below each node, as of this frame. Rebuilt in
+    /// [`View::animate`] from what the deleter has reported freeing.
+    ///
+    /// The bytes here are the deleter's own running total, so a row emptying is the disk
+    /// emptying and not a timer dressed up as one. The **claims** move separately and later:
+    /// a target part way through is a directory that still exists, and it stops being counted
+    /// only when the sweep says it has finished with it.
+    ///
+    /// Bounded by the targets one removal has in flight, times the depth of the tree, and
+    /// built once per frame rather than asked per row.
+    drained: HashMap<NodeId, Roll>,
+    /// This frame's instant. Handed in by [`View::animate`] and read by everything else, so
+    /// nothing in this file calls a clock.
+    now: Instant,
+    /// When the view opened, which is what the shimmer's phase is measured from.
+    opened: Instant,
+    /// How many [`NodeId`]s the tree had handed out last time this looked, so the ones it has
+    /// handed out since can be lit as new arrivals.
+    seen: usize,
+    /// Directories a removal left standing, and why.
+    ///
+    /// The safety model refusing a subtree is the tool **working**, so this is kept apart
+    /// from the walk's errors and drawn calmly. A reader who marked forty directories and got
+    /// thirty-eight has to be able to see which two, on the rows themselves, after the footer
+    /// has moved on.
+    kept: HashMap<NodeId, String>,
+    /// What this session has given back, across every batch.
+    freed: u64,
     /// The treemap pane: whether this terminal could draw one, and whether the reader wants
     /// it. Told to the view the way [`View::viewport`] is — the renderer owns the fact and
     /// the view owns the decision, so `m` has one place to act on and the layout has one
@@ -494,8 +632,12 @@ impl View {
     /// A view of a scan that has not found anything yet.
     #[must_use]
     pub fn new(tree: Tree) -> Self {
+        let opened = Instant::now();
         let mut view = Self {
             expanded: HashSet::from([tree.root()]),
+            // The root is not an arrival: it is the directory the reader typed, and lighting
+            // it on the first frame would say something was found before anything was.
+            seen: tree.minted(),
             tree,
             sort: Sort::default(),
             marks: HashSet::new(),
@@ -511,11 +653,17 @@ impl View {
             pending: None,
             pricing: HashSet::new(),
             scanning: true,
-            deleting: false,
+            removing: None,
             quitting: false,
             notice: None,
             stale: true,
             sorted: false,
+            moving: Moving::new(opened),
+            drained: HashMap::new(),
+            now: opened,
+            opened,
+            kept: HashMap::new(),
+            freed: 0,
             // On wherever it is possible, which is the spike's own bet: a feature nobody
             // turns on is a feature nobody judges.
             map: Map {
@@ -536,11 +684,40 @@ impl View {
         self.sorted = false;
     }
 
+    /// A pricing thread has gone into this claim.
+    ///
+    /// What the shimmer draws, and the reason it is worth drawing: the pool is bounded, so the
+    /// rows lit at any instant are exactly the ones being worked on. A dash that is being
+    /// measured right now and a dash that will be measured in four minutes are different facts
+    /// about a row, and before this event the front end had no way to tell them apart.
+    pub fn pricing(&mut self, path: &Path) {
+        if let Some(id) = self.tree.find(path) {
+            self.moving.heats(id);
+        }
+    }
+
     /// A price for a claim that was published without one.
     pub fn priced(&mut self, path: &Path, size: Size) {
+        if let Some(id) = self.tree.find(path) {
+            self.moving.cools(id);
+        }
         self.tree.price(path, size);
         self.stale = true;
         self.sorted = false;
+    }
+
+    /// Bytes the deleter has just given back from a target it is still working through.
+    ///
+    /// This is what makes a row **empty** rather than merely disappear, and the reason it is
+    /// an event rather than a timer: the number falling is the number of bytes that have
+    /// actually left the disk. A fixed animation started after the fact would look the same
+    /// for a target that took ten seconds and one that took ten milliseconds, which is the
+    /// definition of motion that is not information.
+    pub fn freeing(&mut self, path: &Path, bytes: u64) {
+        if let Some(id) = self.tree.find(path) {
+            self.moving.frees(id, bytes);
+            self.stale = true;
+        }
     }
 
     /// A target the deleter has finished with.
@@ -548,16 +725,61 @@ impl View {
     /// Only a *complete* removal takes the row away. A target the sweep entered and did not
     /// finish — a checkout inside it, an unreadable subtree — is still on disk, and dropping
     /// its row would tell a reader something was deleted that was not.
-    pub fn removed(&mut self, path: &Path, complete: bool) {
+    ///
+    /// A complete one does not take it away on this frame either. Its number is already at
+    /// zero, having got there on the bytes reported by [`View::freeing`]; what it spends now
+    /// is [`super::moving::DIM`] dimmed, so the row is seen to have emptied instead of
+    /// vanishing on the same frame as its last byte. That beat is presentational and its
+    /// consequences are not: the row is out of the batch and out of the marks from the moment
+    /// the sweep first touched it.
+    pub fn removed(&mut self, path: &Path, bytes: u64, complete: bool) {
+        let Some(id) = self.tree.find(path) else {
+            return;
+        };
         if complete {
-            self.tree.remove(path);
-            self.stale = true;
+            self.moving.spends(id, bytes, self.now);
+        } else {
+            // Still on disk, and the bytes that did go are still gone. The row keeps its
+            // place showing what is left of it, which is the honest reading of a sweep that
+            // went in and came out again.
+            self.moving.frees(id, bytes);
+        }
+        self.stale = true;
+    }
+
+    /// The deleter has moved off a target, whatever it managed to do to it.
+    ///
+    /// **This and [`View::removed`] answer different questions, which is why the progress
+    /// counts here and the rows move there.** A target that failed before unlinking a single
+    /// entry, or that had already vanished, is one the deleter is no longer working on — it
+    /// belongs to where the batch has got to, and to nothing else. Counting the position on
+    /// removals instead would leave a batch that failed on every target reading 0% for its
+    /// whole life and then vanishing, which reports the *outcome* under the guise of the
+    /// position; and even one such target leaves the bar permanently short of where the
+    /// deleter actually is.
+    ///
+    /// It deliberately does not touch the tree. Nothing happened to that directory, so there
+    /// is nothing for its row to say.
+    pub fn swept(&mut self) {
+        if let Some(removing) = &mut self.removing {
+            removing.finished();
+        }
+    }
+
+    /// Directories a removal left standing, with the reason each one was left.
+    pub fn refused(&mut self, kept: &[Refused]) {
+        for refused in kept {
+            if let Some(id) = self.tree.find(&refused.path) {
+                self.kept.insert(id, refused.reason.to_string());
+            }
         }
     }
 
     /// The walk is over.
     pub fn scanned(&mut self) {
         self.scanning = false;
+        // A pool that has stopped leaves nothing hot behind it.
+        self.moving.cooled();
     }
 
     /// A pricing pass is over, and these are the claims it was holding.
@@ -575,10 +797,44 @@ impl View {
         self.notice = Some(notice);
     }
 
-    /// The removal is over, and this is what it did.
-    pub fn deleted(&mut self, notice: Notice) {
-        self.deleting = false;
+    /// The removal is over, `notice` is what it did, and `freed` is what the session has given
+    /// back across every batch it has run.
+    ///
+    /// The two are the same event told from two ends and they hand over here, which is why they
+    /// are set in one call. While the batch runs the rows and the counter carry it — bytes
+    /// falling as they leave the disk, a position against the batch's own size — and none of
+    /// that survives the last target. `notice` is what is left saying anything at all, so it is
+    /// the *only* place the counts a live row cannot show land: what the safety model refused,
+    /// and what failed. How long it stays is picked from those same counts, by
+    /// [`summarise`](crate::tui::summarise). See [`Notice`].
+    ///
+    /// The freed figure is **set** rather than added to, and it is the batch report's own
+    /// arithmetic rather than a second tally kept here: the per-target totals the counter has
+    /// been climbing on and [`crate::delete::Removal::bytes_freed`] are the same bytes counted
+    /// by the same code, so keeping both would count each one twice. The running figures are
+    /// dropped in the same breath that this one lands, which is why the counter hands over
+    /// without so much as a flicker.
+    ///
+    /// **A target the sweep could not finish has to be reconciled into the tree first.** Its
+    /// row is staying — the directory is still on disk — and what it is worth is what survived,
+    /// which until this point has only ever been said by the deleter's progress. Progress is
+    /// the thing being dropped here, so the reduction is made durable before it goes: a claim
+    /// whose bytes went but whose row remains springs straight back to its original size
+    /// otherwise, and the headline reclaimable figure *rises* after a partial delete while
+    /// `freed` says those same bytes are gone. A complete removal needs none of this, because
+    /// its claim leaves the tree outright when its dimmed beat is over.
+    pub fn deleted(&mut self, notice: Notice, freed: u64) {
+        for (id, bytes) in self.moving.leaving().collect::<Vec<_>>() {
+            if self.moving.is_spent(id) {
+                continue;
+            }
+            let path = self.tree.node(id).path.clone();
+            self.tree.shrink(&path, bytes);
+        }
+        self.removing = None;
         self.notice = Some(notice);
+        self.freed = freed;
+        self.moving.banked();
         self.stale = true;
     }
 
@@ -619,15 +875,39 @@ impl View {
             self.tree.sort_by(self.sort);
             self.sorted = true;
         }
+        // Everything the tree has minted since the last look is a directory the walk found
+        // since the last look, so it is exactly the set of rows to light. The tree does not
+        // have to report arrivals for this to be exact: ids are handed out in order and never
+        // recycled.
+        for id in self.seen..self.tree.minted() {
+            self.moving.arrived(id, self.now);
+        }
+        self.seen = self.tree.minted();
         // A mark or an open row can outlive the directory it names, because the deleter takes
         // rows away while the reader is looking at them. Dropped here, once per frame, rather
         // than per removal: a batch of ten thousand deletions would otherwise re-scan the
-        // whole mark set ten thousand times.
-        if self.marks.iter().any(|&id| !self.tree.is_attached(id)) {
-            self.marks.retain(|&id| self.tree.is_attached(id));
-            self.recount_marks();
-        }
+        // whole mark set ten thousand times. A draining row goes with them — it is a row for a
+        // directory that is no longer on the disk, and a mark on one would put it in the next
+        // batch.
+        let (tree, moving) = (&self.tree, &self.moving);
+        self.marks
+            .retain(|&id| tree.is_attached(id) && !(moving.is_freeing(id) || moving.is_spent(id)));
         self.expanded.retain(|&id| self.tree.is_attached(id));
+        self.kept.retain(|&id, _| self.tree.is_attached(id));
+        // A claim the reader deleted while a pricing thread was inside it never gets its
+        // price, because [`View::priced`] resolves the path and the path is gone — so nothing
+        // would ever cool it. It would shimmer for a thread that had finished, forever, and
+        // hold the whole view at the animating frame rate to do it. Bounded by the pool, so
+        // this is a handful of ids per frame.
+        for id in self
+            .moving
+            .hot()
+            .filter(|&id| !self.tree.is_attached(id))
+            .collect::<Vec<_>>()
+        {
+            self.moving.cools(id);
+        }
+        self.recount_marks();
         if let Some(filter) = &mut self.filter {
             filter.recompute(&self.tree);
         }
@@ -635,6 +915,114 @@ impl View {
         self.settle(&anchor);
         self.follow_cursor();
         self.stale = false;
+    }
+
+    /// Moves the frame on to `now`: the one place time enters this file.
+    ///
+    /// Three things, in an order that matters. A drain that has run its course takes its row
+    /// out of the tree *first*, so the rows this frame draws are the rows that exist. Then the
+    /// view is brought back in line. Then every drawn row's number is advanced toward what it
+    /// is really worth — **drawn** rows, which is what keeps this O(the pane) rather than
+    /// O(the tree), and the whole reason interpolation is affordable on a view holding 22,765
+    /// directories.
+    pub fn animate(&mut self, now: Instant) {
+        self.now = now;
+        self.moving.tick(now);
+        for id in self.moving.collapsed(now) {
+            let path = self.tree.node(id).path.clone();
+            self.tree.remove(&path);
+            self.stale = true;
+        }
+        self.sync();
+        self.recount_drains();
+        let targets: Vec<(NodeId, u64, bool)> = std::iter::once(self.tree.root())
+            .chain(
+                self.rows
+                    .iter()
+                    .skip(self.scroll)
+                    .take(self.page)
+                    .map(|row| row.id),
+            )
+            // Never eased: these numbers come from the deleter and they are already the
+            // truth, so smoothing them would be putting a guess in front of a measurement.
+            // The chase is for values that jump — an arrival, a price — and a row emptying
+            // does not jump, it is reported as it happens.
+            .map(|id| (id, self.live(id).bytes, self.drained.contains_key(&id)))
+            .collect();
+        self.moving.advance(now, &targets, self.freed_total());
+    }
+
+    /// What the session has given back, counting the batch that is running.
+    ///
+    /// One source at a time and no overlap between them: while a removal is in flight the
+    /// figure climbs on the per-target totals the deleter is reporting, and the moment the
+    /// batch reports its own the running figures are dropped for it. See [`View::deleted`].
+    fn freed_total(&self) -> u64 {
+        self.freed + self.moving.freed_so_far()
+    }
+
+    /// Rebuilds [`View::drained`] from what the deleter has reported freeing.
+    ///
+    /// One walk up the ancestors per target in flight, which is the same shape as
+    /// [`View::recount_marks`] and for the same reason: a subtraction applied when a target
+    /// started would have to be un-applied correctly when it finished, and being wrong leaves
+    /// a total that never comes back.
+    ///
+    /// The two halves move at different times on purpose. **Bytes** come off as they are
+    /// freed, because they really have gone. **Claims** come off only when the sweep says it
+    /// has finished with the target, because until then the directory is still there — and
+    /// "how many directories" is what the selection counter and the batch are stated in, so
+    /// dropping it early would say a row had been deleted while it was still being deleted.
+    fn recount_drains(&mut self) {
+        self.drained.clear();
+        for (id, freed) in self.moving.leaving().collect::<Vec<_>>() {
+            let roll = self.roll(id);
+            let gone = if self.moving.is_spent(id) {
+                // Finished with. Whatever the sweep managed to count, the directory is gone,
+                // so the row is worth nothing and its claim stops counting.
+                roll
+            } else {
+                Roll {
+                    bytes: freed.min(roll.bytes),
+                    claims: 0,
+                    unpriced: 0,
+                }
+            };
+            let mut at = Some(id);
+            while let Some(current) = at {
+                let drained = self.drained.entry(current).or_default();
+                drained.bytes += gone.bytes;
+                drained.claims += gone.claims;
+                drained.unpriced += gone.unpriced;
+                at = self.tree.node(current).parent;
+            }
+        }
+    }
+
+    /// What a row is worth once what has already left the disk is taken off.
+    ///
+    /// The truth the tree itself cannot state, because the tree learns about a removal only
+    /// when the deleter has finished with the whole target: this is the same number a second
+    /// or two earlier, falling as the bytes do. It is what the screen draws *and* what a
+    /// decision is made on — the batch, the selection counter — and there is deliberately no
+    /// second, laggier version of it for display.
+    fn live(&self, id: NodeId) -> Roll {
+        let roll = self.roll(id);
+        let Some(gone) = self.drained.get(&id) else {
+            return roll;
+        };
+        Roll {
+            bytes: roll.bytes.saturating_sub(gone.bytes),
+            claims: roll.claims.saturating_sub(gone.claims),
+            unpriced: roll.unpriced.saturating_sub(gone.unpriced),
+        }
+    }
+
+    /// Whether anything on screen is still in motion, which is what the event loop reads to
+    /// decide how often to repaint.
+    #[must_use]
+    pub fn is_moving(&self) -> bool {
+        self.moving.is_moving()
     }
 
     /// Whether this terminal can draw a map at all. Told once, at start-up.
@@ -698,23 +1086,146 @@ impl View {
         }
     }
 
+    /// What this row is drawing at this instant, which is the truth once it has caught up.
+    ///
+    /// A rolled-up total climbing toward its real value is the one thing a count of
+    /// directories cannot say: how fast the scan is finding them. It is also the same
+    /// mechanism, running the other way, that empties a row the deleter has just finished
+    /// with. Only the *bytes* move — the claim counts do not, because a count is a thing a
+    /// reader reads off rather than watches.
+    #[must_use]
+    pub fn drawn(&self, id: NodeId) -> Roll {
+        Roll {
+            bytes: self.moving.shown(id, self.live(id).bytes),
+            ..self.live(id)
+        }
+    }
+
+    /// The header's number, climbing.
+    #[must_use]
+    pub fn drawn_total(&self) -> Roll {
+        self.drawn(self.tree.root())
+    }
+
+    /// What this session has given back, climbing — the other of the two counters a removal
+    /// moves, and the one that goes up.
+    #[must_use]
+    pub fn drawn_freed(&self) -> u64 {
+        self.moving.freed()
+    }
+
+    /// Whether anything has been freed this session at all.
+    ///
+    /// True as soon as the first bytes leave rather than when the batch reports, so the
+    /// counter that climbs is on screen for the whole of the fall it is the counterpart to.
+    #[must_use]
+    pub fn has_freed(&self) -> bool {
+        self.freed_total() > 0
+    }
+
+    /// How lit a newly found row is, from 1.0 down to 0.0 over about a second.
+    #[must_use]
+    pub fn freshness(&self, id: NodeId) -> f64 {
+        self.moving.freshness(id)
+    }
+
+    /// Whether a pricing thread is inside this claim at this instant.
+    #[must_use]
+    pub fn is_pricing(&self, id: NodeId) -> bool {
+        self.moving.is_hot(id)
+    }
+
+    /// Whether bytes are leaving this row right now.
+    #[must_use]
+    pub fn is_freeing(&self, id: NodeId) -> bool {
+        self.moving.is_freeing(id)
+    }
+
+    /// Whether this row has emptied and is spending its last moment on screen.
+    #[must_use]
+    pub fn is_spent(&self, id: NodeId) -> bool {
+        self.moving.is_spent(id)
+    }
+
+    /// Whether the deleter has touched this row at all — either phase.
+    ///
+    /// The one predicate the batch, the marks and `space` all read, so "a directory the
+    /// deleter is part way through is not a directory to delete again" is stated once rather
+    /// than in three places that could drift.
+    fn is_leaving(&self, id: NodeId) -> bool {
+        self.moving.is_freeing(id) || self.moving.is_spent(id)
+    }
+
+    /// Whether the mark cascade is passing through this row right now.
+    #[must_use]
+    pub fn is_cascading(&self, id: NodeId) -> bool {
+        self.moving.is_cascading(id)
+    }
+
+    /// Which cell of a `width`-wide pricing shimmer is lit this frame.
+    #[must_use]
+    pub fn shimmer(&self, width: usize) -> usize {
+        self.moving.shimmer(width, self.opened)
+    }
+
+    /// Why a removal left this directory standing, if it did.
+    #[must_use]
+    pub fn kept_reason(&self, id: NodeId) -> Option<&str> {
+        self.kept.get(&id).map(String::as_str)
+    }
+
     /// How much of this row's subtree is marked.
     #[must_use]
     pub fn mark_of(&self, id: NodeId) -> Mark {
         if self.covered(id) {
             Mark::All
-        } else if self.below.get(&id).copied().unwrap_or(0) > 0 {
+        } else if self.below.get(&id).is_some_and(|roll| roll.claims > 0) {
             Mark::Partial
         } else {
             Mark::None
         }
     }
 
+    /// What share of this row's subtree is marked, between 0.0 and 1.0.
+    ///
+    /// By **bytes**, which is what a reader deciding whether a partial ancestor is worth
+    /// opening actually wants: forty marked directories out of fifty means nothing if the
+    /// other ten hold all the space. Claims are the fallback for a subtree nobody has priced
+    /// yet, where bytes cannot answer and the count is the only thing that is true.
+    #[must_use]
+    pub fn share(&self, id: NodeId) -> f64 {
+        if self.covered(id) {
+            return 1.0;
+        }
+        let whole = self.roll(id);
+        let marked = self.below.get(&id).copied().unwrap_or_default();
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a ratio bound for one of seven block glyphs has no precision to lose"
+        )]
+        // Bytes only once everything under here has a number on it. Part way through a
+        // breakdown a byte share would be a share of what happens to be priced — which reads
+        // as "nearly all of this is marked" for a subtree whose one marked claim is the only
+        // one anybody has measured. Claims are always known, so they are what the glyph
+        // reports until bytes can be trusted, and it converges as the pool catches up.
+        let share = match (whole.unpriced, whole.bytes, whole.claims) {
+            (0, bytes @ 1.., _) => marked.bytes as f64 / bytes as f64,
+            (_, _, claims @ 1..) => marked.claims as f64 / claims as f64,
+            _ => 0.0,
+        };
+        share.clamp(0.0, 1.0)
+    }
+
     /// What is marked, all together — the selection counter.
+    ///
+    /// Net of the rows the deleter has already finished with, which are in the tree for
+    /// another third of a second while they empty. They are out of [`View::batch`], so they
+    /// have to be out of the number that describes it: a counter and a batch that disagree is
+    /// exactly the arithmetic a reader would catch first.
     #[must_use]
     pub fn marked(&self) -> Roll {
         self.marks.iter().fold(Roll::default(), |mut total, &id| {
-            let roll = self.roll(id);
+            let roll = self.live(id);
             total.bytes += roll.bytes;
             total.claims += roll.claims;
             total.unpriced += roll.unpriced;
@@ -772,7 +1283,13 @@ impl View {
     /// Whether a removal is in flight.
     #[must_use]
     pub fn is_deleting(&self) -> bool {
-        self.deleting
+        self.removing.is_some()
+    }
+
+    /// Where the removal in flight has got to, if there is one.
+    #[must_use]
+    pub fn removing(&self) -> Option<Removing> {
+        self.removing
     }
 
     /// Puts the view mid-removal without one having happened.
@@ -781,7 +1298,7 @@ impl View {
     /// door into that state runs an actual removal against an actual filesystem.
     #[cfg(test)]
     pub(crate) fn deleting_for_test(&mut self) {
-        self.deleting = true;
+        self.removing = Some(Removing::new(1));
     }
 
     /// What just happened, for the footer.
@@ -959,7 +1476,7 @@ impl View {
     /// rows keep disappearing as the deleter finishes each target. Tearing the batch in half
     /// would not be.
     fn quit(&mut self) -> Effect {
-        if self.deleting {
+        if self.is_deleting() {
             self.quitting = true;
             self.says("the removal has to finish — closing the moment it does");
             return Effect::None;
@@ -970,7 +1487,7 @@ impl View {
     /// Whether a quit that was held back by a removal can be honoured now.
     #[must_use]
     pub fn wants_to_quit(&self) -> bool {
-        self.quitting && !self.deleting
+        self.quitting && !self.is_deleting()
     }
 
     /// One rung down the ladder: whatever is in front of the reader, taken away.
@@ -1070,11 +1587,17 @@ impl View {
         match pending.answer {
             Answer::Cancel => Effect::None,
             Answer::Delete => {
-                self.deleting = true;
-                self.says(format!(
-                    "removing {}…",
-                    plural(pending.targets.len(), "directory", "directories")
-                ));
+                // The batch's size is fixed here and nowhere else, which is what makes the
+                // progress a fraction rather than a running total. No notice beside it: the
+                // footer draws the count while this is set, and a static "removing 12
+                // directories…" sitting next to a live "removing 4 of 12" would be two
+                // statements about one batch that stop agreeing on the second target.
+                //
+                // Cleared outright rather than expired, standing ones included: answering this
+                // dialog is as deliberate as a reader gets, and what the last batch refused is
+                // not a thing to leave sitting beside a live count of this one.
+                self.removing = Some(Removing::new(pending.targets.len()));
+                self.notice = None;
                 Effect::Delete(pending.targets)
             }
         }
@@ -1082,7 +1605,7 @@ impl View {
 
     /// `x`: hand the marked batch out to be planned.
     fn commit(&mut self) -> Effect {
-        if self.deleting {
+        if self.is_deleting() {
             self.says("a removal is already running");
             return Effect::None;
         }
@@ -1099,12 +1622,16 @@ impl View {
     /// Filtered, and that is the safety rule the filter's own rolled-up numbers exist to make
     /// visible: what a mark deletes is what its row says it is worth. A claim the filter is
     /// hiding is not in the batch, however marked its ancestor.
+    ///
+    /// A row that is draining away is out too. It is on screen for another third of a second
+    /// saying what happened to it, and offering a directory that is already gone to a second
+    /// removal would report a failure for a target the first removal succeeded on.
     #[must_use]
     pub fn batch(&self) -> Vec<Target> {
         let mut batch = Vec::new();
         let mut stack: Vec<NodeId> = self.marks.iter().copied().collect();
         while let Some(id) = stack.pop() {
-            if !self.shown(id) {
+            if !self.shown(id) || self.is_leaving(id) {
                 continue;
             }
             let node = self.tree.node(id);
@@ -1465,6 +1992,11 @@ impl View {
     // ---- marking ----------------------------------------------------------------------
 
     /// `space`: mark the cursor's subtree, or unmark it.
+    ///
+    /// A mark runs visibly up the ancestors on its way in — see [`Moving::cascade`]. It is the
+    /// signature interaction and the one whose effect is otherwise entirely off screen: a mark
+    /// on a collapsed row takes everything underneath, and the only place that shows is on
+    /// ancestors the reader is not looking at. The cascade is that fact, drawn.
     fn toggle_mark(&mut self) {
         if let Some(row) = self.row() {
             self.mark_at(row.id);
@@ -1472,12 +2004,36 @@ impl View {
     }
 
     /// Marking one row, whichever door reached it — the key or the box under the pointer.
+    ///
+    /// Both the guard and the cascade live here rather than in [`View::toggle_mark`], because
+    /// they are facts about marking a row and not about the key that reached it: a press on
+    /// the mark box of a row the deleter is emptying has to be refused for exactly the reason
+    /// `space` on it is.
     fn mark_at(&mut self, id: NodeId) {
+        // A directory the deleter has already finished with is not something to mark for
+        // deletion. Its row is still on screen because it is emptying, which is a statement
+        // about the past.
+        if self.is_leaving(id) {
+            return;
+        }
         if self.covered(id) {
             self.unmark(id);
         } else {
+            let chain = self.ancestry(id);
+            self.moving.cascade(&chain, self.now);
             self.mark(id);
         }
+    }
+
+    /// A row and every directory above it, nearest first — what a cascade runs through.
+    fn ancestry(&self, id: NodeId) -> Vec<NodeId> {
+        let mut chain = Vec::new();
+        let mut at = Some(id);
+        while let Some(current) = at {
+            chain.push(current);
+            at = self.tree.node(current).parent;
+        }
+        chain
     }
 
     /// `a`: mark everything, or — if anything at all is marked — clear.
@@ -1555,43 +2111,40 @@ impl View {
     fn clear_marks(&mut self) {
         self.marks.clear();
         self.below.clear();
+        self.stale = true;
     }
 
     fn add_mark(&mut self, id: NodeId) {
-        if !self.marks.insert(id) {
-            return;
-        }
-        let mut at = self.tree.node(id).parent;
-        while let Some(current) = at {
-            *self.below.entry(current).or_insert(0) += 1;
-            at = self.tree.node(current).parent;
-        }
+        self.stale = self.marks.insert(id) || self.stale;
     }
 
     fn drop_mark(&mut self, id: NodeId) {
-        if !self.marks.remove(&id) {
-            return;
-        }
-        let mut at = self.tree.node(id).parent;
-        while let Some(current) = at {
-            if let Some(count) = self.below.get_mut(&current) {
-                *count = count.saturating_sub(1);
-            }
-            at = self.tree.node(current).parent;
-        }
+        self.stale = self.marks.remove(&id) || self.stale;
     }
 
-    /// Rebuilds the partial-state counts from the marks that are left.
+    /// Rebuilds what is marked below each node, from the marks that are left.
     ///
-    /// From scratch rather than adjusted, because this runs after marks have been dropped
-    /// wholesale by a deletion and a count that drifted would leave a partial marker on a
-    /// row with nothing marked under it.
+    /// From scratch on every sync rather than adjusted as marks come and go, and the reason is
+    /// the filter's own: this carries **bytes** now, and bytes under a mark move without the
+    /// marks moving at all — a price lands, a deletion finishes, a claim streams in under a
+    /// directory that was marked while it was still empty. An incremental total would have to
+    /// be right about every one of those, and being wrong leaves a partial glyph reporting a
+    /// share of a subtree that is no longer that shape.
+    ///
+    /// One walk up the ancestors per mark, so it is bounded by marks × depth rather than by
+    /// the tree: a reader's handful of marks against ten levels. The one case that is not a
+    /// handful is a push-down (see [`View::unmark`]), which can leave a mark per sibling on a
+    /// wide level — and that is what the `scale` module measures rather than assumes.
     fn recount_marks(&mut self) {
         self.below.clear();
         for id in self.marks.clone() {
+            let roll = self.roll(id);
             let mut at = self.tree.node(id).parent;
             while let Some(current) = at {
-                *self.below.entry(current).or_insert(0) += 1;
+                let below = self.below.entry(current).or_default();
+                below.bytes += roll.bytes;
+                below.claims += roll.claims;
+                below.unpriced += roll.unpriced;
                 at = self.tree.node(current).parent;
             }
         }
@@ -1622,10 +2175,13 @@ pub fn plural(count: usize, one: &str, many: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{Action, Answer, Effect, Mark, Motion, Notice, Overlay, Pending, Turn, View};
+    use crate::delete::{Refusal, Refused};
     use crate::fixture::hit;
     use crate::size::Size;
     use crate::tree::{Order, Sort, Tree};
+    use crate::tui::moving::{ARRIVAL, COUNT_UP, DIM, FLASH, RUNG};
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
 
     /// A view over a fixed little tree:
     ///
@@ -1668,6 +2224,13 @@ mod tests {
 
     fn at(view: &View, path: &str) -> crate::tree::NodeId {
         view.tree().find(Path::new(path)).unwrap()
+    }
+
+    /// Runs the clock past the drain, which is what actually takes a removed row out of the
+    /// tree. Every test written before the drain existed used a bare `sync` for this, and the
+    /// substitution is exact: the removal still happens, a third of a second later.
+    fn settle(view: &mut View) {
+        view.animate(Instant::now() + DIM * 2);
     }
 
     /// Moves the cursor onto a row that is already visible, using only the keys a reader has.
@@ -1878,8 +2441,8 @@ mod tests {
         view.apply(Action::ToggleSubtree);
         point_at(&mut view, "/scan/nx/packages/ui/node_modules");
 
-        view.removed(Path::new("/scan/nx/packages/ui/node_modules"), true);
-        view.sync();
+        view.removed(Path::new("/scan/nx/packages/ui/node_modules"), 100, true);
+        settle(&mut view);
 
         // `ui` and `packages` held nothing else, so they went too. `nx` is what is left of
         // where the reader was — and it is emphatically not row 0, which is the scan root.
@@ -1893,8 +2456,8 @@ mod tests {
     fn deleting_everything_a_reader_was_looking_at_lands_on_the_scan_root_and_not_on_a_stranger() {
         let mut view = view();
         point_at(&mut view, "/scan/old");
-        view.removed(Path::new("/scan/old/target"), true);
-        view.sync();
+        view.removed(Path::new("/scan/old/target"), 10, true);
+        settle(&mut view);
 
         // The chain ends at the scan root, so that is where a cursor with nothing else left
         // above it comes to rest. It is the *nearest surviving ancestor* rather than "row 0":
@@ -1933,7 +2496,7 @@ mod tests {
         let mut view = view();
         let before = view.total();
 
-        view.removed(Path::new("/scan/old/target"), false);
+        view.removed(Path::new("/scan/old/target"), 0, false);
         view.sync();
 
         // The sweep went in and came out again — a checkout inside it, an unreadable
@@ -2043,8 +2606,8 @@ mod tests {
         view.apply(Action::Mark);
         assert_eq!(view.marked().claims, 1);
 
-        view.removed(Path::new("/scan/old/target"), true);
-        view.sync();
+        view.removed(Path::new("/scan/old/target"), 10, true);
+        settle(&mut view);
 
         assert_eq!(view.marked().claims, 0);
         assert!(batched(&view).is_empty());
@@ -2255,7 +2818,7 @@ mod tests {
     #[test]
     fn a_report_of_what_was_removed_can_be_got_rid_of() {
         let mut view = view();
-        view.deleted(Notice::passing("removed 10 B from 1 directory"));
+        view.deleted(Notice::passing("removed 10 B from 1 directory"), 10);
         assert_eq!(view.notice(), Some("removed 10 B from 1 directory"));
 
         // The bug this rung exists for: without it the sentence sits over the keys for the
@@ -2267,7 +2830,7 @@ mod tests {
     #[test]
     fn the_next_thing_the_reader_does_takes_an_ordinary_report_away() {
         let mut view = view();
-        view.deleted(Notice::passing("removed 10 B from 1 directory"));
+        view.deleted(Notice::passing("removed 10 B from 1 directory"), 10);
 
         // Moving the cursor is the reader looking at the tree the report describes, by which
         // point the report describes the frame before. No timer: every lifetime here is an
@@ -2279,7 +2842,7 @@ mod tests {
     #[test]
     fn a_key_nobody_bound_is_not_the_reader_having_read_the_report() {
         let mut view = view();
-        view.deleted(Notice::passing("removed 10 B from 1 directory"));
+        view.deleted(Notice::passing("removed 10 B from 1 directory"), 10);
         view.apply(Action::Ignore);
         assert!(view.notice().is_some());
     }
@@ -2287,9 +2850,10 @@ mod tests {
     #[test]
     fn a_report_naming_a_refusal_outlives_the_keys_that_clear_an_ordinary_one() {
         let mut view = view();
-        view.deleted(Notice::standing(
-            "removed 10 B from 1 directory, 1 directory failed",
-        ));
+        view.deleted(
+            Notice::standing("removed 10 B from 1 directory, 1 directory failed"),
+            10,
+        );
         assert!(view.notice_stands());
 
         // The safety model's counts are what the run exits non-zero on, so this line is where
@@ -2314,7 +2878,10 @@ mod tests {
     #[test]
     fn a_newer_report_answers_the_keystroke_that_asked_for_it_even_over_a_standing_one() {
         let mut view = view();
-        view.deleted(Notice::standing("removed 10 B from 1 directory, 1 failed"));
+        view.deleted(
+            Notice::standing("removed 10 B from 1 directory, 1 failed"),
+            10,
+        );
 
         // Not an incidental keypress: `x` on nothing marked is the reader asking a question,
         // and the footer is where it is answered. There is only ever one footer, so the newer
@@ -2330,7 +2897,7 @@ mod tests {
         point_at(&mut view, "/scan/nx");
         view.apply(Action::Mark);
         filter(&mut view, "node_modules");
-        view.deleted(Notice::passing("removed 10 B from 1 directory"));
+        view.deleted(Notice::passing("removed 10 B from 1 directory"), 10);
 
         // One `Esc`, one rung. The notice goes first because it is the cheapest rung to take
         // by mistake; dropping the marks instead would be the expensive one.
@@ -2349,7 +2916,7 @@ mod tests {
     fn a_press_on_a_report_that_has_already_gone_does_not_take_the_filter_with_it() {
         let mut view = view();
         filter(&mut view, "node_modules");
-        view.deleted(Notice::passing("removed 10 B from 1 directory"));
+        view.deleted(Notice::passing("removed 10 B from 1 directory"), 10);
 
         // A press is aimed at the frame the reader was looking at and acted on at the release,
         // so the report can go in between — a keystroke during a held button is all it takes.
@@ -2364,7 +2931,10 @@ mod tests {
     #[test]
     fn an_overlay_is_dismissed_before_the_report_behind_it() {
         let mut view = view();
-        view.deleted(Notice::standing("removed 10 B from 1 directory, 1 failed"));
+        view.deleted(
+            Notice::standing("removed 10 B from 1 directory, 1 failed"),
+            10,
+        );
         view.apply(Action::Help);
 
         // The overlays are drawn over the footer, so they are what is in front of the reader
@@ -2375,6 +2945,35 @@ mod tests {
         assert!(view.notice().is_some(), "the help took the report with it");
         view.apply(Action::Back);
         assert_eq!(view.notice(), None);
+    }
+
+    #[test]
+    fn the_clock_that_drives_everything_else_on_the_frame_does_not_reach_the_report() {
+        let mut view = view();
+        let start = Instant::now();
+        view.deleted(
+            Notice::standing("removed 10 B from 1 directory, 1 directory failed"),
+            10,
+        );
+
+        // A minute of frames, which is what a reader who walked away comes back to. Every
+        // other moving thing on screen has long since settled — the arrival wash, the dimmed
+        // rows, the counter climbing — and this is the one that must not, because the tree it
+        // reports on is gone and the exit status is the only other place these counts appear.
+        for tick in 1..=600 {
+            view.animate(start + Duration::from_millis(100) * tick);
+        }
+        assert!(view.notice().is_some(), "a clock took the report away");
+        assert!(view.notice_stands());
+
+        // And an ordinary report is no more perishable — what ends one is an action, so a
+        // frame is not it. The difference between the two lifetimes is *which* actions count.
+        view.apply(Action::Dismiss);
+        view.deleted(Notice::passing("removed 10 B from 1 directory"), 20);
+        for tick in 1..=600 {
+            view.animate(start + Duration::from_millis(100) * tick);
+        }
+        assert!(view.notice().is_some(), "a clock took the report away");
     }
 
     #[test]
@@ -2448,8 +3047,10 @@ mod tests {
         // The row the press aimed at has been deleted between the press and the release.
         // Doing nothing is the honest outcome; the alternative is acting on whatever is now
         // at that position.
-        view.removed(Path::new("/scan/old/target"), true);
-        view.sync();
+        view.removed(Path::new("/scan/old/target"), 10, true);
+        // Past the dimmed beat, which is what actually detaches the row now: a complete
+        // removal empties it on this frame and takes it out of the tree a moment later.
+        settle(&mut view);
         view.apply(Action::Select(target));
 
         assert_eq!(
@@ -2621,8 +3222,8 @@ mod tests {
         // keeps its hit, so "walk what is under this id" would happily hand back a path that
         // is no longer on screen and no longer on disk — which is the identity rule going
         // one way for the cursor and the other way for the work.
-        view.removed(Path::new("/scan/old/target"), true);
-        view.sync();
+        view.removed(Path::new("/scan/old/target"), 0, true);
+        settle(&mut view);
 
         assert_eq!(view.apply(Action::Price(target)), Effect::None);
     }
@@ -2748,7 +3349,7 @@ mod tests {
 
         // …and the keystroke is remembered rather than dropped: the loop leaves on the first
         // frame after the removal reports.
-        view.deleted(Notice::passing("removed 10 B from 1 directory"));
+        view.deleted(Notice::passing("removed 10 B from 1 directory"), 10);
         assert!(view.wants_to_quit());
     }
 
@@ -2759,8 +3360,526 @@ mod tests {
         view.ask(pending(&["/scan/old/target"]));
         view.apply(Action::Highlight(Turn::Next));
         view.apply(Action::Answer);
-        view.deleted(Notice::passing("removed 10 B from 1 directory"));
+        view.deleted(Notice::passing("removed 10 B from 1 directory"), 10);
         assert!(!view.wants_to_quit());
+    }
+
+    // ---- what moves, and what it is saying ---------------------------------------------
+
+    #[test]
+    fn a_rolled_up_total_climbs_toward_what_arrived_rather_than_snapping_to_it() {
+        let mut view = view();
+        let start = Instant::now();
+        view.animate(start);
+        assert_eq!(view.drawn_total().bytes, 310);
+
+        view.found(hit("/scan/big/node_modules", Size::Measured(690), 1));
+        view.animate(start + COUNT_UP / 2);
+
+        // The tree knows the answer immediately; the screen takes a moment to say it, and
+        // that moment is the information — a number climbing fast is a scan finding fast,
+        // which the count of directories beside it cannot express.
+        assert_eq!(view.total().bytes, 1000);
+        let climbing = view.drawn_total().bytes;
+        assert!(climbing > 310 && climbing < 1000, "{climbing}");
+        assert!(view.is_moving());
+
+        view.animate(start + COUNT_UP * 8);
+        assert_eq!(view.drawn_total().bytes, 1000);
+        assert!(
+            !view.is_moving(),
+            "a settled view is still asking for frames"
+        );
+    }
+
+    #[test]
+    fn a_row_the_walk_has_just_found_is_lit_and_the_light_goes_out() {
+        let mut view = view();
+        let start = Instant::now();
+        view.animate(start);
+        // Nothing here was found while anybody was watching, so nothing is lit. A view that
+        // opened onto a tree it already had would otherwise flash all of it at once.
+        assert!(view.freshness(at(&view, "/scan/nx")).abs() < f64::EPSILON);
+
+        view.found(hit("/scan/late/node_modules", Size::Measured(1), 1));
+        view.animate(start);
+
+        let late = at(&view, "/scan/late");
+        assert!(view.freshness(late) > 0.9, "{}", view.freshness(late));
+        assert!(view.freshness(at(&view, "/scan/nx")).abs() < f64::EPSILON);
+
+        view.animate(start + ARRIVAL * 2);
+        assert!(view.freshness(late).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn an_ancestor_whose_children_are_still_being_priced_says_its_number_is_a_floor() {
+        let mut tree = Tree::new("/scan");
+        tree.insert(hit("/scan/nx/a/node_modules", Size::Measured(4200), 1));
+        tree.insert(hit("/scan/nx/b/node_modules", Size::Unmeasured, 1));
+        let mut view = View::new(tree);
+        let nx = at(&view, "/scan/nx");
+
+        // Not `4.1 KiB`, which would be wrong in the one direction a cleaner must not be
+        // wrong in, and not a dash, which throws away a number that is already known.
+        assert_eq!(view.roll(nx).label(), "> 4.1 KiB");
+
+        view.priced(Path::new("/scan/nx/b/node_modules"), Size::Measured(700));
+        view.sync();
+        assert_eq!(view.roll(nx).label(), "4.8 KiB");
+    }
+
+    #[test]
+    fn only_the_claims_a_pricing_thread_is_inside_are_hot() {
+        let mut tree = Tree::new("/scan");
+        tree.insert(hit("/scan/a/node_modules", Size::Unmeasured, 1));
+        tree.insert(hit("/scan/b/node_modules", Size::Unmeasured, 1));
+        let mut view = View::new(tree);
+        let a = at(&view, "/scan/a/node_modules");
+        let b = at(&view, "/scan/b/node_modules");
+        assert!(!view.is_pricing(a) && !view.is_pricing(b));
+
+        view.pricing(Path::new("/scan/a/node_modules"));
+
+        // The whole claim the effect makes, and the reason it is worth an event of its own:
+        // the pool is bounded, so as many rows are hot as there are threads working. `b` is
+        // queued, which is a different fact about a dash and used to be indistinguishable.
+        assert!(view.is_pricing(a));
+        assert!(!view.is_pricing(b));
+
+        view.priced(Path::new("/scan/a/node_modules"), Size::Measured(64));
+        assert!(!view.is_pricing(a));
+    }
+
+    #[test]
+    fn a_walk_that_has_finished_leaves_nothing_shimmering_for_a_thread_that_is_gone() {
+        let mut tree = Tree::new("/scan");
+        tree.insert(hit("/scan/a/node_modules", Size::Unmeasured, 1));
+        let mut view = View::new(tree);
+        let a = at(&view, "/scan/a/node_modules");
+        view.pricing(Path::new("/scan/a/node_modules"));
+
+        view.scanned();
+
+        // A pool that has stopped can leave a claim hot if it died on the way. A row moving
+        // for a thread that no longer exists is the one thing here that would say nothing.
+        assert!(!view.is_pricing(a));
+        assert!(!view.is_moving());
+    }
+
+    #[test]
+    fn a_claim_deleted_while_it_was_being_priced_stops_shimmering() {
+        let mut view = view();
+        let start = Instant::now();
+        view.animate(start);
+        view.pricing(Path::new("/scan/old/target"));
+        assert!(view.is_moving());
+
+        // The price for this claim will never arrive, because `priced` resolves a path and
+        // the path is gone. Nothing else would ever cool it: it would shimmer for a thread
+        // that finished long ago, and hold the whole view at the animating frame rate to do
+        // it — a quiet, permanent cost on a row nobody can see.
+        view.removed(Path::new("/scan/old/target"), 10, true);
+        view.animate(start + DIM);
+
+        assert!(view.tree().find(Path::new("/scan/old/target")).is_none());
+        assert!(!view.is_moving());
+    }
+
+    #[test]
+    fn marking_a_row_runs_the_mark_up_its_ancestors_rather_than_flashing_all_of_them() {
+        let mut view = view();
+        let start = Instant::now();
+        view.animate(start);
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Mark);
+        view.animate(start);
+
+        // The signature interaction, and the one whose effect is otherwise entirely off
+        // screen: `nx` is collapsed, so everything the mark took is out of sight and the only
+        // visible consequence is on ancestors the reader is not looking at.
+        let root = view.tree().root();
+        assert!(view.is_cascading(at(&view, "/scan/nx")));
+        assert!(!view.is_cascading(root), "the whole chain flashed at once");
+
+        view.animate(start + RUNG);
+        assert!(view.is_cascading(root), "the mark never reached the root");
+
+        view.animate(start + RUNG + FLASH);
+        assert!(!view.is_cascading(root));
+        assert!(!view.is_moving());
+    }
+
+    #[test]
+    fn a_partial_ancestor_says_what_share_of_its_bytes_is_marked() {
+        let mut view = view();
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Expand);
+        point_at(&mut view, "/scan/nx/node_modules");
+        view.apply(Action::Mark);
+
+        // 200 of `nx`'s 300 bytes, and 200 of the root's 310. A bare partial marker says
+        // "some of this"; the share is what tells a reader whether opening the row is worth
+        // the keystroke.
+        assert!((view.share(at(&view, "/scan/nx")) - 200.0 / 300.0).abs() < 1e-9);
+        assert!((view.share(view.tree().root()) - 200.0 / 310.0).abs() < 1e-9);
+        assert!(view.share(at(&view, "/scan/old")).abs() < f64::EPSILON);
+        assert!((view.share(at(&view, "/scan/nx/node_modules")) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_share_that_cannot_be_stated_in_bytes_is_stated_in_claims() {
+        let mut tree = Tree::new("/scan");
+        tree.insert(hit("/scan/a/node_modules", Size::Measured(1000), 1));
+        tree.insert(hit("/scan/b/node_modules", Size::Unmeasured, 1));
+        let mut view = View::new(tree);
+        point_at(&mut view, "/scan/a");
+        view.apply(Action::Mark);
+
+        // By bytes this is 100% marked, which would read as "all but a sliver of this is
+        // spoken for" — for a subtree whose one marked claim is the only one anybody has
+        // measured. Claims are always known, so they are what the glyph reports until the
+        // bytes can be trusted.
+        assert!((view.share(view.tree().root()) - 0.5).abs() < 1e-9);
+
+        view.priced(Path::new("/scan/b/node_modules"), Size::Measured(1000));
+        view.sync();
+        assert!((view.share(view.tree().root()) - 0.5).abs() < 1e-9);
+    }
+
+    // ---- deletion, restrained ---------------------------------------------------------
+
+    #[test]
+    fn a_row_empties_on_the_bytes_the_deleter_says_have_gone() {
+        let mut view = view();
+        let start = Instant::now();
+        view.animate(start);
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Expand);
+        let claim = at(&view, "/scan/nx/node_modules");
+
+        // Half of the 200-byte target is off the disk. Nothing about this is a timer: the
+        // row is worth exactly what is left of it, and the next report decides the next
+        // frame — so a target that takes ten seconds empties over ten seconds and one that
+        // takes ten milliseconds does not pretend otherwise.
+        view.freeing(Path::new("/scan/nx/node_modules"), 100);
+        view.animate(start);
+        assert!(view.is_freeing(claim));
+        assert!(!view.is_spent(claim), "dimmed while it is still emptying");
+        assert_eq!(view.drawn(claim).bytes, 100);
+        // Its ancestors are lighter by the same bytes, on the same event.
+        assert_eq!(view.drawn(at(&view, "/scan/nx")).bytes, 200);
+
+        view.freeing(Path::new("/scan/nx/node_modules"), 180);
+        view.animate(start + Duration::from_millis(10));
+        assert_eq!(view.drawn(claim).bytes, 20);
+
+        // The sweep finishes. Only now is the row dim, and only after the beat does it go.
+        view.removed(Path::new("/scan/nx/node_modules"), 200, true);
+        view.animate(start + Duration::from_millis(20));
+        assert!(view.is_spent(claim));
+        assert!(!view.is_freeing(claim));
+        assert_eq!(view.drawn(claim).bytes, 0);
+        assert!(
+            view.tree()
+                .find(Path::new("/scan/nx/node_modules"))
+                .is_some()
+        );
+
+        view.animate(start + Duration::from_millis(20) + DIM);
+        assert!(
+            view.tree()
+                .find(Path::new("/scan/nx/node_modules"))
+                .is_none()
+        );
+        assert_eq!(view.drawn(at(&view, "/scan/nx")).bytes, 100);
+    }
+
+    #[test]
+    fn a_row_the_sweep_could_not_finish_keeps_what_is_left_of_it() {
+        let mut view = view();
+        let start = Instant::now();
+        view.animate(start);
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Expand);
+        let claim = at(&view, "/scan/nx/node_modules");
+
+        // A checkout inside it, an unreadable corner: the sweep went in, freed some of it and
+        // came out again. The directory is still there, so the row stays — worth what is left
+        // rather than what it was, which is the only figure that is true of the disk.
+        view.removed(Path::new("/scan/nx/node_modules"), 150, false);
+        view.animate(start + DIM * 2);
+
+        assert!(
+            view.tree()
+                .find(Path::new("/scan/nx/node_modules"))
+                .is_some()
+        );
+        assert!(!view.is_spent(claim), "a row that survived was collapsed");
+        assert_eq!(view.drawn(claim).bytes, 50);
+    }
+
+    #[test]
+    fn a_running_removal_counts_targets_against_the_batch_it_was_given() {
+        let mut view = view();
+        view.ask(pending(&[
+            "/scan/nx/node_modules",
+            "/scan/nx/packages/ui/node_modules",
+            "/scan/old/target",
+        ]));
+        view.apply(Action::Highlight(Turn::Next));
+        view.apply(Action::Answer);
+
+        // The denominator is fixed here, by the question the reader answered — which is what
+        // separates this bar from the pricing one, whose total grows as the walk finds claims.
+        assert_eq!(view.removing().unwrap().counted(), (0, 3));
+        assert_eq!(view.removing().unwrap().percent(), 0);
+        assert_eq!(
+            view.removing().unwrap().label(),
+            "removing 0 of 3 directories · 0%"
+        );
+
+        // The count moves on the deleter leaving a target, never on what it did there — the
+        // row work is `removed`'s and the position is this. A removal reports both, in that
+        // order, and only the second one advances the bar.
+        view.removed(Path::new("/scan/nx/node_modules"), 200, true);
+        assert_eq!(
+            view.removing().unwrap().counted(),
+            (0, 3),
+            "the position moved on what happened to a row"
+        );
+        view.swept();
+        assert_eq!(view.removing().unwrap().counted(), (1, 3));
+
+        // A target the sweep went into and came back out of counts the same: it is not a claim
+        // that the target was removed — the row is still there saying what is left of it.
+        view.removed(Path::new("/scan/nx/packages/ui/node_modules"), 40, false);
+        view.swept();
+        assert_eq!(view.removing().unwrap().counted(), (2, 3));
+        assert_eq!(view.removing().unwrap().percent(), 66);
+
+        // The third target turns out to be gone already, so nothing happened to it and no row
+        // moves — but the deleter still worked through it and said so, so the count reaches
+        // its total rather than stopping one short for the rest of the run.
+        view.swept();
+        assert_eq!(view.removing().unwrap().counted(), (3, 3));
+        assert_eq!(view.removing().unwrap().percent(), 100);
+
+        view.deleted(Notice::passing("removed 240 B from 1 directory"), 240);
+        assert!(view.removing().is_none());
+        assert!(!view.is_deleting());
+    }
+
+    #[test]
+    fn a_batch_that_fails_on_everything_still_shows_the_deleter_working_through_it() {
+        let mut view = view();
+        view.ask(pending(&[
+            "/scan/nx/node_modules",
+            "/scan/nx/packages/ui/node_modules",
+            "/scan/old/target",
+        ]));
+        view.apply(Action::Highlight(Turn::Next));
+        view.apply(Action::Answer);
+
+        // Every target fails before unlinking a single entry, so not one of them is a removal
+        // and not one row moves. The deleter is working through them all the same, and a bar
+        // that read 0% for the whole run and then vanished would be reporting the OUTCOME
+        // while claiming to report the position.
+        for done in 1..=3 {
+            view.swept();
+            assert_eq!(view.removing().unwrap().counted(), (done, 3));
+        }
+        assert_eq!(view.removing().unwrap().percent(), 100);
+        assert_eq!(
+            view.removing().unwrap().label(),
+            "removing 3 of 3 directories · 100%"
+        );
+
+        // …and nothing was deleted, which is the other half of the same claim: the position
+        // says where the deleter got to and never that anything went.
+        assert_eq!(view.roll(view.tree().root()).bytes, 310);
+        assert_eq!(view.roll(view.tree().root()).claims, 3);
+    }
+
+    #[test]
+    fn a_second_removal_is_refused_while_one_is_running() {
+        let mut view = view();
+        view.ask(pending(&["/scan/old/target"]));
+        view.apply(Action::Highlight(Turn::Next));
+        view.apply(Action::Answer);
+
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Mark);
+        assert_eq!(view.apply(Action::Commit), Effect::None);
+        assert_eq!(view.notice(), Some("a removal is already running"));
+    }
+
+    #[test]
+    fn a_part_emptied_row_does_not_spring_back_when_the_batch_reports() {
+        let mut view = view();
+        let start = Instant::now();
+        view.animate(start);
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Expand);
+        let claim = at(&view, "/scan/nx/node_modules");
+        let root = view.tree().root();
+
+        // 150 of the target's 200 bytes go, and then the sweep comes out again — a checkout
+        // inside it, an unreadable corner. Both events, because that is the order the deleter
+        // reports in and the reduction has to survive either one arriving last.
+        view.freeing(Path::new("/scan/nx/node_modules"), 150);
+        view.removed(Path::new("/scan/nx/node_modules"), 150, false);
+        view.animate(start);
+        assert_eq!(view.drawn(claim).bytes, 50);
+        assert_eq!(view.drawn_total().bytes, 160);
+
+        // The batch reports. Its per-target figures are dropped for the report's own
+        // arithmetic — and until this was fixed, the *reduction* went with them: the tree still
+        // held 200 for a directory that has 50 left, so the row and the headline both jumped
+        // back to what they were worth before a single byte was deleted. That is the direction
+        // a cleaner may never be wrong in, because the number that rose is the one a reader
+        // came back to check.
+        // Standing, because this is the shape `summarise` gives a batch that left something
+        // behind: the sweep came out of this target without finishing it.
+        view.deleted(Notice::standing("freed 150 B"), 150);
+        view.animate(start + DIM * 2);
+
+        assert_eq!(view.drawn(claim).bytes, 50, "the row sprang back");
+        assert_eq!(view.drawn_total().bytes, 160, "the headline rose again");
+        // Durably, not just on this frame: the tree itself is what a later sort, filter or
+        // second batch reads, and it has to agree with the screen.
+        assert_eq!(view.roll(claim).bytes, 50);
+        assert_eq!(view.roll(root).bytes, 160);
+        // And the freed figure is untouched — the bytes are counted once, by the batch.
+        assert_eq!(view.drawn_freed(), 150);
+    }
+
+    #[test]
+    fn a_row_the_deleter_has_touched_is_out_of_the_batch_and_out_of_the_counter() {
+        let mut view = view();
+        let start = Instant::now();
+        view.animate(start);
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Mark);
+        assert_eq!(view.marked().claims, 2);
+
+        // Part way through, not finished: the bytes are gone but the directory is not, so the
+        // counter loses the bytes and keeps the count.
+        view.freeing(Path::new("/scan/nx/node_modules"), 200);
+        view.animate(start);
+        assert_eq!(view.marked().claims, 2);
+        assert_eq!(view.marked().bytes, 100);
+        // It is out of the batch from the moment the sweep first touched it, though. Offering
+        // a directory that is being deleted to a second removal would report a failure for
+        // the one thing that worked.
+        assert_eq!(
+            batched(&view),
+            [PathBuf::from("/scan/nx/packages/ui/node_modules")]
+        );
+
+        // And the claim stops counting when the sweep says it has finished with it.
+        view.removed(Path::new("/scan/nx/node_modules"), 200, true);
+        view.animate(start);
+        assert_eq!(view.marked().claims, 1);
+        assert_eq!(view.marked().bytes, 100);
+    }
+
+    #[test]
+    fn a_row_the_deleter_has_touched_cannot_be_marked() {
+        let mut view = view();
+        let start = Instant::now();
+        view.animate(start);
+        point_at(&mut view, "/scan/old");
+        view.apply(Action::Expand);
+        point_at(&mut view, "/scan/old/target");
+
+        view.freeing(Path::new("/scan/old/target"), 5);
+        view.animate(start);
+        view.apply(Action::Mark);
+
+        // The cursor is still on it, because it is still on screen saying what is happening to
+        // it. A mark aimed at a directory that is being deleted is a keystroke with nowhere
+        // to land.
+        assert_eq!(view.marked().claims, 0);
+        assert!(view.batch().is_empty());
+    }
+
+    #[test]
+    fn the_freed_counter_climbs_on_the_same_bytes_the_reclaimable_one_loses() {
+        // Its own tree, with sizes a disk would actually have: a chase snaps once it is
+        // within a byte of its target, so a ten-byte counter arrives before it has moved.
+        let mut tree = Tree::new("/scan");
+        tree.insert(hit("/scan/nx/node_modules", Size::Measured(300_000), 900));
+        tree.insert(hit("/scan/old/target", Size::Measured(100_000), 100));
+        let mut view = View::new(tree);
+        view.viewport(40);
+        let start = Instant::now();
+        view.animate(start);
+        assert!(!view.has_freed());
+        assert_eq!(view.drawn_total().bytes, 400_000);
+
+        // One event, both counters. They are not two accounts of a deletion that have to be
+        // kept in step — they are one number read from each end, which is why they cannot
+        // drift apart or lag one another.
+        view.freeing(Path::new("/scan/old/target"), 40_000);
+        view.animate(start + COUNT_UP * 8);
+        assert!(view.has_freed());
+        assert_eq!(view.drawn_total().bytes, 360_000);
+        assert_eq!(view.drawn_freed(), 40_000);
+
+        view.removed(Path::new("/scan/old/target"), 100_000, true);
+        view.animate(start + COUNT_UP * 16);
+        assert_eq!(view.drawn_total().bytes, 300_000);
+        assert_eq!(view.drawn_freed(), 100_000);
+    }
+
+    #[test]
+    fn the_batch_report_replaces_the_running_total_rather_than_adding_to_it() {
+        let mut tree = Tree::new("/scan");
+        tree.insert(hit("/scan/old/target", Size::Measured(100_000), 100));
+        let mut view = View::new(tree);
+        view.viewport(40);
+        let start = Instant::now();
+        view.animate(start);
+
+        view.freeing(Path::new("/scan/old/target"), 60_000);
+        view.removed(Path::new("/scan/old/target"), 100_000, true);
+        view.animate(start + COUNT_UP * 8);
+        assert_eq!(view.drawn_freed(), 100_000);
+
+        // The batch's own arithmetic over the same bytes. Added to what the counter had
+        // already climbed, this would read 200_000 — every byte counted twice, on the one
+        // number a reader came back for.
+        view.deleted(
+            Notice::passing("removed 97.7 KiB from 1 directory"),
+            100_000,
+        );
+        view.animate(start + COUNT_UP * 16);
+        assert_eq!(view.drawn_freed(), 100_000);
+
+        // …and it survives the row finally collapsing away, which is what would drop the
+        // per-target figures if they were still the ones being counted.
+        view.animate(start + COUNT_UP * 16 + DIM * 2);
+        assert_eq!(view.drawn_freed(), 100_000);
+        assert!(view.tree().find(Path::new("/scan/old/target")).is_none());
+    }
+
+    #[test]
+    fn a_directory_the_safety_model_refused_says_so_on_its_own_row() {
+        let mut view = view();
+        view.refused(&[Refused {
+            path: PathBuf::from("/scan/old/target"),
+            reason: Refusal::HoldsCheckout,
+        }]);
+
+        // The footer says how many were left alone and then moves on to the next thing. Only
+        // the row can say *which*, and it is the tool working rather than a fault — so it is
+        // kept apart from the walk's errors, which is what lets the renderer draw it calmly.
+        assert_eq!(
+            view.kept_reason(at(&view, "/scan/old/target")),
+            Some("holds a git checkout")
+        );
+        assert_eq!(view.kept_reason(at(&view, "/scan/nx/node_modules")), None);
     }
 
     /// The batch, as paths, for the tests that are about *what* is in it.
@@ -2807,6 +3926,30 @@ mod scale {
     //!
     //! So there is no fan-out cap, and the reason is measured rather than assumed. Collapsed
     //! by default was already the answer; the numbers say it did not need a second one.
+    //!
+    //! # What the motion costs, on the same fixture
+    //!
+    //! The frame rate doubles and a bit while something is moving, so the budget these have to
+    //! fit inside is **33 ms** rather than 100. Release, fully expanded, all 32,634 rows:
+    //!
+    //! | | per frame |
+    //! |---|---|
+    //! | a frame with nothing arriving | **2 µs** |
+    //! | a frame with a claim arriving | **806 µs** |
+    //! | the same, with 8,661 marks | **1.5 ms** |
+    //!
+    //! Three things worth reading off that. The interpolation itself is the first row — two
+    //! microseconds, because it is one entry per row the *pane* drew and the pane is fifty
+    //! rows whatever the tree is. The second row is #602's own number: it is the sort and the
+    //! re-flatten of everything, which the animation did not touch. The third is the one that
+    //! had to be measured rather than argued: sparing one row out of a marked-everything
+    //! pushes the mark down onto every sibling along the path, and one of those levels is
+    //! 8,660 wide — so the per-frame fold over the marks really does run over 8,661 of them,
+    //! and it costs 0.7 ms.
+    //!
+    //! And a frame only pays any of the last two when something moved. `sync` folds the marks
+    //! and the drains behind the same `stale` flag as the sort, so a reader sitting looking at
+    //! a still tree pays the 2 µs and nothing else.
     //!
     //! `cargo test --release --lib scale -- --ignored --nocapture` re-runs it.
 
@@ -2867,5 +4010,68 @@ mod scale {
         view.found(priced("/home/repos/late/node_modules", 1));
         view.sync();
         println!("one arrival, fully expanded: {:?}", started.elapsed());
+    }
+
+    #[test]
+    #[ignore = "a measurement rather than an assertion; timings are not a pass or a fail"]
+    fn measure_what_one_animated_frame_costs() {
+        // The budget the motion work had to fit inside, and the reason every effect is keyed
+        // by node and advanced from the viewport rather than from the tree. The frame rate
+        // goes to 33 ms while something is moving, so that — not 100 ms — is what these have
+        // to fit in, and the interesting cases are the two per-frame folds that are *not*
+        // bounded by the pane: the marks and the drains.
+        let tree = home();
+        let mut view = View::new(tree);
+        view.viewport(50);
+        view.apply(Action::Cursor(Motion::Top));
+        view.apply(Action::ToggleSubtree);
+        view.apply(Action::ToggleSubtree);
+        let epoch = Instant::now();
+        println!("rows: {}", view.rows().len());
+
+        let started = Instant::now();
+        for tick in 1..=100 {
+            view.animate(epoch + super::super::moving::COUNT_UP * tick);
+        }
+        println!("quiet frame:                {:?}", started.elapsed() / 100);
+
+        // A frame with something arriving on it, which is the only kind that does any work:
+        // `sync` folds the marks and the drains only when the tree or the marks moved, so a
+        // view a reader is sitting and looking at costs the line above and nothing more.
+        let started = Instant::now();
+        for tick in 101..=200u32 {
+            view.found(priced(&format!("/home/repos/late{tick}/node_modules"), 1));
+            view.animate(epoch + super::super::moving::COUNT_UP * tick);
+        }
+        println!("frame during a scan:        {:?}", started.elapsed() / 100);
+
+        // And the expensive one, which is the whole reason this is measured rather than
+        // assumed: sparing one row out of a marked-everything pushes the root's mark down the
+        // path to it, leaving a mark per sibling on the way — and one of those levels is
+        // 8,660 wide. Every frame that does any work then re-folds all of them.
+        view.apply(Action::MarkAll);
+        select(&mut view, "/home/types/p0/node_modules");
+        view.apply(Action::Mark);
+        println!("marks after a push-down:    {}", view.marks.len());
+        let started = Instant::now();
+        for tick in 201..=300u32 {
+            view.found(priced(&format!("/home/repos/later{tick}/node_modules"), 1));
+            view.animate(epoch + super::super::moving::COUNT_UP * tick);
+        }
+        println!("frame, marks pushed down:   {:?}", started.elapsed() / 100);
+    }
+
+    /// Puts the cursor on a row by walking to it, which is all a reader can do.
+    fn select(view: &mut View, path: &str) {
+        let want = std::path::PathBuf::from(path);
+        let at = view
+            .rows()
+            .iter()
+            .position(|row| view.tree().node(row.id).path == want)
+            .expect("the fixture is fully expanded");
+        view.apply(Action::Cursor(Motion::Top));
+        for _ in 0..at {
+            view.apply(Action::Cursor(Motion::Down));
+        }
     }
 }
