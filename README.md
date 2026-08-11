@@ -41,6 +41,7 @@ drilled into on demand.
 
 ```
  /Users/agentender/repos  165.9 GiB reclaimable in 10599 directories
+directory                                            size ↓        age  how to get it back
 [~] ▾ /Users/agentender/repos                     165.9 GiB         0h
 [~]   ▾ definitely-typed                           22.2 GiB        3mo
 [x]     ▸ types                                    21.8 GiB        3mo
@@ -73,7 +74,14 @@ one.
 - Sorting is per level, because children have to stay under their parent. `/` filters on a regex
   over the whole path, and a filtered row's number counts only what the filter shows, so a mark
   can never delete what you cannot see.
-- `?` lists every key, generated from the keymap rather than maintained beside it.
+- `?` lists every key and every mouse gesture, generated from the tables that dispatch them
+  rather than maintained beside them.
+- **The mouse works**, and it is a pointer rather than a link: click a row's box to mark it, its
+  `▸` to open it, its name to put the cursor there; click a column heading to sort by it and again
+  to reverse it; wheel to scroll. A click happens when the button comes *up* on the thing it went
+  down on, so dragging out a terminal selection never re-sorts the tree on its way. Double-click a
+  row to price that subtree — the one expensive thing worth asking for on one directory, which is
+  `--breakdown-under` reached by pointing at it.
 - A long sweep stays readable from outside the terminal: the window title carries the live figure
   (`pristine — pricing 41%`, `pristine — freed 41.2 GiB`), the dock or taskbar carries a real
   progress bar, and a run that took long enough raises one notification if you have looked away.
