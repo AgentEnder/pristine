@@ -35,6 +35,11 @@ use std::process::Command;
 /// from. Every artifact guarded here lives outside the crate.
 const ROOT: &str = "../..";
 
+/// GitHub's SSH host keys, pinned so the tap push can check what it is talking
+/// to. Repo-relative, and named once because both the test and the workflow have
+/// to agree on it.
+const KNOWN_HOSTS: &str = "dist/homebrew/github_known_hosts";
+
 fn read(rel: &str) -> String {
     let path = format!("{ROOT}/{rel}");
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
@@ -425,6 +430,71 @@ fn npm_pack_is_never_handed_an_owner_slash_repo_shorthand() {
             !spec.starts_with("npm/"),
             "`npm pack {spec}` is a GitHub owner/repo shorthand, not a path. \
              Write `./{spec}`:\n    {trimmed}"
+        );
+    }
+}
+
+/// The tap push authenticates the host it is pushing to, against keys pinned in
+/// this repository.
+///
+/// `ssh-keyscan github.com >> known_hosts` is the natural thing to write here
+/// and it authenticates nothing: it learns the host key from the very
+/// connection it is meant to be checking, so whoever answers the scan becomes
+/// the trusted host for the push that follows. Someone able to intercept the
+/// runner's network then receives the formula — and the deploy key's
+/// authentication attempt — while the job reports a clean push to the tap.
+///
+/// The pinned file is fetched over HTTPS from `api.github.com/meta`, where a
+/// certificate chain vouches for it, and committed. That moves the trust
+/// decision to review time from a scan re-run on every release.
+#[test]
+fn the_tap_push_checks_the_host_key_against_pinned_content() {
+    let yml = read(".github/workflows/release.yml");
+    for line in yml.lines() {
+        let trimmed = line.trim();
+        assert!(
+            trimmed.starts_with('#') || !trimmed.contains("ssh-keyscan"),
+            "`ssh-keyscan` learns the host key from the connection it is checking, which is \
+             not a check. Pin the keys instead:\n    {trimmed}"
+        );
+    }
+    assert!(
+        yml.contains("StrictHostKeyChecking=yes"),
+        "the tap push must set StrictHostKeyChecking=yes; `accept-new` is the same \
+         trust-on-first-use the pinned file exists to remove"
+    );
+    assert!(
+        yml.contains("UserKnownHostsFile=") && yml.contains(KNOWN_HOSTS),
+        "the tap push must point UserKnownHostsFile at {KNOWN_HOSTS}"
+    );
+
+    let pinned = read(KNOWN_HOSTS);
+    let entries: Vec<&str> = pinned
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "{KNOWN_HOSTS} has no entries; an empty known_hosts under \
+         StrictHostKeyChecking=yes fails every push"
+    );
+    for entry in &entries {
+        let mut fields = entry.split_whitespace();
+        let host = fields.next().unwrap_or_default();
+        let algorithm = fields.next().unwrap_or_default();
+        let key = fields.next().unwrap_or_default();
+        assert_eq!(
+            host, "github.com",
+            "{KNOWN_HOSTS} pins a host other than github.com: {entry}"
+        );
+        assert!(
+            algorithm.starts_with("ssh-") || algorithm.starts_with("ecdsa-"),
+            "{KNOWN_HOSTS} entry has no key algorithm: {entry}"
+        );
+        assert!(
+            key.len() > 40,
+            "{KNOWN_HOSTS} entry has no key material: {entry}"
         );
     }
 }

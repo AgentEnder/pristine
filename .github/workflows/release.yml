@@ -400,11 +400,30 @@ jobs:
           install -m 700 -d ~/.ssh
           printf '%s\n' "$TAP_DEPLOY_KEY" > ~/.ssh/tap_key
           chmod 600 ~/.ssh/tap_key
-          ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null
 
-          # `IdentitiesOnly` so the runner's own agent, if it has one, cannot
-          # offer a different key and get us rejected before this one is tried.
-          export GIT_SSH_COMMAND="ssh -i ~/.ssh/tap_key -o IdentitiesOnly=yes"
+          # Three options, each load-bearing:
+          #
+          #   IdentitiesOnly       so the runner's own agent, if it has one,
+          #                        cannot offer a different key and get us
+          #                        rejected before this one is tried.
+          #   StrictHostKeyChecking=yes
+          #                        refuse an unknown host outright. `accept-new`
+          #                        would be the same trust-on-first-use as the
+          #                        `ssh-keyscan` this replaced.
+          #   UserKnownHostsFile   GitHub's published host keys, committed at
+          #                        dist/homebrew/github_known_hosts. Scanning for
+          #                        them here would learn the key from the
+          #                        connection being checked, so whoever answered
+          #                        the scan would receive the formula and this
+          #                        key's authentication attempt while the job
+          #                        reported a clean push.
+          #
+          # The path is absolute: `git push` below runs after `cd tap`, so a
+          # relative one would resolve differently than it does for the clone and
+          # the push would fail on a host it had just accepted.
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/tap_key -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=${GITHUB_WORKSPACE}/dist/homebrew/github_known_hosts"
 
           git clone --depth 1 git@github.com:AgentEnder/homebrew-pristine.git tap
           mkdir -p tap/Formula
