@@ -109,8 +109,32 @@ The formula reaches the tap as a push over an SSH deploy key (`TAP_DEPLOY_KEY`),
 deploy key is scoped to one repository by construction rather than by a setting somebody has to get
 right, and it does not expire, so the tap cannot silently stop updating the way a lapsed PAT would.
 The cost is that a deploy key authenticates git transport and nothing else, so `repository_dispatch`
-is not available and the tap cannot come and fetch. When a push does not land, the tap's own
-`update-formula.yml` pulls the `pristine.rb` asset off the release instead.
+is not available and the tap cannot come and fetch.
+
+**The host key is pinned, not scanned.** `dist/homebrew/github_known_hosts` holds GitHub's published
+host keys and the push runs with `StrictHostKeyChecking=yes` against it. The obvious
+`ssh-keyscan github.com >> known_hosts` authenticates nothing — it learns the key from the very
+connection it is meant to check, so whoever answers the scan becomes the trusted host and receives
+the formula and the deploy key's authentication attempt, while the job reports a clean push. If
+GitHub rotates a key the push fails with `Host key verification failed`; refresh the file with
+`gh api meta --jq '.ssh_keys[]'` and re-check the fingerprints in its header against
+[GitHub's docs](https://docs.github.com/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints).
+
+**When a push does not land, there is no repair workflow in the tap, on purpose.** One would need a
+cross-repository credential: the tap's own `GITHUB_TOKEN` is scoped to the tap and cannot read a
+private AgentEnder/pristine's release assets, so a workflow there would fail with a 404 that reads
+like the tag does not exist. Two paths work with what already exists:
+
+```sh
+# From ~/repos/homebrew-pristine, with the access you already have.
+gh release download v0.1.0 --repo AgentEnder/pristine \
+  --pattern pristine.rb --output Formula/pristine.rb --clobber
+git commit -am "pristine 0.1.0" && git push
+```
+
+or re-run this workflow with `workflow_dispatch` against the tag, which regenerates the formula from
+that tag's checksums and pushes it again. A re-run against a version already on crates.io or npm will
+show those two publish jobs failing; the tap is updated by an earlier job and is unaffected.
 
 ### Why publishing is not `nx release publish`
 
