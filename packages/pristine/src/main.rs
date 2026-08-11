@@ -1,5 +1,5 @@
 //! `pristine` finds reclaimable build artifacts and vendored dependency directories across
-//! every ecosystem on a machine, and tells you what regenerates each one before you delete it.
+//! every ecosystem on a machine, and names what each one is before you delete it.
 //!
 //! There are two front ends and this file picks between them. At a terminal a sweep opens the
 //! rollup tree ([`pristine::tui`]), which is where marking a subtree and deleting a batch live;
@@ -12,8 +12,8 @@
 //!
 //! Properties of the output:
 //!
-//! - A tier-two hit says out loud that it does not know how to regenerate what it found. The
-//!   asymmetry against tier one is information rather than an omission.
+//! - A tier-two hit says out loud that it does not know what it found. The asymmetry against a
+//!   named tier-one row is information rather than an omission.
 //! - A tier that could not run says `inert` rather than printing nothing, because silence is
 //!   indistinguishable from a clean result and the two mean opposite things.
 //! - `--min-size` is a flag a person can type rather than a builder method.
@@ -837,18 +837,16 @@ fn question(selection: Selection, plan: &Plan) -> String {
     format!("\n{question}?")
 }
 
-/// One reclaimable directory, with what is known about getting it back.
+/// One reclaimable directory, with what is known about what it is.
 fn row(hit: &Hit, root: &Path) -> String {
     let path = hit.path.strip_prefix(root).unwrap_or(&hit.path);
-    let regenerate = hit.regenerate().unwrap_or(
-        // The asymmetry is the point: this tier knows the directory is safe to remove and
-        // knows nothing about what put it there, which tells you the deletion is not cheap.
-        "no known way to regenerate this",
-    );
+    // The asymmetry is the point: a tier-two row says only that git hides the directory, which
+    // is the honest thing it knows and tells you the deletion is not a cheap one.
     format!(
-        "{:>10}  {:<60}  {regenerate}",
+        "{:>10}  {:<60}  {}",
         hit.size.label(),
-        path.display()
+        path.display(),
+        hit.label()
     )
 }
 

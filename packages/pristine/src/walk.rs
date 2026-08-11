@@ -25,6 +25,7 @@
 //! fourth condition, "no tier-one rule already claimed it": there is no separate check for it
 //! anywhere, and there does not need to be.
 
+use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -39,7 +40,13 @@ use crate::rules::{Rule, Ruleset};
 use crate::size::{Measurer, Size, SizeMode};
 use crate::tree::Tree;
 
-/// Why a directory is reclaimable, and what is known about getting it back.
+/// What tier two says in place of a label.
+///
+/// Not a blank and not a guess: the fallback knows the directory is safe to remove and knows
+/// nothing whatever about what put it there, so it says exactly that. See [`IgnoredClaim`].
+pub const UNLABELLED: &str = "Gitignored, kind unknown";
+
+/// Why a directory is reclaimable, and what is known about it.
 #[derive(Debug, Clone)]
 pub enum Claim {
     /// Tier one: a marker-anchored rule recognised the project and named this directory as its
@@ -52,22 +59,18 @@ pub enum Claim {
 /// A claim made by the curated ruleset.
 #[derive(Debug, Clone)]
 pub struct RuleClaim {
-    /// The rule that matched, carrying its ecosystem label and any caveat.
+    /// The rule that matched, carrying the ecosystem, the kind and any caveat.
     pub rule: Arc<Rule>,
     /// The project whose markers justified the claim.
     pub project_root: PathBuf,
-    /// The concrete command that brings this directory back, resolved for this project — so
-    /// `pnpm install` rather than the rule's "npm ci / pnpm install / yarn" when a
-    /// `pnpm-lock.yaml` is what the project actually has.
-    pub regenerate: String,
 }
 
 /// A claim made by the tier-two gitignore fallback.
 ///
-/// There is no regeneration command here, and that is the point rather than an omission: this
+/// Nothing here says what the directory is, and that is the point rather than an omission: this
 /// tier knows the directory is safe to remove and knows nothing whatever about what put it
-/// there. The asymmetry against tier one is information — it tells the user which deletions are
-/// cheap and which are a leap.
+/// there. The asymmetry against tier one is information — a named row is a directory whose cost
+/// to lose is known, and an unnamed one is a leap.
 #[derive(Debug, Clone)]
 pub struct IgnoredClaim {
     /// The git work tree whose ignore stack and index justified the claim.
@@ -98,15 +101,17 @@ impl Hit {
         now.duration_since(self.modified?).ok()
     }
 
-    /// The command that brings this directory back, when anything knows one.
+    /// What this directory is: the ecosystem and the kind, or [`UNLABELLED`] when only git
+    /// knows the directory at all.
     ///
-    /// `None` for a tier-two hit. See [`IgnoredClaim`] for why that gap is worth carrying all
-    /// the way to the user rather than papering over.
+    /// A fact rather than a hint, which is the whole reason it replaced the command that used
+    /// to sit here. "`node_modules` is Node Dependencies" is checked; "`npm install` brings it
+    /// back" was a guess about a package manager, on a machine nothing here had looked at.
     #[must_use]
-    pub fn regenerate(&self) -> Option<&str> {
+    pub fn label(&self) -> Cow<'_, str> {
         match &self.claim {
-            Claim::Rule(claim) => Some(&claim.regenerate),
-            Claim::Ignored(_) => None,
+            Claim::Rule(claim) => Cow::Owned(claim.rule.label()),
+            Claim::Ignored(_) => Cow::Borrowed(UNLABELLED),
         }
     }
 

@@ -164,7 +164,6 @@ impl Detector {
             };
             if let Some(project_root) = anchor {
                 return Some(RuleClaim {
-                    regenerate: compiled.regeneration_command(&project_root, scan_root),
                     rule: Arc::clone(&compiled.rule),
                     project_root,
                 });
@@ -212,40 +211,6 @@ impl CompiledRule {
         }
 
         all || any
-    }
-
-    /// The concrete command that regenerates a claim owned by `project_root`.
-    ///
-    /// A rule with no `regenerate_when` entries — every rule but Node today — answers from
-    /// its own field without touching the filesystem. Node pays a handful of `stat` calls per
-    /// claim to turn "npm ci / pnpm install / yarn" into the one of those the project
-    /// actually uses.
-    ///
-    /// The search starts at the project root and walks up, because a workspace keeps one
-    /// lockfile at its root while every package under it has its own `package.json` and its
-    /// own `node_modules`. It stops at the scan root: a lockfile above the tree the user
-    /// pointed us at is not evidence we are entitled to use.
-    fn regeneration_command(&self, project_root: &Path, scan_root: &Path) -> String {
-        if self.rule.regenerate_when.is_empty() {
-            return self.rule.regenerate.clone();
-        }
-        let mut cursor = Some(project_root);
-        for _ in 0..MAX_ANCESTOR_SEARCH {
-            let Some(candidate) = cursor else { break };
-            if !candidate.starts_with(scan_root) {
-                break;
-            }
-            for when in &self.rule.regenerate_when {
-                if candidate.join(&when.marker).symlink_metadata().is_ok() {
-                    return when.regenerate.clone();
-                }
-            }
-            if candidate == scan_root {
-                break;
-            }
-            cursor = candidate.parent();
-        }
-        self.rule.regenerate.clone()
     }
 
     /// The nearest ancestor of `from` (inclusive) carrying this rule's markers, searched no

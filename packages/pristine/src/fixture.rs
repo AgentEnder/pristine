@@ -20,15 +20,14 @@ use crate::walk::{Claim, Hit, RuleClaim};
 /// these against each other, and one anchored to the real clock would drift.
 pub(crate) fn hit(path: &str, size: Size, seconds: u64) -> Hit {
     // Whichever rule is first. Nothing downstream of the walk reads the rule except to print
-    // the command that regenerates the directory, so which one it is does not matter — only
-    // that a tier-one claim has one and a tier-two claim does not.
+    // what the directory is, so which one it is does not matter — only that a tier-one claim
+    // has a rule and a tier-two claim does not.
     let ruleset = Ruleset::builtin().expect("the built-in ruleset parses");
     let rule = Arc::clone(&ruleset.rules()[0]);
     Hit {
         path: PathBuf::from(path),
         claim: Claim::Rule(RuleClaim {
             project_root: PathBuf::from("/scan"),
-            regenerate: rule.regenerate.clone(),
             rule,
         }),
         size,

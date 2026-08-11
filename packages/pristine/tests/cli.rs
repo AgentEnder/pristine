@@ -2,8 +2,8 @@
 //!
 //! Some of these are properties of the *output* and the library cannot hold them on its own:
 //! `--min-size` has to be a flag a person can type, a tier-two hit has to say out loud that it
-//! does not know how to regenerate what it found, and a tier that could not run has to say so
-//! instead of looking like a clean result.
+//! does not know what it found, and a tier that could not run has to say so instead of looking
+//! like a clean result.
 //!
 //! The rest are properties of the *run*, and no library test can hold them either: `--dry-run`
 //! has to be inert, the confirmation has to default to no, and a run that could not do
@@ -158,17 +158,16 @@ fn a_size_the_flag_cannot_read_is_refused_rather_than_guessed_at() {
 }
 
 #[test]
-fn the_output_says_which_deletions_are_cheap_and_which_are_not() {
+fn the_output_says_what_it_found_and_admits_what_it_does_not_know() {
     let tmp = repo_with_reclaimable_sediment();
     fs::write(tmp.path().join(".gitignore"), "sediment/\nnode_modules/\n").unwrap();
     write(&tmp.path().join("app/package.json"), 0);
-    write(&tmp.path().join("app/pnpm-lock.yaml"), 0);
     write(&tmp.path().join("app/node_modules/dep/index.js"), OVER);
 
     let printed = succeeds(tmp.path(), &["--min-size", "128K"]);
 
-    // Tier one knows the price of getting it back. Tier two knows only that it is safe to
-    // remove, and the asymmetry has to survive all the way into what the user reads.
+    // Tier one can name the artefact. Tier two knows only that git hides it, and the
+    // asymmetry has to survive all the way into what the user reads.
     let sediment = printed
         .lines()
         .find(|line| line.contains("sediment"))
@@ -178,11 +177,8 @@ fn the_output_says_which_deletions_are_cheap_and_which_are_not() {
         .find(|line| line.contains("node_modules"))
         .unwrap_or_else(|| panic!("no row for node_modules:\n{printed}"));
 
-    assert!(modules.contains("pnpm install"), "{modules}");
-    assert!(
-        sediment.contains("no known way to regenerate"),
-        "{sediment}"
-    );
+    assert!(modules.contains("Node Dependencies"), "{modules}");
+    assert!(sediment.contains("Gitignored, kind unknown"), "{sediment}");
 }
 
 #[test]
