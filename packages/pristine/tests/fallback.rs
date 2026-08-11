@@ -8,14 +8,14 @@
 
 // `allow-unwrap-in-tests` in clippy.toml only reaches code inside a `#[test]` function, and the
 // fixture helpers below sit outside one. An unwrap in a fixture is an assertion.
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-use pristine::{Claim, Hit, Ruleset, Size, SizeMode, Walker};
+use pristine::{Claim, Found, Hit, Ruleset, Size, SizeMode, Walker};
 use tempfile::TempDir;
 
 /// Comfortably over the floor the tests set, and nowhere near the 10 MiB default, so a test
@@ -82,15 +82,30 @@ fn walker(root: &Path) -> Walker {
 }
 
 /// Runs a walk and returns the hits in a deterministic order, asserting nothing went wrong.
+///
+/// Prices are folded back in, because a claim is published unpriced and its size follows as
+/// its own event. Tier two's claims arrive priced — the survey has already walked them — so
+/// this only ever matters here for a tier-one claim under a breakdown.
 fn scan_with(walker: &Walker) -> Vec<Hit> {
     let hits = Mutex::new(Vec::new());
-    let outcome = walker.run(|hit| hits.lock().unwrap().push(hit));
+    let sizes = Mutex::new(Vec::new());
+    let outcome = walker.run(|found| match found {
+        Found::Claim(hit) => hits.lock().unwrap().push(hit),
+        Found::Priced(priced) => sizes.lock().unwrap().push(priced),
+    });
     assert!(
         outcome.errors.is_empty(),
         "unexpected: {:?}",
         outcome.errors
     );
     let mut hits = hits.into_inner().unwrap();
+    for priced in sizes.into_inner().unwrap() {
+        let hit = hits
+            .iter_mut()
+            .find(|hit| hit.path == priced.path)
+            .expect("a price arrived for a claim nobody reported");
+        hit.size = priced.size;
+    }
     hits.sort_by(|a, b| a.path.cmp(&b.path));
     hits
 }
