@@ -41,6 +41,7 @@ drilled into on demand.
 
 ```
  /Users/agentender/repos  165.9 GiB reclaimable in 10599 directories
+directory                                            size ↓        age  how to get it back
 [▁] ▾ /Users/agentender/repos                     165.9 GiB         0h
 [▇]   ▾ definitely-typed                           22.2 GiB        3mo
 [x]     ▸ types                                    21.8 GiB        3mo
@@ -85,7 +86,22 @@ one.
 - Sorting is per level, because children have to stay under their parent. `/` filters on a regex
   over the whole path, and a filtered row's number counts only what the filter shows, so a mark
   can never delete what you cannot see.
-- `?` lists every key, generated from the keymap rather than maintained beside it.
+- `?` lists every key and every mouse gesture, generated from the tables that dispatch them
+  rather than maintained beside them.
+- **The mouse works**, and it is a pointer rather than a link: click a row's box to mark it, its
+  `▸` to open it, its name to put the cursor there; click a column heading to sort by it and again
+  to reverse it; wheel to scroll. A click happens when the button comes *up* on the thing it went
+  down on, so dragging out a terminal selection never re-sorts the tree on its way. Double-click a
+  row to price that subtree — the one expensive thing worth asking for on one directory, which is
+  `--breakdown-under` reached by pointing at it.
+- **A treemap sits beside the tree** on a terminal that reads the kitty graphics protocol
+  (Ghostty, kitty, WezTerm), showing the subtree the cursor is in with each rectangle's area
+  proportional to what it is worth. `m` turns it off. It answers "where are the bytes" in one
+  glance, and it is honest about what nobody has measured yet: unpriced claims are never drawn as
+  small rectangles among priced ones — they get a hatched region of their own, counted in
+  directories rather than in bytes, which shrinks as the prices land. Anywhere else there is
+  simply no pane: nothing probes the terminal, nothing is sent to one that might not decode it,
+  and the tree alone is the whole interface.
 - A long sweep stays readable from outside the terminal: the window title carries the live figure
   (`pristine — pricing 41%`, `pristine — freed 41.2 GiB`), the dock or taskbar carries a real
   progress bar, and a run that took long enough raises one notification if you have looked away.

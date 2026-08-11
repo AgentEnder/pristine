@@ -112,6 +112,20 @@ impl Order {
             Self::Age => "age",
         }
     }
+
+    /// What the tree's column heading calls the column this orders by.
+    ///
+    /// Not [`Order::label`], which is what the footer calls the *sort*. The column over the
+    /// names is headed `directory`, because that is what is under it; the footer says
+    /// `sort (path)`, because that is the key being cycled.
+    #[must_use]
+    pub fn column(self) -> &'static str {
+        match self {
+            Self::Size => "size",
+            Self::Path => "directory",
+            Self::Age => "age",
+        }
+    }
 }
 
 /// An order and whether it is upside down.

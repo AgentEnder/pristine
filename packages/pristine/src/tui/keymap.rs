@@ -28,12 +28,22 @@
 //! never shadow a global key, which is one assertion over the table rather than a property
 //! somebody has to keep noticing. An overlay is modal by *omission* — while one is up the
 //! chain simply does not contain the tree.
+//!
+//! # The pointer is a second table, for the same reason
+//!
+//! [`POINTER`] is to a mouse event what [`KEYMAP`] is to a keystroke, and it is a table for
+//! the argument written above rather than by analogy: the dispatcher, the help overlay and
+//! the guarantee that no gesture acts undocumented all read it. What it does *not* need is
+//! the chain — a press has coordinates, so "which surface is this" is answered by
+//! [`super::render::hit`] geometrically, and restating the order here would be two rules that
+//! have to agree.
 
 use std::fmt;
 use std::sync::LazyLock;
 
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use super::render::{Spot, Zone};
 use crate::tree::Order;
 
 /// Where a motion key wants the cursor.
@@ -103,12 +113,47 @@ pub enum Action {
     /// find out whether it is armed. The key **asks** and never deletes; the only thing that
     /// commits is the dialog handing back what it was holding.
     Commit,
+    /// `m` — show or hide the treemap pane.
+    ///
+    /// A key rather than a flag, and the reason is the one every part of [`super::treemap`]
+    /// turns on: an enhancement a reader cannot dismiss is not an enhancement. It is on the
+    /// tree's surface rather than among the globals because what it changes is how the tree
+    /// pane is laid out.
+    ToggleMap,
     /// `s` — the next sort key.
     CycleSort,
     /// `S` — the same key, upside down.
     ReverseSort,
-    /// `1` `2` `3` — a sort key by position, derived from [`Order::ALL`].
+    /// `1` `2` `3`, or a click on a column heading — order a level by that key.
+    ///
+    /// Reverses when it names the order already in force, and starts a *new* column the right
+    /// way up: see [`super::state::View::sort_by`].
     SortBy(Order),
+    /// A click on a row's name — put the cursor on that directory.
+    ///
+    /// By [`NodeId`](crate::tree::NodeId) and never by row index; see [`Spot::Row`].
+    Select(crate::tree::NodeId),
+    /// A click on a row's `▸` — open that row, or close it.
+    ///
+    /// The one thing `→` and `←` between them do, reached with one gesture and without the
+    /// cursor having to be there first.
+    OpenRow(crate::tree::NodeId),
+    /// A click on a row's `[ ]` — mark that row's subtree, or unmark it.
+    ///
+    /// `space` for a reader who is pointing. pristine draws a box on every row, and a box
+    /// that cannot be pressed is a lie the screen tells about itself.
+    MarkRow(crate::tree::NodeId),
+    /// A double click on a row — price everything under it that carries no price.
+    ///
+    /// The expensive thing a reader wants on one specific subtree, which is what
+    /// `--breakdown-under` is on the command line. A double click is the gesture for it
+    /// because it is the one that says "this one, in particular".
+    Price(crate::tree::NodeId),
+    /// The wheel over the tree — move the viewport, taking the cursor with it.
+    ///
+    /// Distinct from [`Cursor`](Self::Cursor), which moves the cursor and lets the viewport
+    /// follow: this is the other way round.
+    ScrollRows(Motion),
     /// `/` — open the filter prompt.
     OpenFilter,
     /// A printable character, while the prompt has it.
@@ -334,10 +379,14 @@ fn tree_keys() -> Vec<Binding> {
         map.push(bind(
             Surface::Tree,
             &[key(digit_for(nth))],
+            // Each sentence says the key turns its own order upside down when pressed again,
+            // because it does — the digits and a click on the heading are one door, and a
+            // reader who does not know that would press `S` and reverse whatever `s` last
+            // left in force instead.
             match order {
-                Order::Size => "sort by size — biggest subtree first",
-                Order::Path => "sort by path",
-                Order::Age => "sort by age — stalest first",
+                Order::Size => "sort by size, biggest subtree first — again to reverse",
+                Order::Path => "sort by path — again to reverse",
+                Order::Age => "sort by age, stalest first — again to reverse",
             },
             Action::SortBy(*order),
         ));
@@ -438,6 +487,12 @@ fn tree_verbs() -> Vec<Binding> {
             &[key('x')],
             "delete what is marked — asks first",
             Action::Commit,
+        ),
+        bind(
+            Tree,
+            &[key('m')],
+            "show or hide the map beside the tree",
+            Action::ToggleMap,
         ),
         bind(Tree, &[key('s')], "the next sort key", Action::CycleSort),
         bind(
@@ -697,10 +752,381 @@ fn lookup(surface: Surface, chord: Chord) -> Option<Action> {
         .map(|binding| binding.action)
 }
 
+// ---- the pointer ----------------------------------------------------------------------
+
+/// What the loop has judged one mouse event to be.
+///
+/// Judgements about *previous* events, which the one in hand cannot see — whether a press has
+/// already moved, whether one landed on this spot a moment ago — so they are made by
+/// [`super::Pointer`] and handed here. That keeps [`pointer()`] a pure function of one gesture
+/// and one spot, which is what makes the whole table assertable without a terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gesture {
+    /// A press, or the pointer merely passing over. It **aims and no more**.
+    ///
+    /// The rule the deferred click forced: at the moment the button goes down there is no way
+    /// to tell a click from a drag, so a press that acted would re-sort the tree under a hand
+    /// that was about to select from it. See [`finish`].
+    Aim,
+    /// A press and a release, with no movement between them — the click, at last.
+    Click,
+    /// Two clicks on one **row**, close enough together to be one gesture.
+    Double,
+    /// One turn of the wheel.
+    ///
+    /// The direction belongs to the *action* rather than to the row of the table: the wheel
+    /// does the same thing over a spot whichever way it turns, so both turns are one row and
+    /// [`Gesture::same`] is what keys them together.
+    Wheel(Motion),
+}
+
+impl Gesture {
+    /// Whether this is the gesture a table row describes.
+    ///
+    /// By kind rather than by value, which matters for exactly one variant: the two wheel
+    /// turns are one row of the table, and the row has to be written with *some* direction
+    /// in it.
+    fn same(self, row: Self) -> bool {
+        std::mem::discriminant(&self) == std::mem::discriminant(&row)
+    }
+
+    /// Which way the wheel turned, if it was the wheel.
+    fn motion(self) -> Option<Motion> {
+        match self {
+            Self::Wheel(motion) => Some(motion),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Gesture {
+    /// How the help overlay spells this gesture.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Aim => "point at",
+            Self::Click => "click",
+            Self::Double => "double-click",
+            Self::Wheel(_) => "wheel over",
+        })
+    }
+}
+
+/// What a gesture landed on, as the table names it — a [`Spot`] with the identity taken out.
+///
+/// The identity is what the *action* needs and what the table must not carry: a row of
+/// [`POINTER`] says "a click on a name selects", and which directory is a fact about the
+/// press rather than about the rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// A column heading.
+    Heading,
+    /// A row's mark box.
+    Box,
+    /// A row's expand indicator.
+    Indicator,
+    /// A row's name, and the space around it.
+    Name,
+    /// A row, whichever part of it — what a gesture that is not a click aims at.
+    Row,
+    /// The tree pane, past its last row.
+    Pane,
+    /// The help overlay.
+    Help,
+    /// One of a confirmation's two answers.
+    Answer,
+    /// A confirmation, off both of its answers.
+    Question,
+    /// The filter prompt.
+    Prompt,
+    /// Outside whichever overlay is up.
+    Away,
+    /// Chrome, or a frame with nothing on it.
+    Elsewhere,
+}
+
+impl Target {
+    /// Every target there is, for the assertions over the table.
+    pub const ALL: [Self; 12] = [
+        Self::Heading,
+        Self::Box,
+        Self::Indicator,
+        Self::Name,
+        Self::Row,
+        Self::Pane,
+        Self::Help,
+        Self::Answer,
+        Self::Question,
+        Self::Prompt,
+        Self::Away,
+        Self::Elsewhere,
+    ];
+
+    /// What this gesture, landing here, is aimed at.
+    ///
+    /// The zones are a **click**'s business and nothing else's. A double click and a wheel
+    /// turn are both claims about the row rather than about the cell of it under the hand —
+    /// "double-click a row" is what the gesture means everywhere, and a wheel that scrolled
+    /// differently over the mark box would be unusable.
+    fn of(gesture: Gesture, spot: Spot) -> Self {
+        match spot {
+            Spot::Heading(_) => Self::Heading,
+            Spot::Row { zone, .. } if matches!(gesture, Gesture::Click) => match zone {
+                Zone::Mark => Self::Box,
+                Zone::Open => Self::Indicator,
+                Zone::Name => Self::Name,
+            },
+            Spot::Row { .. } => Self::Row,
+            Spot::Tree => Self::Pane,
+            Spot::Help => Self::Help,
+            Spot::Answer(_) => Self::Answer,
+            Spot::Confirm => Self::Question,
+            Spot::Prompt => Self::Prompt,
+            Spot::Outside => Self::Away,
+            Spot::Nowhere => Self::Elsewhere,
+        }
+    }
+}
+
+/// One row of the pointer map: a gesture, where it lands, and what it does there.
+#[derive(Clone, Debug)]
+pub struct Pointing {
+    /// Which gesture.
+    pub gesture: Gesture,
+    /// Every spot it means this on. Several, exactly as a [`Binding`] has several chords: the
+    /// wheel scrolls the tree over the heading, over a row and over the empty pane below.
+    pub targets: &'static [Target],
+    /// How the help overlay names where it lands, as the object of [`Gesture`]'s verb.
+    pub place: &'static str,
+    /// The sentence the help overlay prints, in the same lower-case imperative the keymap's
+    /// sentences use.
+    pub what: &'static str,
+    /// What it produces. A function of the spot, because the action carries the identity the
+    /// table deliberately does not.
+    deed: fn(Gesture, Spot) -> Action,
+}
+
+impl Pointing {
+    /// The gesture, spelled as the overlay spells it.
+    #[must_use]
+    pub fn how(&self) -> String {
+        format!("{} {}", self.gesture, self.place)
+    }
+}
+
+const fn point(
+    gesture: Gesture,
+    targets: &'static [Target],
+    place: &'static str,
+    what: &'static str,
+    deed: fn(Gesture, Spot) -> Action,
+) -> Pointing {
+    Pointing {
+        gesture,
+        targets,
+        place,
+        what,
+        deed,
+    }
+}
+
+/// Every pointer gesture pristine has, in help order.
+///
+/// # Only the left button, and the wheel
+///
+/// The right and middle are left to the terminal's own menus. A **drag** is deliberately
+/// absent from this table and that is not an omission: a press that moved is not a click, and
+/// there is nothing else for it to be here — pristine has no text selection of its own, so a
+/// drag's only job is to make sure the press it belongs to never becomes one. See
+/// [`super::Pointer`].
+static POINTER: LazyLock<Vec<Pointing>> = LazyLock::new(|| {
+    vec![
+        point(
+            Gesture::Click,
+            &[Target::Heading],
+            "a column heading",
+            "order the levels by it — again to turn it upside down",
+            sort_by,
+        ),
+        point(
+            Gesture::Click,
+            &[Target::Box],
+            "a row's box",
+            "mark this row's whole subtree, or unmark it",
+            mark_row,
+        ),
+        point(
+            Gesture::Click,
+            &[Target::Indicator],
+            "a row's ▸",
+            "open the row, or close it",
+            open_row,
+        ),
+        point(
+            Gesture::Click,
+            &[Target::Name],
+            "a row's name",
+            "put the cursor on it",
+            select,
+        ),
+        point(
+            Gesture::Double,
+            &[Target::Row],
+            "a row",
+            "price this subtree — what --breakdown-under does, on one directory",
+            price,
+        ),
+        point(
+            Gesture::Aim,
+            &[Target::Answer],
+            "a confirmation's answer",
+            "highlight it, so the button under the pointer is the one a click takes",
+            aim,
+        ),
+        point(
+            Gesture::Click,
+            &[Target::Answer],
+            "a confirmation's answer",
+            "answer with it — the press has to have landed on it too",
+            answer,
+        ),
+        point(
+            Gesture::Click,
+            &[Target::Away],
+            "outside an overlay",
+            "close it, exactly as Esc does",
+            dismiss,
+        ),
+        point(
+            Gesture::Wheel(Motion::Down),
+            &[Target::Heading, Target::Row, Target::Pane],
+            "the tree",
+            "scroll the rows",
+            scroll_rows,
+        ),
+        point(
+            Gesture::Wheel(Motion::Down),
+            &[Target::Help],
+            "the help",
+            "scroll the page",
+            scroll_page,
+        ),
+    ]
+});
+
+/// The whole pointer map, for anything that renders or checks it.
+#[must_use]
+pub fn pointing() -> &'static [Pointing] {
+    &POINTER
+}
+
+/// What one mouse gesture means, given what it landed on.
+///
+/// There is no chain here, and that is the point. A key is offered to a list of surfaces
+/// because a keyboard has no coordinates; a press has them, so the same question is answered
+/// by [`super::render::hit`] — an overlay covers what it is over, so a press inside one cannot
+/// also be a press on the tree, and one outside is the dismissal.
+#[must_use]
+pub fn pointer(gesture: Gesture, spot: Spot) -> Action {
+    let target = Target::of(gesture, spot);
+    pointing()
+        .iter()
+        .find(|row| row.gesture.same(gesture) && row.targets.contains(&target))
+        .map_or(Action::Ignore, |row| (row.deed)(gesture, spot))
+}
+
+/// Letting go of a press that never moved — the click.
+///
+/// It acts on what the **press** landed on rather than on what the release did, which is the
+/// only rule that can be right: the press is the aimed half of the gesture, resolved against
+/// the frame the reader was looking at when they aimed.
+///
+/// A confirmation is the exception, and it is the one surface where the worst case is
+/// irreversible: there both halves have to land in the same button. That single equality is
+/// the whole guard, and it is stronger than it looks — [`Spot::Answer`] exists only on a frame
+/// that drew a question, so a press made *before* the box appeared can never equal one, and a
+/// box arriving under a held button cannot be answered by the hand that was already down.
+#[must_use]
+pub fn finish(pressed: Spot, double: bool, released: Spot) -> Action {
+    if matches!(pressed, Spot::Answer(_)) && pressed != released {
+        return Action::Ignore;
+    }
+    pointer(
+        if double {
+            Gesture::Double
+        } else {
+            Gesture::Click
+        },
+        pressed,
+    )
+}
+
+/// A click on a row, with the identity the table left out put back.
+fn on_row(spot: Spot, deed: fn(crate::tree::NodeId) -> Action) -> Action {
+    match spot {
+        Spot::Row { id, .. } => deed(id),
+        _ => Action::Ignore,
+    }
+}
+
+fn select(_: Gesture, spot: Spot) -> Action {
+    on_row(spot, Action::Select)
+}
+
+fn open_row(_: Gesture, spot: Spot) -> Action {
+    on_row(spot, Action::OpenRow)
+}
+
+fn mark_row(_: Gesture, spot: Spot) -> Action {
+    on_row(spot, Action::MarkRow)
+}
+
+fn price(_: Gesture, spot: Spot) -> Action {
+    on_row(spot, Action::Price)
+}
+
+fn sort_by(_: Gesture, spot: Spot) -> Action {
+    match spot {
+        Spot::Heading(order) => Action::SortBy(order),
+        _ => Action::Ignore,
+    }
+}
+
+/// Aiming at an answer moves the *keyboard's* highlight, which is what keeps the pointer and
+/// the arrow keys driving one selection rather than two.
+fn aim(_: Gesture, spot: Spot) -> Action {
+    match spot {
+        Spot::Answer(answer) => Action::Highlight(answer.turn()),
+        _ => Action::Ignore,
+    }
+}
+
+/// Taking the answer the press aimed at, which the press has already highlighted.
+fn answer(_: Gesture, spot: Spot) -> Action {
+    match spot {
+        Spot::Answer(_) => Action::Answer,
+        _ => Action::Ignore,
+    }
+}
+
+fn dismiss(_: Gesture, _: Spot) -> Action {
+    Action::Back
+}
+
+fn scroll_rows(gesture: Gesture, _: Spot) -> Action {
+    gesture.motion().map_or(Action::Ignore, Action::ScrollRows)
+}
+
+fn scroll_page(gesture: Gesture, _: Spot) -> Action {
+    gesture.motion().map_or(Action::Ignore, Action::Scroll)
+}
+
 /// The help page, as headed groups of `(keys, sentence)`.
 ///
-/// Generated from the table rather than written, which is what keeps it honest: a binding
+/// Generated from the tables rather than written, which is what keeps it honest: a binding
 /// added without a sentence does not compile, and a sentence with no binding cannot exist.
+/// The pointer's rows are generated the same way and for the same reason — a gesture that
+/// acts while being undocumented is exactly the failure these tables exist to make
+/// impossible.
 #[must_use]
 pub fn help() -> Vec<(&'static str, Vec<(String, &'static str)>)> {
     let surfaces = [
@@ -710,7 +1136,7 @@ pub fn help() -> Vec<(&'static str, Vec<(String, &'static str)>)> {
         Surface::Confirm,
         Surface::Help,
     ];
-    surfaces
+    let mut page: Vec<(&'static str, Vec<(String, &'static str)>)> = surfaces
         .into_iter()
         .map(|surface| {
             let rows = bindings()
@@ -720,12 +1146,22 @@ pub fn help() -> Vec<(&'static str, Vec<(String, &'static str)>)> {
                 .collect();
             (surface.title(), rows)
         })
-        .collect()
+        .collect();
+    page.push((
+        "The pointer",
+        pointing().iter().map(|row| (row.how(), row.what)).collect(),
+    ));
+    page
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, Chord, Motion, Overlay, Surface, action_for, bindings, help, lookup};
+    use super::{
+        Action, Chord, Gesture, Motion, Overlay, Spot, Surface, Target, Turn, Zone, action_for,
+        bindings, finish, help, lookup, pointer, pointing,
+    };
+    use crate::tree::{NodeId, Order};
+    use crate::tui::state::Answer;
     use ratatui::crossterm::event::{
         Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
     };
@@ -736,6 +1172,38 @@ mod tests {
 
     fn letter(letter: char) -> Event {
         press(KeyCode::Char(letter))
+    }
+
+    /// A spot of each kind, for the assertions that sweep the whole pointer map.
+    ///
+    /// One per [`Target`], in the same order, so a target added without a spot to reach it
+    /// with does not compile.
+    fn spot(target: Target) -> Spot {
+        const ROW: NodeId = 7;
+        match target {
+            Target::Heading => Spot::Heading(Order::Size),
+            Target::Box => Spot::Row {
+                id: ROW,
+                zone: Zone::Mark,
+            },
+            Target::Indicator => Spot::Row {
+                id: ROW,
+                zone: Zone::Open,
+            },
+            // A row aimed at by something other than a click resolves to `Target::Row`
+            // whichever zone it names, so the name is as good a stand-in as any.
+            Target::Name | Target::Row => Spot::Row {
+                id: ROW,
+                zone: Zone::Name,
+            },
+            Target::Pane => Spot::Tree,
+            Target::Help => Spot::Help,
+            Target::Answer => Spot::Answer(Answer::Delete),
+            Target::Question => Spot::Confirm,
+            Target::Prompt => Spot::Prompt,
+            Target::Away => Spot::Outside,
+            Target::Elsewhere => Spot::Nowhere,
+        }
     }
 
     #[test]
@@ -792,9 +1260,9 @@ mod tests {
     }
 
     #[test]
-    fn the_help_page_lists_every_binding_there_is() {
+    fn the_help_page_lists_every_binding_and_every_gesture_there_is() {
         let listed: usize = help().iter().map(|(_, rows)| rows.len()).sum();
-        assert_eq!(listed, bindings().len());
+        assert_eq!(listed, bindings().len() + pointing().len());
     }
 
     #[test]
@@ -875,5 +1343,176 @@ mod tests {
         assert_eq!(Chord::plain(KeyCode::Char(' ')).to_string(), "space");
         assert_eq!(Chord::ctrl('u').to_string(), "Ctrl-u");
         assert_eq!(Chord::plain(KeyCode::Up).to_string(), "↑");
+    }
+
+    // ---- the pointer ------------------------------------------------------------------
+
+    #[test]
+    fn no_row_of_the_pointer_map_is_dead() {
+        // The table *is* the dispatcher, so "a gesture that acts is a gesture the help page
+        // lists" holds by construction. What does not is the other direction: a row wired to
+        // the wrong shape of spot — `sort_by` under a `Row` target — would document a
+        // gesture that quietly does nothing. Each row is asked for its own gesture on each
+        // of its own targets, which is exactly the sentence the help page prints.
+        for row in pointing() {
+            for &target in row.targets {
+                assert_ne!(
+                    pointer(row.gesture, spot(target)),
+                    Action::Ignore,
+                    "{:?} does nothing, and the help page says {:?}",
+                    row.how(),
+                    row.what
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_spot_gives_one_gesture_two_meanings() {
+        for gesture in [
+            Gesture::Aim,
+            Gesture::Click,
+            Gesture::Double,
+            Gesture::Wheel(Motion::Down),
+        ] {
+            for target in Target::ALL {
+                let claimants = pointing()
+                    .iter()
+                    .filter(|row| row.gesture.same(gesture) && row.targets.contains(&target))
+                    .count();
+                assert!(claimants <= 1, "{gesture} {target:?} is bound twice");
+            }
+        }
+    }
+
+    #[test]
+    fn a_row_is_named_by_its_directory_and_never_by_where_it_is_on_the_screen() {
+        // The rule the whole model turns on. The action a press produces carries the
+        // `NodeId`, so the row it acts on is the one that was pressed even after a price
+        // lands and re-sorts the level under the hand.
+        let spot = Spot::Row {
+            id: 42,
+            zone: Zone::Name,
+        };
+        assert_eq!(pointer(Gesture::Click, spot), Action::Select(42));
+        assert_eq!(pointer(Gesture::Double, spot), Action::Price(42));
+    }
+
+    #[test]
+    fn the_zones_of_a_row_are_a_clicks_business_and_nothing_elses() {
+        // Each part of a row does its own thing under a click…
+        for (zone, action) in [
+            (Zone::Mark, Action::MarkRow(3)),
+            (Zone::Open, Action::OpenRow(3)),
+            (Zone::Name, Action::Select(3)),
+        ] {
+            assert_eq!(
+                pointer(Gesture::Click, Spot::Row { id: 3, zone }),
+                action,
+                "{zone:?}"
+            );
+            // …and every part of it is the same row to a double click and to the wheel. A
+            // wheel that scrolled differently over the mark box would be unusable, and
+            // "double-click a row" is what the gesture means everywhere.
+            assert_eq!(
+                pointer(Gesture::Double, Spot::Row { id: 3, zone }),
+                Action::Price(3),
+                "{zone:?}"
+            );
+            assert_eq!(
+                pointer(Gesture::Wheel(Motion::Down), Spot::Row { id: 3, zone }),
+                Action::ScrollRows(Motion::Down),
+                "{zone:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_press_aims_and_does_no_more_than_aim() {
+        // The rule the deferred click exists for: at the moment the button goes down there
+        // is no telling a click from a drag, so a press that acted would re-sort the tree
+        // under the hand that was about to select from it.
+        for target in Target::ALL {
+            let aimed = pointer(Gesture::Aim, spot(target));
+            let expected = match target {
+                // The one exception, and it is not really one: highlighting the button under
+                // the pointer moves a selection, which a hover would have moved too.
+                Target::Answer => Action::Highlight(Turn::Next),
+                _ => Action::Ignore,
+            };
+            assert_eq!(aimed, expected, "{target:?}");
+        }
+    }
+
+    #[test]
+    fn the_click_acts_on_what_the_press_was_aimed_at() {
+        // The release's own spot is not the target: a hand that lets go a cell off the
+        // heading it pressed has still clicked that heading, and the press is the aimed half
+        // of the gesture.
+        assert_eq!(
+            finish(Spot::Heading(Order::Age), false, Spot::Nowhere),
+            Action::SortBy(Order::Age)
+        );
+    }
+
+    #[test]
+    fn a_confirmation_is_the_one_surface_that_needs_both_halves_in_the_same_button() {
+        let delete = Spot::Answer(Answer::Delete);
+        assert_eq!(finish(delete, false, delete), Action::Answer);
+
+        // Landing near an answer, or on the other one, is a miss — and so is a press made
+        // *before* the box appeared, which is the case that matters: `Spot::Answer` exists
+        // only on a frame that drew a question, so such a press can never equal one, and a
+        // box arriving under a held button cannot be answered by the hand already down.
+        assert_eq!(finish(delete, false, Spot::Confirm), Action::Ignore);
+        assert_eq!(
+            finish(delete, false, Spot::Answer(Answer::Cancel)),
+            Action::Ignore
+        );
+        assert_eq!(finish(Spot::Tree, false, delete), Action::Ignore);
+    }
+
+    #[test]
+    fn a_press_inside_an_overlay_that_lands_on_nothing_does_nothing() {
+        // Deliberately not a dismissal: a press on a caveat line or on the prompt's own text
+        // is a miss, and closing the thing being read is the one response that loses work.
+        for spot in [Spot::Help, Spot::Prompt, Spot::Confirm, Spot::Nowhere] {
+            assert_eq!(pointer(Gesture::Click, spot), Action::Ignore, "{spot:?}");
+        }
+        // Outside it is the dismissal, which is `Esc`'s own action rather than a second one.
+        assert_eq!(pointer(Gesture::Click, Spot::Outside), Action::Back);
+    }
+
+    #[test]
+    fn the_wheel_means_the_nearest_thing_to_scrolling_each_surface_has() {
+        // Over the tree it moves the viewport; over the help overlay it moves a document.
+        // Those are genuinely different verbs, and over a question it is neither — a wheel
+        // is not a way past something that swallowed the keyboard.
+        assert_eq!(
+            pointer(Gesture::Wheel(Motion::Up), Spot::Tree),
+            Action::ScrollRows(Motion::Up)
+        );
+        assert_eq!(
+            pointer(Gesture::Wheel(Motion::Down), Spot::Help),
+            Action::Scroll(Motion::Down)
+        );
+        for spot in [Spot::Confirm, Spot::Answer(Answer::Delete), Spot::Nowhere] {
+            assert_eq!(
+                pointer(Gesture::Wheel(Motion::Down), spot),
+                Action::Ignore,
+                "{spot:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_help_page_spells_a_gesture_the_way_a_reader_would_say_it() {
+        let page = help();
+        let (title, rows) = page.last().unwrap();
+        assert_eq!(*title, "The pointer");
+        let said: Vec<&str> = rows.iter().map(|(how, _)| how.as_str()).collect();
+        assert!(said.contains(&"double-click a row"), "{said:?}");
+        assert!(said.contains(&"wheel over the tree"), "{said:?}");
+        assert!(said.contains(&"click a column heading"), "{said:?}");
     }
 }
