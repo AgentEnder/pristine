@@ -23,6 +23,12 @@
 //! than the scan it prices. [`SizeMode::BreakdownUnder`](size::SizeMode::BreakdownUnder) buys
 //! the same answer for one subtree at that subtree's price, and is what a TUI drill-in runs.
 //!
+//! When a breakdown is asked for, **the prices do not hold the claims up**. A claim is
+//! published as [`Found::Claim`] the moment it is judged and a pool of threads prices it
+//! afterwards, reporting [`Found::Priced`] for the same path; over one real `~/repos` that
+//! moves the last row of the listing from 60.1 s to 7.5 s while the totals take the same
+//! minute either way. [`Walker::run`] explains the shape and carries the measurements.
+//!
 //! Detection is marker-anchored and never name-anchored: a rule is "a directory named
 //! `target` whose parent holds a `Cargo.toml`", never "a directory named `target`".
 //! `target` is Rust's and Maven's, `vendor` is Go's and Composer's and Bundler's, and `build`
@@ -66,4 +72,6 @@ pub use repo::{Class, Enumeration, Repo, RepoError, Reset, Selected, Selection};
 pub use rules::{Anchor, MarkersRequired, RegenerateWhen, Rule, RuleError, Ruleset};
 pub use size::{Measurement, Measurer, Size, SizeMode, Survey};
 pub use tree::{Node, NodeId, Tree};
-pub use walk::{Claim, Hit, IgnoredClaim, RuleClaim, WalkError, WalkOutcome, Walker};
+pub use walk::{
+    Claim, Found, Hit, IgnoredClaim, Priced, RuleClaim, WalkError, WalkOutcome, Walker,
+};

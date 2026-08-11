@@ -120,6 +120,40 @@ impl Hit {
     }
 }
 
+/// What a walk reports, as it happens.
+///
+/// Two events rather than one, because a claim and its price are found at different times and
+/// waiting for the second would throw away the first. See [`Walker::run`].
+#[derive(Debug)]
+pub enum Found {
+    /// A directory was claimed. Published the moment the claim is judged, whatever the size
+    /// mode: nothing here ever waits for a measurement.
+    Claim(Hit),
+    /// A claim that was published without a size now has one.
+    ///
+    /// Arrives after the [`Found::Claim`] it belongs to — always, because the claim is
+    /// published before the pricing pool is even told about it — and on a different thread.
+    Priced(Priced),
+}
+
+/// A price for a claim that was published without one.
+#[derive(Debug, Clone)]
+pub struct Priced {
+    /// The claimed directory, spelled exactly as its [`Hit`] spelled it.
+    pub path: PathBuf,
+    /// What the traversal found.
+    pub size: Size,
+}
+
+/// One claim waiting for the pricing pool.
+///
+/// The metadata travels with the path because the walk has already paid for it, and measuring
+/// starts from the claim's own block count.
+struct Job {
+    path: PathBuf,
+    metadata: std::fs::Metadata,
+}
+
 /// Something the walk could not read. Collected rather than fatal: one unreadable directory
 /// must not cost the user the rest of the scan.
 #[derive(Debug)]
@@ -236,14 +270,45 @@ impl Walker {
         self
     }
 
-    /// Runs the walk, calling `on_hit` from a walker thread as each claim is found.
+    /// Runs the walk, calling `on_found` as each claim is found and again as each is priced.
     ///
-    /// `on_hit` is called concurrently from several threads and while the walk is still
-    /// running — that is the point, since the TUI renders rows as they arrive. It must not
-    /// block for long, or it becomes the walk's bottleneck.
-    pub fn run<F>(&self, on_hit: F) -> WalkOutcome
+    /// `on_found` is called concurrently, from the walker threads and from the pricing pool,
+    /// and while the walk is still running — that is the point, since the TUI renders rows as
+    /// they arrive. It must not block for long, or it becomes the walk's bottleneck.
+    ///
+    /// ## Why a claim and its price are two events
+    ///
+    /// Pricing a claim means walking the subtree the scan just pruned at, and that is an order
+    /// of magnitude more work than finding it. Measured over one real `~/repos`, 10,599
+    /// claims, under a full breakdown:
+    ///
+    /// | | last claim published | run complete |
+    /// |---|---|---|
+    /// | priced on the walker thread | 60.1 s | 60.1 s |
+    /// | priced on the pool | **7.5 s** | 63.0 s |
+    ///
+    /// Those two left-hand numbers are the whole change. Measuring on the walker thread makes
+    /// every claim's *publication* wait behind its own measurement, so the listing completes
+    /// only when the last byte has been counted and a front end has nothing whatever to render
+    /// for a minute. That is npkill's bargain, and not making it is what the pruning was for.
+    ///
+    /// So a claim is published the moment it is judged, carrying [`Size::Unmeasured`], and is
+    /// then handed to a pool of pricing threads. Its size arrives afterwards as
+    /// [`Found::Priced`], naming the same path, and a consumer updates the row in place.
+    ///
+    /// **`run` still does not return until the pool has drained**, so every number in the
+    /// returned [`WalkOutcome`] is final. A consumer that only wants totals — the command
+    /// line, today — need not care that any of this happened.
+    ///
+    /// The pool is one thread per walker thread. Oversubscribing it is the obvious next idea
+    /// and it was measured, because the deleter oversubscribes for exactly this reason: at
+    /// four times the threads the same scan takes **85.8 s** and does not publish its last
+    /// claim until 30.7 s. Pricing is `readdir` and `lstat`, which is 97% kernel time and
+    /// contends; `unlink` and `rmdir` wait on the disk and do not. The conclusion from the
+    /// deleter does not carry over here.
+    pub fn run<F>(&self, on_found: F) -> WalkOutcome
     where
-        F: Fn(Hit) + Send + Sync,
+        F: Fn(Found) + Send + Sync,
     {
         let fallback = self
             .fallback
@@ -253,7 +318,7 @@ impl Walker {
             detector: self.ruleset.detector(),
             measurer: Measurer::new(self.size_mode.clone()).same_file_system(self.same_file_system),
             min_size: self.min_size,
-            on_hit,
+            on_found,
             errors: Mutex::new(Vec::new()),
             hits: AtomicUsize::new(0),
             fallback_hits: AtomicUsize::new(0),
@@ -265,29 +330,46 @@ impl Walker {
         let threads = self.threads.unwrap_or_else(|| {
             std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
         });
+        // No pool at all under the default mode, which is the hot path and queues nothing.
+        // Threads that could only ever block on an empty queue are not free, and a pool with
+        // no work in it is harder to reason about than no pool.
+        let pricers = if self.size_mode == SizeMode::Skip {
+            0
+        } else {
+            threads
+        };
 
-        let mut builder = WalkBuilder::new(self.root.as_path());
-        builder
-            .hidden(false)
-            .parents(false)
-            .ignore(false)
-            .git_global(false)
-            .git_ignore(false)
-            .git_exclude(false)
-            .follow_links(self.follow_links)
-            .same_file_system(self.same_file_system)
-            .threads(threads)
-            .max_depth(self.max_depth)
-            // Git's object store is large, never reclaimable, and full of names that would
-            // waste marker probes.
-            .filter_entry(|entry| entry.file_name() != OsStr::new(".git"));
+        let builder = self.builder(threads);
 
-        builder.build_parallel().run(|| {
-            // Per-thread, because tier two's matchers mutate as they learn and sharing one
-            // would mean a lock on the hottest path in the scan.
-            let mut tier_two = fallback.as_ref().map(Fallback::thread);
-            let scan = &scan;
-            Box::new(move |result| scan.visit(tier_two.as_mut(), result))
+        // Deliberately unbounded, and the bound that matters is on the POOL rather than on the
+        // queue. A bounded queue is backpressure, and backpressure here means stalling the
+        // walk until pricing catches up — which is exactly the wait this exists to remove. Over
+        // `~/repos` any bound below the 10,599 claims would stretch a 4.6 s scan out to the
+        // 56 s the pricing takes, and the last rows would reach the screen last. What it costs
+        // instead is one path and one `stat` per claim not yet priced, which is strictly less
+        // than the `Hit` the consumer is already holding for that same claim.
+        let (submit, queue) = std::sync::mpsc::channel::<Job>();
+        let queue = Mutex::new(queue);
+
+        std::thread::scope(|pool| {
+            for _ in 0..pricers {
+                pool.spawn(|| scan.price(&queue));
+            }
+
+            // An inner scope so that every sender is dropped before the pool is joined: the
+            // walk's clones go when `ignore` joins its own threads, and this one goes at the
+            // closing brace. A pricing thread ends when the last sender is gone, not before.
+            {
+                let submit = submit;
+                builder.build_parallel().run(|| {
+                    // Per-thread, because tier two's matchers mutate as they learn and sharing
+                    // one would mean a lock on the hottest path in the scan.
+                    let mut tier_two = fallback.as_ref().map(Fallback::thread);
+                    let scan = &scan;
+                    let submit = submit.clone();
+                    Box::new(move |result| scan.visit(tier_two.as_mut(), &submit, result))
+                });
+            }
         });
 
         let mut errors = std::mem::take(&mut *lock(&scan.errors));
@@ -316,23 +398,63 @@ impl Walker {
         }
     }
 
-    /// Runs the walk and files every hit into a rollup tree.
+    /// The parallel walk itself, configured to be a plain traversal.
     ///
-    /// The tree is correct at every moment, so a caller that wants to render while scanning
-    /// can build the same thing itself around [`Walker::run`] and read the shared tree
-    /// between updates.
+    /// Every ignore source is off, and that is tier one's requirement rather than an
+    /// oversight: `node_modules`, `target` and `.venv` are gitignored in every repository that
+    /// has a `.gitignore`, so a filtering walk would find almost nothing. `hidden(false)` is
+    /// the same point — `.venv`, `.gradle`, `.nx` and `.build` all start with a dot. Tier two
+    /// brings its own matcher and queries it per path instead.
+    fn builder(&self, threads: usize) -> WalkBuilder {
+        let mut builder = WalkBuilder::new(self.root.as_path());
+        builder
+            .hidden(false)
+            .parents(false)
+            .ignore(false)
+            .git_global(false)
+            .git_ignore(false)
+            .git_exclude(false)
+            .follow_links(self.follow_links)
+            .same_file_system(self.same_file_system)
+            .threads(threads)
+            .max_depth(self.max_depth)
+            // Git's object store is large, never reclaimable, and full of names that would
+            // waste marker probes.
+            .filter_entry(|entry| entry.file_name() != OsStr::new(".git"));
+        builder
+    }
+
+    /// Runs the walk and files every hit into a rollup tree, pricing included.
+    ///
+    /// The tree is correct at every moment — after each claim and after each late price — so a
+    /// caller that wants to render while scanning can build the same thing itself around
+    /// [`Walker::run`] and read the shared tree between updates.
     #[must_use]
     pub fn run_to_tree(&self) -> (Tree, WalkOutcome) {
         let tree = Mutex::new(Tree::new(&self.root));
         let stray = Mutex::new(Vec::new());
 
-        let mut outcome = self.run(|hit| {
-            let path = hit.path.clone();
-            if lock(&tree).insert(hit).is_none() {
-                lock(&stray).push(WalkError {
-                    path: Some(path),
-                    message: "claimed directory is not under the scan root".to_owned(),
-                });
+        let mut outcome = self.run(|found| match found {
+            Found::Claim(hit) => {
+                let path = hit.path.clone();
+                if lock(&tree).insert(hit).is_none() {
+                    lock(&stray).push(WalkError {
+                        path: Some(path),
+                        message: "claimed directory is not under the scan root".to_owned(),
+                    });
+                }
+            }
+            // A price for a row the tree does not hold, or holds priced already, would be
+            // double-counted rather than absorbed — so `price` refuses it and it is reported,
+            // on the same rule as a claim from outside the root.
+            Found::Priced(priced) => {
+                if lock(&tree).price(&priced.path, priced.size).is_none() {
+                    lock(&stray).push(WalkError {
+                        path: Some(priced.path),
+                        message: "priced directory is not an unpriced claim in this tree"
+                            .to_owned(),
+                    });
+                }
             }
         });
 
@@ -351,7 +473,7 @@ struct Scan<'a, F> {
     /// The floor a tier-two claim has to clear. Tier one is exempt: a rule that names a
     /// directory has already said it is output.
     min_size: u64,
-    on_hit: F,
+    on_found: F,
     errors: Mutex<Vec<WalkError>>,
     hits: AtomicUsize,
     fallback_hits: AtomicUsize,
@@ -362,12 +484,13 @@ struct Scan<'a, F> {
 
 impl<F> Scan<'_, F>
 where
-    F: Fn(Hit) + Send + Sync,
+    F: Fn(Found) + Send + Sync,
 {
     /// Judges one entry of the walk.
     fn visit(
         &self,
         tier_two: Option<&mut crate::fallback::Thread<'_>>,
+        submit: &std::sync::mpsc::Sender<Job>,
         result: Result<DirEntry, ignore::Error>,
     ) -> WalkState {
         let entry = match result {
@@ -417,7 +540,18 @@ where
             }
         };
 
+        // Whether this claim's size costs a traversal, and so belongs to the pricing pool
+        // rather than to this thread. Decided before the claim is published, because it
+        // decides what size the claim is published with.
+        let queued =
+            matches!(claim, Claim::Rule(_)) && self.measurer.traverses(entry.path(), &metadata);
+
         let size = match &claim {
+            // Nothing is measured here when the pool is taking it: the claim goes out
+            // unpriced and the number follows. What is left for this branch is the claim
+            // whose size is free — a symlink, one `lstat` the walk already did — and the
+            // claim no mode asked to price, which stays `Unmeasured`.
+            Claim::Rule(_) if queued => Size::Unmeasured,
             Claim::Rule(_) => {
                 let measured = self.measurer.measure(entry.path(), &metadata);
                 self.report_blind_spots(
@@ -426,47 +560,13 @@ where
                 );
                 measured.size
             }
-            Claim::Ignored(_) => {
-                let surveyed = self.measurer.survey(entry.path(), &metadata);
-                let blind_spots =
-                    !surveyed.unreadable.is_empty() || !surveyed.not_crossed.is_empty();
-                self.report_blind_spots(
-                    surveyed.unreadable,
-                    "unreadable, so this subtree could not be judged reclaimable",
-                );
-                self.report_blind_spots(
-                    surveyed.not_crossed,
-                    "on another filesystem, so this subtree could not be judged reclaimable",
-                );
-                if blind_spots {
-                    // Part of the subtree could not be read, so neither "holds no checkout" nor
-                    // the size is established — both are claims about the whole of it. Tier one
-                    // can live with a lower bound because a rule already vouched for the
-                    // directory; here the traversal *is* the evidence, and unjudgeable ground
-                    // is left alone. The paths went into the errors above, so the user can see
-                    // why a directory they expected did not appear.
-                    return WalkState::Continue;
-                }
-                if surveyed.nested_repo.is_some() {
-                    // Somebody's checkout lives in here, so this directory is not a single
-                    // thing to be removed. `git clean` descends past it rather than collapsing
-                    // it, and so do we — subdirectories with no checkout under them are still
-                    // claimable on their own.
-                    self.holding_a_checkout.fetch_add(1, Ordering::Relaxed);
-                    return WalkState::Continue;
-                }
-                if surveyed
-                    .size
-                    .bytes()
-                    .is_none_or(|bytes| bytes < self.min_size)
-                {
-                    // Below the floor, so not a claim — but keep descending. A rule may still
-                    // match deeper, and an ignored directory that holds a tracked file can
-                    // still have reclaimable subdirectories under it that do not.
-                    return WalkState::Continue;
-                }
-                surveyed.size
-            }
+            Claim::Ignored(_) => match self.survey(entry.path(), &metadata) {
+                Some(size) => size,
+                // Refused, and always by descending rather than pruning: a rule may still match
+                // deeper, and an ignored directory holding a tracked file can still have
+                // reclaimable subdirectories under it that do not.
+                None => return WalkState::Continue,
+            },
         };
 
         self.hits.fetch_add(1, Ordering::Relaxed);
@@ -481,15 +581,104 @@ where
                 self.unmeasured.fetch_add(1, Ordering::Relaxed);
             }
         }
-        (self.on_hit)(Hit {
-            path: entry.into_path(),
+        let path = entry.into_path();
+        let queued = queued.then(|| path.clone());
+        (self.on_found)(Found::Claim(Hit {
+            path,
             claim,
             size,
             modified: metadata.modified().ok(),
-        });
+        }));
+
+        // Queued only after the claim has been published, and that order is load-bearing: a
+        // pricing thread is running already, so submitting first would let a `Priced` reach
+        // the consumer for a row it has not been told about.
+        if let Some(path) = queued {
+            if let Err(returned) = submit.send(Job { path, metadata }) {
+                // Unreachable while the pool's receiver is alive, which it is for the whole
+                // walk. Reported rather than dropped: a claim queued and never priced would
+                // otherwise be indistinguishable from one nobody asked to price.
+                self.fail(
+                    Some(returned.0.path),
+                    "could not be queued for pricing".to_owned(),
+                );
+            }
+        }
 
         // The whole thesis, in one line: what we have claimed, we do not enumerate.
         WalkState::Skip
+    }
+
+    /// The one pass tier two needs over a candidate, and the three ways it can refuse.
+    ///
+    /// Returns the size when the directory is claimable, and `None` when it is not — each
+    /// refusal already reported to the user through the errors or the checkout count, because
+    /// a directory somebody expected to see and did not is exactly what needs explaining.
+    ///
+    /// Unlike tier one this never goes near the pricing pool. The survey is not optional work:
+    /// neither the size floor nor "holds no checkout" can be inferred, and the second is a
+    /// negative, which is only proved by covering everything. By the time the tier can say
+    /// "claim", it has already paid for the number.
+    fn survey(&self, path: &Path, metadata: &std::fs::Metadata) -> Option<Size> {
+        let surveyed = self.measurer.survey(path, metadata);
+        let blind_spots = !surveyed.unreadable.is_empty() || !surveyed.not_crossed.is_empty();
+        self.report_blind_spots(
+            surveyed.unreadable,
+            "unreadable, so this subtree could not be judged reclaimable",
+        );
+        self.report_blind_spots(
+            surveyed.not_crossed,
+            "on another filesystem, so this subtree could not be judged reclaimable",
+        );
+        if blind_spots {
+            // Part of the subtree could not be read, so neither "holds no checkout" nor the
+            // size is established — both are claims about the whole of it. Tier one can live
+            // with a lower bound because a rule already vouched for the directory; here the
+            // traversal *is* the evidence, and unjudgeable ground is left alone.
+            return None;
+        }
+        if surveyed.nested_repo.is_some() {
+            // Somebody's checkout lives in here, so this directory is not a single thing to be
+            // removed. `git clean` descends past it rather than collapsing it, and so do we.
+            self.holding_a_checkout.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        surveyed
+            .size
+            .bytes()
+            .is_some_and(|bytes| bytes >= self.min_size)
+            .then_some(surveyed.size)
+    }
+
+    /// One pricing thread: takes claims off the queue and measures them until the walk is
+    /// finished with it.
+    ///
+    /// Ends when every sender is gone, which is what makes the pool self-terminating and is
+    /// why [`Walker::run`] is careful about where the senders are dropped.
+    fn price(&self, queue: &Mutex<std::sync::mpsc::Receiver<Job>>) {
+        loop {
+            // The lock covers the `recv` and nothing else. Held across the measurement it
+            // would make the pool one thread wearing several hats — and the measurement is
+            // the entire reason the pool exists.
+            let job = lock(queue).recv();
+            let Ok(job) = job else { return };
+
+            let measured = self.measurer.measure(&job.path, &job.metadata);
+            self.report_blind_spots(
+                measured.unreadable,
+                "unreadable, so this size is a lower bound",
+            );
+            if let Some(bytes) = measured.size.bytes() {
+                self.reclaimed.fetch_add(bytes, Ordering::Relaxed);
+                // The claim was counted as unpriced when it was published. It is not any
+                // longer, and the outcome has to agree with the events the consumer saw.
+                self.unmeasured.fetch_sub(1, Ordering::Relaxed);
+            }
+            (self.on_found)(Found::Priced(Priced {
+                path: job.path,
+                size: measured.size,
+            }));
+        }
     }
 
     fn fail(&self, path: Option<PathBuf>, message: String) {

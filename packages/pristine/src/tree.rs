@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use crate::size::Size;
 use crate::walk::Hit;
 
 /// A handle to a node. Stable for the life of the tree.
@@ -108,6 +109,47 @@ impl Tree {
 
         self.nodes[parent].hit = Some(hit);
         Some(parent)
+    }
+
+    /// Puts a number on a claim that was filed without one, and adds it to every ancestor.
+    ///
+    /// This is the other half of streaming: a claim is published as soon as it is judged and
+    /// priced afterwards, so the tree has to be able to learn a size for a node it already
+    /// holds. The rollup stays correct after this as it does after [`Tree::insert`], because
+    /// the ancestor chain is the same one the insert walked.
+    ///
+    /// Returns `None`, changing nothing, when the path is not a claim in this tree or already
+    /// carries a size. Both would be a caller error rather than a fact about the filesystem,
+    /// and pricing one claim twice would count its bytes twice — so it is refused rather than
+    /// absorbed, exactly as an out-of-root insert is.
+    pub fn price(&mut self, path: &Path, size: Size) -> Option<NodeId> {
+        let bytes = size.bytes()?;
+        let relative = path.strip_prefix(&self.root).ok()?;
+
+        // Resolved in full before anything is written, so a path that turns out not to be a
+        // claim cannot leave half the chain updated.
+        let mut chain = vec![self.root()];
+        let mut current = self.root();
+        for component in relative.components() {
+            current = *self
+                .index
+                .get(&(current, component.as_os_str().to_os_string()))?;
+            chain.push(current);
+        }
+        let hit = self.nodes[current].hit.as_mut()?;
+        if hit.size.bytes().is_some() {
+            return None;
+        }
+        hit.size = size;
+
+        for id in chain {
+            self.nodes[id].reclaimable += bytes;
+            // Saturating because the alternative is a silent wrap to `usize::MAX` in release,
+            // which would render as an enormous unpriced count. The guard above makes it
+            // unreachable: the insert set exactly one on each of these nodes.
+            self.nodes[id].unmeasured = self.nodes[id].unmeasured.saturating_sub(1);
+        }
+        Some(current)
     }
 
     /// The root node's id.

@@ -169,6 +169,18 @@ impl Measurer {
         self
     }
 
+    /// Whether measuring `dir` means traversing it.
+    ///
+    /// This is what decides whether a claim goes to the pricing pool instead of being sized on
+    /// the walker thread that found it. Two things are false here and both matter: a claim
+    /// this mode does not price at all, and a *symlink*, whose one `lstat` the walk has
+    /// already done. Queueing either would trade a constant-time answer for a thread handoff
+    /// and delay the claim's own publication for nothing.
+    #[must_use]
+    pub fn traverses(&self, dir: &Path, metadata: &fs::Metadata) -> bool {
+        metadata.is_dir() && self.mode.prices(dir)
+    }
+
     /// Measures `dir`, whose metadata the caller already has from the walk.
     ///
     /// Returns without touching the filesystem under [`SizeMode::Skip`], which is the point.

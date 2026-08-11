@@ -18,6 +18,11 @@
 //! - A listing with a dash on it says what the dash means and which flag removes it. A count
 //!   of unpriced claims with no way to act on it is a puzzle rather than a report.
 //!
+//! This front end paints once, at the end, because it sorts by size — so it is the one
+//! consumer that cannot show off the streaming underneath it. Claims and their prices arrive
+//! as separate events from [`Walker::run`] and are folded back together here. The TUI (#602)
+//! is what the split is for: rows the moment they are found, numbers filling in behind.
+//!
 //! Properties of the run:
 //!
 //! - `--dry-run` prints the resolved plan and is inert. It prints the same [`Plan`] a real run
@@ -44,6 +49,7 @@
 //! - `--yes` gates the final confirmation and nothing else, so `pristine repo --ignored` in CI
 //!   still refuses to delete without it.
 
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -54,8 +60,8 @@ use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use pristine::delete::confirm;
 use pristine::repo::{Class, Repo, Reset, Selected, Selection};
 use pristine::{
-    DEFAULT_MIN_SIZE, Deleter, Enumeration, FallbackReport, Hit, Plan, Planner, Removal, Ruleset,
-    Size, SizeMode, Target, WalkOutcome, Walker,
+    DEFAULT_MIN_SIZE, Deleter, Enumeration, FallbackReport, Found, Hit, Plan, Planner, Removal,
+    Ruleset, Size, SizeMode, Target, WalkOutcome, Walker,
 };
 
 /// A language-agnostic reclaimable-space finder and cleaner.
@@ -346,6 +352,7 @@ fn main() -> ExitCode {
 fn run(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::error::Error>> {
     let ruleset = Arc::new(Ruleset::load(None)?);
     let hits = Mutex::new(Vec::new());
+    let sizes = Mutex::new(HashMap::new());
     // The mount rule has to reach the walk as well as the plan. Setting it on only one of them
     // makes `--one-file-system=false` a flag that permits crossing a mount the scan never
     // looked across, which reads as "there was nothing over there".
@@ -353,9 +360,24 @@ fn run(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::error::Er
         .same_file_system(cli.one_file_system)
         .min_size(cli.min_size)
         .size_mode(cli.size_mode()?)
-        .run(|hit| lock(&hits).push(hit));
+        // A claim arrives as soon as it is judged and its price arrives later, from the
+        // pricing pool. A TUI would repaint the row; this front end paints once, at the end,
+        // so it holds the prices and folds them in below. `run` does not return until the
+        // pool has drained, so nothing here is racing it.
+        .run(|found| match found {
+            Found::Claim(hit) => lock(&hits).push(hit),
+            Found::Priced(priced) => {
+                lock(&sizes).insert(priced.path, priced.size);
+            }
+        });
 
     let mut hits = hits.into_inner().unwrap_or_else(PoisonError::into_inner);
+    let sizes = sizes.into_inner().unwrap_or_else(PoisonError::into_inner);
+    for hit in &mut hits {
+        if let Some(size) = sizes.get(&hit.path) {
+            hit.size = *size;
+        }
+    }
     // Biggest first, and the unpriced after the priced rather than ahead of them: a tier-one
     // claim has no number because nothing looked, not because it is empty.
     hits.sort_by(|a, b| {
