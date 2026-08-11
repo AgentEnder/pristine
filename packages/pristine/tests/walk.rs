@@ -325,6 +325,24 @@ fn markers_required_all_needs_every_marker() {
 }
 
 #[test]
+fn unitys_import_cache_and_its_compiled_output_are_labelled_apart() {
+    let tmp = TempDir::new().unwrap();
+    mkdir(&tmp.path().join("game/Assets"));
+    mkdir(&tmp.path().join("game/ProjectSettings"));
+    // `Library` is the asset import cache and `Obj` holds compiled intermediates. One rule
+    // over both could only have named one of them honestly, which is the invariant the kind
+    // vocabulary makes checkable rather than remembered.
+    mkdir(&tmp.path().join("game/Library"));
+    mkdir(&tmp.path().join("game/Obj"));
+
+    let hits = scan(tmp.path());
+
+    assert_eq!(rule_ids(tmp.path()), ["unity", "unity-build"]);
+    assert_eq!(label(&hits[0]), "Unity Cache");
+    assert_eq!(label(&hits[1]), "Unity Build Artifacts");
+}
+
+#[test]
 fn an_unreal_build_directory_is_left_alone_because_it_holds_authored_files() {
     let tmp = TempDir::new().unwrap();
     touch(&tmp.path().join("game/Game.uproject"));

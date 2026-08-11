@@ -164,6 +164,9 @@ kind = "dependencies"
 markers = ["composer.json"]
 targets = ["vendor"]
 
+# `.bundle` is neither installed code nor output, and the judgement is recorded rather than
+# left to be re-litigated: it is the state `bundle install --path` writes beside the gems it
+# vendored, so it shares their kind and comes back with them.
 [[rules]]
 id = "bundler"
 ecosystem = "Ruby / Bundler"
@@ -253,16 +256,27 @@ anchor = "self"
 markers = ["CMakeCache.txt"]
 targets = ["build", "_build", "out", "cmake-build-*", "build-*"]
 
-# A cache by kind, but an expensive one to refill, which is what the note is for: the kind
-# says how the directory comes back and the note says what it costs when that is unusual.
+# `Library` is the asset import cache and `Temp` is play-mode and build scratch. A cache by
+# kind, but an expensive one to refill, which is what the note is for: the kind says how the
+# directory comes back and the note says what it costs when that is unusual.
 [[rules]]
 id = "unity"
 ecosystem = "Unity"
 kind = "cache"
 markers = ["ProjectSettings", "Assets"]
 markers_required = "all"
-targets = ["Library", "Temp", "Obj"]
+targets = ["Library", "Temp"]
 note = "a Unity reimport is slow — minutes to hours on a large project"
+
+# `Obj` holds compiled intermediates from script compilation, which is output rather than an
+# import cache — so it is its own rule, on the invariant one row up.
+[[rules]]
+id = "unity-build"
+ecosystem = "Unity"
+kind = "build"
+markers = ["ProjectSettings", "Assets"]
+markers_required = "all"
+targets = ["Obj"]
 
 # `Build/` is NOT claimed, though kondo claims it. An Unreal project keeps authored
 # per-platform build configuration under it — `Build/IOS/` provisioning and icons,
