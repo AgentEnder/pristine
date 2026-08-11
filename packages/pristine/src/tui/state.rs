@@ -40,6 +40,13 @@
 //! beside the path to the row being spared. "Mark all, then keep this one" is a real workflow —
 //! npkill's select-all exists for the first half of it — and the alternative is telling a
 //! reader to clear forty marks and start again.
+//!
+//! # What the footer says is transient, and has to be able to stop being said
+//!
+//! A [`Notice`] is a report about something that has already happened, drawn in permanent
+//! furniture: the footer, which otherwise carries the keys. So a report with no way out is a
+//! stale claim sitting on the one line that tells a reader what they can do — and the older it
+//! gets the less of the tree it still describes. See [`Notice`] for how long one lasts and why.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -340,6 +347,69 @@ pub enum Effect {
     Price(Vec<PathBuf>),
 }
 
+/// One sentence for the footer, and how long it stays there.
+///
+/// # Why not a timer
+///
+/// A timer is the wrong answer for a report of what was **destroyed**. A reader who looked away
+/// while it counted down has no way to get it back, and the thing it described is not on disk
+/// any more — so the one state a countdown leaves them in is "something happened and nothing
+/// will say what". Every lifetime here is therefore a *reader's* action rather than a clock.
+///
+/// # Two lifetimes, because the reports differ in what it costs to miss one
+///
+/// [`passing`](Self::passing) is an ordinary report — what was removed, what was priced, why a
+/// key did nothing. The next thing the reader does takes it away, because by then it describes
+/// the frame before rather than the one in front of them.
+///
+/// [`standing`](Self::standing) names something **refused or failed**. The safety model collects
+/// those and the run exits non-zero on them, so a sentence that says a directory was left alone
+/// or could not be removed is the only place a reader learns that from — and an arrow key
+/// pressed while reading it must not be what takes it away. Nothing incidental clears one: it
+/// goes when it is dismissed, or when a newer report answers a keystroke the reader has just
+/// made.
+///
+/// Both are dismissed by `Esc` and by a press on the footer, which is the rung
+/// [`View::step_back`] takes first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Notice {
+    said: String,
+    /// Whether this one outlasts the reader's next action. See the type's docs.
+    stands: bool,
+}
+
+impl Notice {
+    /// An ordinary report, gone by the reader's next action.
+    #[must_use]
+    pub fn passing(said: impl Into<String>) -> Self {
+        Self {
+            said: said.into(),
+            stands: false,
+        }
+    }
+
+    /// One that names something refused or failed, and so waits to be dismissed.
+    #[must_use]
+    pub fn standing(said: impl Into<String>) -> Self {
+        Self {
+            said: said.into(),
+            stands: true,
+        }
+    }
+
+    /// The sentence itself.
+    #[must_use]
+    pub fn said(&self) -> &str {
+        &self.said
+    }
+
+    /// Whether it waits to be dismissed rather than going with the reader's next action.
+    #[must_use]
+    pub fn stands(&self) -> bool {
+        self.stands
+    }
+}
+
 /// The live view.
 #[derive(Debug)]
 #[expect(
@@ -395,8 +465,9 @@ pub struct View {
     /// asked for, and nothing would ever report which. So the keystroke is remembered instead
     /// of obeyed, and the loop leaves the moment the removal is over.
     quitting: bool,
-    /// What just happened, for the footer to say.
-    notice: Option<String>,
+    /// What just happened, for the footer to say — until something takes it away. See
+    /// [`Notice`].
+    notice: Option<Notice>,
     /// Whether the rows on hand still describe the tree.
     stale: bool,
     /// Whether the tree's levels are in the current sort order.
@@ -497,7 +568,7 @@ impl View {
     /// dying included — an in-flight set that leaked would be a subtree the reader can never
     /// ask about again for the rest of the run, which is a quiet permanent no-op on a gesture
     /// they keep making.
-    pub fn repriced(&mut self, claims: &[PathBuf], notice: String) {
+    pub fn repriced(&mut self, claims: &[PathBuf], notice: Notice) {
         for claim in claims {
             self.pricing.remove(claim);
         }
@@ -505,7 +576,7 @@ impl View {
     }
 
     /// The removal is over, and this is what it did.
-    pub fn deleted(&mut self, notice: String) {
+    pub fn deleted(&mut self, notice: Notice) {
         self.deleting = false;
         self.notice = Some(notice);
         self.stale = true;
@@ -519,11 +590,15 @@ impl View {
     pub fn ask(&mut self, pending: Pending) {
         if pending.targets.is_empty() {
             let kept = pending.kept.len();
-            self.notice = Some(if kept == 0 {
-                "nothing to delete".to_owned()
+            // A refusal, so it waits to be dismissed: this sentence is the *only* place a
+            // reader learns that the safety model took their whole batch away.
+            if kept == 0 {
+                self.says("nothing to delete");
             } else {
-                format!("nothing to delete: {kept} left alone by the safety model")
-            });
+                self.warns(format!(
+                    "nothing to delete: {kept} left alone by the safety model"
+                ));
+            }
             return;
         }
         self.pending = Some(pending);
@@ -712,7 +787,39 @@ impl View {
     /// What just happened, for the footer.
     #[must_use]
     pub fn notice(&self) -> Option<&str> {
-        self.notice.as_deref()
+        self.notice.as_ref().map(|notice| notice.said.as_str())
+    }
+
+    /// Whether what the footer is saying waits to be dismissed rather than going with the
+    /// reader's next action.
+    ///
+    /// Deliberately not something the frame draws differently: a sentence saying a subtree was
+    /// left alone is the safety model working, and an alarm-coloured footer would teach a
+    /// reader that correct behaviour is a failure. See [`Notice`].
+    #[must_use]
+    pub fn notice_stands(&self) -> bool {
+        self.notice.as_ref().is_some_and(|notice| notice.stands)
+    }
+
+    /// Says something in the footer until the reader's next action.
+    fn says(&mut self, said: impl Into<String>) {
+        self.notice = Some(Notice::passing(said));
+    }
+
+    /// Says something that waits to be dismissed, because it names a refusal or a failure.
+    fn warns(&mut self, said: impl Into<String>) {
+        self.notice = Some(Notice::standing(said));
+    }
+
+    /// Drops what the footer is saying, if the reader's next action has made it stale.
+    ///
+    /// A standing notice survives this — that is the whole of what "standing" means, and it is
+    /// why the two are one field with a flag rather than two independent messages: there is
+    /// only ever one footer, so the last thing said is the thing shown either way.
+    fn expire(&mut self) {
+        if !self.notice_stands() {
+            self.notice = None;
+        }
     }
 
     /// Which sort the levels are in.
@@ -743,6 +850,14 @@ impl View {
     /// Carries out one action, and says what the event loop has to do about it.
     pub fn apply(&mut self, action: Action) -> Effect {
         self.sync();
+        // What the footer says describes the frame *before* this keystroke, so the keystroke
+        // takes it away — before the action runs, so that an action with something of its own
+        // to say still gets the last word. `Ignore` is left out because a key nobody bound is
+        // not the reader acting, and `Back` because dismissing is a rung of its own: one `Esc`
+        // must step back exactly once. See [`Notice`].
+        if !matches!(action, Action::Ignore | Action::Back) {
+            self.expire();
+        }
         match action {
             Action::Quit => return self.quit(),
             Action::Ignore => {}
@@ -750,6 +865,8 @@ impl View {
                 self.help = if self.help.is_some() { None } else { Some(0) };
             }
             Action::Back => self.step_back(),
+            // One rung, never the one below it: see [`Action::Dismiss`].
+            Action::Dismiss => self.notice = None,
             Action::OpenFilter => {
                 self.prompt = Some(Prompt::seeded(self.filter().unwrap_or_default()));
             }
@@ -830,9 +947,7 @@ impl View {
     /// that does nothing — the same rule as a mark box that is drawn and cannot be pressed.
     fn toggle_map(&mut self) {
         if !self.map.possible {
-            self.notice = Some(
-                "this terminal does not read the graphics protocol, so there is no map".to_owned(),
-            );
+            self.says("this terminal does not read the graphics protocol, so there is no map");
             return;
         }
         self.map.on = !self.map.on;
@@ -846,7 +961,7 @@ impl View {
     fn quit(&mut self) -> Effect {
         if self.deleting {
             self.quitting = true;
-            self.notice = Some("the removal has to finish — closing the moment it does".to_owned());
+            self.says("the removal has to finish — closing the moment it does");
             return Effect::None;
         }
         Effect::Quit
@@ -862,6 +977,13 @@ impl View {
     ///
     /// Never quits, which is the rule that makes `Esc` safe to press without looking. The
     /// bottom rung is doing nothing at all; `q` is the way out and it is on every help page.
+    ///
+    /// The rungs are in front-to-back order, and the notice sits where it does for two reasons.
+    /// It is *behind* the overlays because they are literally drawn over it — and the prompt
+    /// borrows the footer, so while one is up there is no notice on the screen to dismiss. It is
+    /// *in front of* the filter and the marks because it is the cheapest rung to take by
+    /// mistake: an `Esc` that dropped forty marks when the reader meant to get rid of a sentence
+    /// is the one outcome this ladder exists to prevent.
     fn step_back(&mut self) {
         if self.prompt.take().is_some() {
             return;
@@ -870,6 +992,9 @@ impl View {
             return;
         }
         if self.pending.take().is_some() {
+            return;
+        }
+        if self.notice.take().is_some() {
             return;
         }
         if self.filter.take().is_some() {
@@ -946,7 +1071,7 @@ impl View {
             Answer::Cancel => Effect::None,
             Answer::Delete => {
                 self.deleting = true;
-                self.notice = Some(format!(
+                self.says(format!(
                     "removing {}…",
                     plural(pending.targets.len(), "directory", "directories")
                 ));
@@ -958,12 +1083,12 @@ impl View {
     /// `x`: hand the marked batch out to be planned.
     fn commit(&mut self) -> Effect {
         if self.deleting {
-            self.notice = Some("a removal is already running".to_owned());
+            self.says("a removal is already running");
             return Effect::None;
         }
         let batch = self.batch();
         if batch.is_empty() {
-            self.notice = Some("nothing is marked — space marks a row's whole subtree".to_owned());
+            self.says("nothing is marked — space marks a row's whole subtree");
             return Effect::None;
         }
         Effect::Plan(batch)
@@ -1088,18 +1213,18 @@ impl View {
         if waiting.is_empty() {
             // Two different facts, and the reader can act on the difference: one says there
             // is nothing to learn here, the other says to wait.
-            self.notice = Some(if running.is_empty() {
-                "everything under here already carries a price".to_owned()
+            if running.is_empty() {
+                self.says("everything under here already carries a price");
             } else {
-                format!(
+                self.says(format!(
                     "{} under here is already being priced",
                     plural(running.len(), "directory", "directories")
-                )
-            });
+                ));
+            }
             return Effect::None;
         }
         self.pricing.extend(waiting.iter().cloned());
-        self.notice = Some(format!(
+        self.says(format!(
             "pricing {}…",
             plural(waiting.len(), "directory", "directories")
         ));
@@ -1496,7 +1621,7 @@ pub fn plural(count: usize, one: &str, many: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, Answer, Effect, Mark, Motion, Overlay, Pending, Turn, View};
+    use super::{Action, Answer, Effect, Mark, Motion, Notice, Overlay, Pending, Turn, View};
     use crate::fixture::hit;
     use crate::size::Size;
     use crate::tree::{Order, Sort, Tree};
@@ -2125,6 +2250,133 @@ mod tests {
         assert_eq!(view.apply(Action::Back), Effect::None);
     }
 
+    // ---- what the footer says, and how it stops saying it ------------------------------
+
+    #[test]
+    fn a_report_of_what_was_removed_can_be_got_rid_of() {
+        let mut view = view();
+        view.deleted(Notice::passing("removed 10 B from 1 directory"));
+        assert_eq!(view.notice(), Some("removed 10 B from 1 directory"));
+
+        // The bug this rung exists for: without it the sentence sits over the keys for the
+        // rest of the run, and there is no key that takes it away.
+        view.apply(Action::Back);
+        assert_eq!(view.notice(), None);
+    }
+
+    #[test]
+    fn the_next_thing_the_reader_does_takes_an_ordinary_report_away() {
+        let mut view = view();
+        view.deleted(Notice::passing("removed 10 B from 1 directory"));
+
+        // Moving the cursor is the reader looking at the tree the report describes, by which
+        // point the report describes the frame before. No timer: every lifetime here is an
+        // action, so nothing can expire while somebody is reading it.
+        view.apply(Action::Cursor(Motion::Down));
+        assert_eq!(view.notice(), None);
+    }
+
+    #[test]
+    fn a_key_nobody_bound_is_not_the_reader_having_read_the_report() {
+        let mut view = view();
+        view.deleted(Notice::passing("removed 10 B from 1 directory"));
+        view.apply(Action::Ignore);
+        assert!(view.notice().is_some());
+    }
+
+    #[test]
+    fn a_report_naming_a_refusal_outlives_the_keys_that_clear_an_ordinary_one() {
+        let mut view = view();
+        view.deleted(Notice::standing(
+            "removed 10 B from 1 directory, 1 directory failed",
+        ));
+        assert!(view.notice_stands());
+
+        // The safety model's counts are what the run exits non-zero on, so this line is where
+        // a reader learns of them. An arrow key pressed while reading it, or a sort they
+        // reach for to go and look, must not be what takes it away.
+        for action in [
+            Action::Cursor(Motion::Down),
+            Action::Expand,
+            Action::CycleSort,
+            Action::Mark,
+        ] {
+            view.apply(action);
+            assert!(view.notice().is_some(), "{action:?} took it away");
+        }
+
+        // Asked for explicitly, it goes — a reader who has been given the chance to see it.
+        view.apply(Action::Back);
+        assert_eq!(view.notice(), None);
+        assert!(!view.notice_stands());
+    }
+
+    #[test]
+    fn a_newer_report_answers_the_keystroke_that_asked_for_it_even_over_a_standing_one() {
+        let mut view = view();
+        view.deleted(Notice::standing("removed 10 B from 1 directory, 1 failed"));
+
+        // Not an incidental keypress: `x` on nothing marked is the reader asking a question,
+        // and the footer is where it is answered. There is only ever one footer, so the newer
+        // sentence wins — the alternative is a key that visibly does nothing.
+        assert_eq!(view.apply(Action::Commit), Effect::None);
+        assert!(view.notice().unwrap().contains("nothing is marked"));
+        assert!(!view.notice_stands());
+    }
+
+    #[test]
+    fn dismissing_a_report_is_one_rung_and_does_not_also_drop_the_filter() {
+        let mut view = view();
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Mark);
+        filter(&mut view, "node_modules");
+        view.deleted(Notice::passing("removed 10 B from 1 directory"));
+
+        // One `Esc`, one rung. The notice goes first because it is the cheapest rung to take
+        // by mistake; dropping the marks instead would be the expensive one.
+        view.apply(Action::Back);
+        assert_eq!(view.notice(), None);
+        assert!(view.filter().is_some());
+        assert_ne!(view.marked().claims, 0);
+
+        view.apply(Action::Back);
+        assert_eq!(view.filter(), None);
+        view.apply(Action::Back);
+        assert_eq!(view.marked().claims, 0);
+    }
+
+    #[test]
+    fn a_press_on_a_report_that_has_already_gone_does_not_take_the_filter_with_it() {
+        let mut view = view();
+        filter(&mut view, "node_modules");
+        view.deleted(Notice::passing("removed 10 B from 1 directory"));
+
+        // A press is aimed at the frame the reader was looking at and acted on at the release,
+        // so the report can go in between — a keystroke during a held button is all it takes.
+        // `Back` would fall through to the rung below, and the rung below is their filter.
+        view.apply(Action::Cursor(Motion::Down));
+        assert_eq!(view.notice(), None);
+
+        view.apply(Action::Dismiss);
+        assert!(view.filter().is_some(), "the dismissal fell through");
+    }
+
+    #[test]
+    fn an_overlay_is_dismissed_before_the_report_behind_it() {
+        let mut view = view();
+        view.deleted(Notice::standing("removed 10 B from 1 directory, 1 failed"));
+        view.apply(Action::Help);
+
+        // The overlays are drawn over the footer, so they are what is in front of the reader
+        // and the first `Esc` is theirs. The report is still underneath afterwards — which is
+        // the point of a standing one: going to read the key list is not having read it.
+        view.apply(Action::Back);
+        assert_eq!(view.overlay(), None);
+        assert!(view.notice().is_some(), "the help took the report with it");
+        view.apply(Action::Back);
+        assert_eq!(view.notice(), None);
+    }
+
     #[test]
     fn the_viewport_follows_the_cursor_and_never_hangs_off_the_end_of_the_rows() {
         let mut tree = Tree::new("/scan");
@@ -2402,7 +2654,7 @@ mod tests {
         // …and the two facts stay apart once the pass reports: nothing left to ask for
         // because it has a price now, rather than because somebody is still working on it.
         view.priced(&claim, Size::Measured(64));
-        view.repriced(&[claim], "priced 1 directory".to_owned());
+        view.repriced(&[claim], Notice::passing("priced 1 directory"));
         assert_eq!(view.apply(Action::Price(nx)), Effect::None);
         assert!(
             view.notice().unwrap().contains("already carries a price"),
@@ -2426,7 +2678,7 @@ mod tests {
         // rest of the run — a quiet, permanent no-op on a gesture the reader keeps making.
         view.repriced(
             std::slice::from_ref(&claim),
-            "the pricing went away".to_owned(),
+            Notice::passing("the pricing went away"),
         );
         assert_eq!(view.notice(), Some("the pricing went away"));
         assert_eq!(view.apply(Action::Price(nx)), Effect::Price(vec![claim]));
@@ -2465,7 +2717,7 @@ mod tests {
 
         view.repriced(
             &[PathBuf::from("/scan/nx/node_modules")],
-            "priced 1 directory".to_owned(),
+            Notice::passing("priced 1 directory"),
         );
         assert_eq!(view.notice(), Some("priced 1 directory"));
     }
@@ -2496,7 +2748,7 @@ mod tests {
 
         // …and the keystroke is remembered rather than dropped: the loop leaves on the first
         // frame after the removal reports.
-        view.deleted("removed 10 B from 1 directory".to_owned());
+        view.deleted(Notice::passing("removed 10 B from 1 directory"));
         assert!(view.wants_to_quit());
     }
 
@@ -2507,7 +2759,7 @@ mod tests {
         view.ask(pending(&["/scan/old/target"]));
         view.apply(Action::Highlight(Turn::Next));
         view.apply(Action::Answer);
-        view.deleted("removed 10 B from 1 directory".to_owned());
+        view.deleted(Notice::passing("removed 10 B from 1 directory"));
         assert!(!view.wants_to_quit());
     }
 

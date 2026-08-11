@@ -97,6 +97,9 @@ pub fn draw(frame: &mut Frame, view: &mut View, errors: &[WalkError]) -> Placed 
         heading: head,
         rows,
         map,
+        // Only on a frame that drew one. A footer saying what is marked is a line to read, not
+        // a button, so there is nothing there for a press to dismiss.
+        notice: view.notice().is_some().then_some(footer),
         scroll: view.scroll(),
         overlay: None,
         answers: None,
@@ -571,12 +574,25 @@ fn age(modified: Option<std::time::SystemTime>) -> String {
 }
 
 /// The line across the bottom: what is marked, or what just happened.
+///
+/// A notice takes the whole line, keys and all, so it carries its own way out: a reader who
+/// cannot see `space mark · x delete · … · ? help` has nothing else on the screen telling them
+/// the sentence in front of them can be got rid of. The hint is drawn dim and last, in the same
+/// grammar the keys it replaced are written in.
 fn status(view: &View) -> Paragraph<'static> {
     if let Some(notice) = view.notice() {
-        return Paragraph::new(Line::from(Span::styled(
-            format!(" {notice} "),
-            Style::default().fg(Color::Black).bg(Color::Yellow),
-        )));
+        // One colour for every notice, refusals included. A sentence that says a subtree was
+        // left alone is the safety model *working*, and drawing it as an alarm would teach a
+        // reader that correct behaviour is a failure — the same reason a kept row goes cyan
+        // and calm rather than red. What a standing notice does differently is **wait**, and
+        // waiting is not a thing a colour can say.
+        return Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(" {notice} "),
+                Style::default().fg(Color::Black).bg(Color::Yellow),
+            ),
+            Span::styled(" Esc to dismiss", Style::default().fg(Color::DarkGray)),
+        ]));
     }
     let marked = view.marked();
     let mut spans = vec![Span::styled(
@@ -693,6 +709,9 @@ pub struct Placed {
     /// Where the treemap's image goes, when the pane is up. `None` is a frame with no map on
     /// it, which is every frame in a terminal that cannot draw one.
     pub map: Option<Rect>,
+    /// The footer, on a frame where it was saying what just happened. `None` whenever there is
+    /// nothing to dismiss — which is what keeps a press on the ordinary footer a miss.
+    pub notice: Option<Rect>,
     /// Which row of the tree the top drawn row held.
     ///
     /// Recorded rather than re-read from the view, so a press maps `y` to a row through the
@@ -773,7 +792,14 @@ pub enum Spot {
     Prompt,
     /// Outside the overlay that is up — where a press dismisses it.
     Outside,
-    /// Chrome, or a frame with nothing on it: the header line and the footer.
+    /// The footer, while it is saying what just happened — where a press dismisses that.
+    ///
+    /// Under the overlays and never over the tree, which is the whole of why it is safe: the
+    /// footer is a line of its own, so a press that lands on a stale report cannot also be a
+    /// press on a row, and no gesture aimed at a sentence can mark a subtree behind it.
+    Notice,
+    /// Chrome, or a frame with nothing on it: the header line, and a footer with only the keys
+    /// on it.
     Nowhere,
 }
 
@@ -801,6 +827,12 @@ pub fn hit(view: &View, placed: &Placed, at: Position) -> Spot {
             return Spot::Help;
         }
         return answer_at(placed.answers, at).map_or(Spot::Confirm, Spot::Answer);
+    }
+
+    // After the overlays and before the tree, which is where the footer is drawn: the prompt
+    // borrows this very line, so while one is up the branch above has already answered.
+    if placed.notice.is_some_and(|footer| footer.contains(at)) {
+        return Spot::Notice;
     }
 
     let Some(columns) = placed.columns else {
@@ -871,8 +903,8 @@ mod tests {
     use crate::fixture::{hit, priced};
     use crate::size::Size;
     use crate::tree::{Order, Tree};
-    use crate::tui::keymap::{Action, Motion};
-    use crate::tui::state::{Answer, Pending, View};
+    use crate::tui::keymap::{Action, Gesture, Motion, pointer};
+    use crate::tui::state::{Answer, Notice, Pending, View};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Position;
@@ -958,6 +990,60 @@ mod tests {
     }
 
     #[test]
+    fn a_report_in_the_footer_says_how_to_get_rid_of_it() {
+        let mut view = view();
+        view.deleted(Notice::passing("removed 2.0 MiB from 1 directory"));
+        let frame = painted(&mut view, 100, 8);
+
+        // A notice takes the whole line, keys and all, so the reader has nothing else on the
+        // screen telling them it can be got rid of. Without the hint the sentence reads as
+        // permanent furniture, which is exactly how it was found.
+        assert!(
+            frame[7].contains("removed 2.0 MiB from 1 directory"),
+            "{frame:#?}"
+        );
+        assert!(frame[7].contains("Esc to dismiss"), "{frame:#?}");
+    }
+
+    #[test]
+    fn the_footer_goes_back_to_its_keys_once_the_report_is_dismissed() {
+        let mut view = view();
+        view.deleted(Notice::passing("removed 2.0 MiB from 1 directory"));
+        painted(&mut view, 100, 8);
+
+        view.apply(Action::Back);
+        let frame = painted(&mut view, 100, 8);
+
+        // Nothing of the report is left on the line — not the sentence, not its hint. The
+        // frame is drawn inside a synchronized update, so a cell of it still standing here
+        // would be a stale claim the next full repaint cannot clear.
+        assert!(!frame[7].contains("removed"), "{frame:#?}");
+        assert!(!frame[7].contains("Esc to dismiss"), "{frame:#?}");
+        assert!(frame[7].contains("nothing marked"), "{frame:#?}");
+        assert!(frame[7].contains("space mark · x delete"), "{frame:#?}");
+    }
+
+    #[test]
+    fn pressing_on_a_report_dismisses_it_and_never_reaches_the_tree_behind_it() {
+        let mut view = view();
+        view.deleted(Notice::passing("removed 2.0 MiB from 1 directory"));
+        let (_, placed) = frame_of(&mut view, 100, 8);
+
+        // The footer is a line of its own, under the tree rather than over it, so a press on
+        // a report cannot also be a press on a row — there is no marking a subtree the reader
+        // could not see.
+        let spot = press_on(&view, &placed, Position::new(4, 7));
+        assert_eq!(spot, Spot::Notice);
+        assert_eq!(pointer(Gesture::Click, spot), Action::Dismiss);
+
+        // …and with nothing being said the same cell is a miss, because there is nothing
+        // there to dismiss.
+        view.apply(Action::Back);
+        let (_, placed) = frame_of(&mut view, 100, 8);
+        assert_eq!(press_on(&view, &placed, Position::new(4, 7)), Spot::Nowhere);
+    }
+
+    #[test]
     fn an_ancestor_of_a_mark_is_drawn_partial() {
         let mut view = view();
         view.apply(Action::Cursor(Motion::Down));
@@ -1013,6 +1099,20 @@ mod tests {
         // …and the map's key is on the page by construction rather than by anyone remembering
         // to add it, which is what the table is for.
         assert!(frame.contains("show or hide the map"), "{frame}");
+    }
+
+    #[test]
+    fn the_help_page_names_the_gesture_that_gets_rid_of_a_report() {
+        let mut view = view();
+        view.apply(Action::Help);
+        // Tall enough for the whole page: the pointer's rows are the last section, so a
+        // frame the size the other help test uses would put them below the fold.
+        let frame = painted(&mut view, 100, 80).join("\n");
+
+        // Generated from [`POINTER`] rather than written here, which is the guarantee the
+        // table exists for: a gesture that acts is a gesture the page lists.
+        assert!(frame.contains("what the footer is saying"), "{frame}");
+        assert!(frame.contains("dismiss what it says"), "{frame}");
     }
 
     #[test]
