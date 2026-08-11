@@ -1,0 +1,583 @@
+name: Release
+
+# Everything downstream of a version tag.
+#
+# `nx release` decides the release — it reads the conventional commits, moves
+# `Cargo.toml`, `Cargo.lock` and all five npm manifests to one version, writes
+# the changelog, commits and tags `vX.Y.Z`. This workflow performs it: four
+# native cross-compiles, a version check per binary, checksums, a keyless cosign
+# signature, the GitHub Release, the generated Homebrew formula pushed into the
+# tap, `cargo publish`, and `npm publish` for the wrapper and each platform
+# package.
+#
+# `nx release` owns versioning and NOT publishing, which is a deliberate split
+# and the reverse of what this project first designed. Two reasons, both found
+# by wiring it up:
+#
+#   - `nx release publish` would silently skip the crate. It needs an
+#     `nx-release-publish` target, `@monodon/rust` attaches that through its
+#     inference plugin, and this workspace does not register the plugin — the
+#     crate's `versionActions` works because it is a direct module path. The
+#     result is a green `nx release publish` that ships npm and nothing else.
+#   - `@monodon/rust:release-publish` runs `cargo publish --allow-dirty` with no
+#     `--locked`, so cargo may resolve dependency versions newer than the
+#     lockfile CI verified. That is the wrong trade for the one step in this
+#     pipeline that cannot be undone.
+#
+# Publishing here also lets each registry's credential live in its own job, and
+# leaves room for the assertion between `npm pack` and `npm publish` that a
+# platform package cannot ship without its binary.
+on:
+  push:
+    tags:
+      - 'v*'
+  # Manual re-run against an already-pushed tag (e.g. to re-upload assets).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re-)release, e.g. v0.1.0'
+        required: true
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+# Read-only by default; the two jobs that need to write say so themselves.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # One native runner per target, and that is a requirement rather than a
+  # convenience. The version check below runs the binary it just built, which is
+  # only possible on its own platform. Cross-compiling would still produce four
+  # tarballs and would silently skip the one check that can tell a correctly
+  # built binary from a mistagged one.
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # `npm:` is the platform package this target's binary is staged into.
+        # Keeping the triple and the package on one row is what makes the
+        # pairing checkable: `dist_channels.rs` asserts these against
+        # `npm/pristine/lib/platform.cjs` and against the directories on disk,
+        # so a target that gains a build but no package (or the reverse) fails
+        # the test suite rather than a stranger's install.
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            npm: pristine-linux-x64-gnu
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            npm: pristine-linux-arm64-gnu
+          # Pinned to GA images, and pinned rather than `macos-latest`, because
+          # a release matrix should not change hosts on GitHub's schedule. A
+          # retired image does not fail a job — it queues it forever.
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            npm: pristine-darwin-x64
+          - target: aarch64-apple-darwin
+            os: macos-15
+            npm: pristine-darwin-arm64
+    steps:
+      # Third-party actions are pinned to a full commit SHA, not a tag. See the
+      # note in ci.yml, and `every_third_party_action_is_pinned_to_a_commit` in
+      # packages/pristine/tests/dist_channels.rs, which fails the build if one
+      # here is not.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve version from tag
+        id: ver
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # mise.toml is the toolchain source of truth, so the release installs from
+      # it rather than naming versions a second time here.
+      - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: release-${{ matrix.target }}
+
+      # `--target` is passed even though every runner is native, so the triple
+      # in the artifact's name is one the compiler agreed to rather than one
+      # this file asserted. If GitHub ever changes a runner's architecture the
+      # build fails outright instead of shipping, say, an arm64 binary inside
+      # `pristine-x.y.z-x86_64-apple-darwin.tar.gz`.
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} -p pristine-cli --bin pristine
+
+      # A mistagged binary is a silent footgun for every install channel at
+      # once: the tarball name, the formula, the npm manifests and the crate all
+      # agree on a version the binary itself would then contradict.
+      - name: Verify the binary reports the tagged version
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/pristine"
+          VERSION="${{ steps.ver.outputs.version }}"
+          VER_OUT="$("$BIN" --version)"
+          echo "pristine --version → $VER_OUT"
+          if [ "$VER_OUT" != "pristine $VERSION" ]; then
+            echo "::error::--version said '$VER_OUT', expected 'pristine $VERSION'"
+            exit 1
+          fi
+
+      - name: Package tarball and checksum
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          TARGET="${{ matrix.target }}"
+          STAGE="pristine-${VERSION}-${TARGET}"
+          mkdir "$STAGE"
+          cp "target/${TARGET}/release/pristine" "$STAGE/"
+          cp README.md LICENSE "$STAGE/"
+          tar -czf "${STAGE}.tar.gz" "$STAGE"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+          else
+            shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+          fi
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the release tarball
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ steps.pkg.outputs.stage }}
+          path: |
+            ${{ steps.pkg.outputs.stage }}.tar.gz
+            ${{ steps.pkg.outputs.stage }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+      # The npm half of this target, packed on the runner that built the binary
+      # so the tarball that ships is the one this job proved.
+      #
+      # A platform package is committed with its manifest and no binary —
+      # `.gitignore` covers `/npm/pristine-*/pristine` — so something has to put
+      # the file there before `npm pack` runs.
+      - name: Pack the platform package, with its binary in it
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          # The `./` is load-bearing. `npm pack npm/pristine-darwin-arm64` is a
+          # valid GitHub shorthand SPEC — owner `npm`, repo
+          # `pristine-darwin-arm64` — and npm resolves it as one, failing with
+          # `ls-remote ssh://git@github.com/npm/pristine-darwin-arm64.git:
+          # Repository not found`. Every path this repository hands npm starts
+          # `npm/`, so every one of them is ambiguous; `./` is what makes it a
+          # directory. `dist_channels.rs` fails if a bare one appears here.
+          PKG_DIR="./npm/${{ matrix.npm }}"
+
+          # The manifests were moved by `nx release version` in the release
+          # commit this tag points at. If one did not move, the wrapper's exact
+          # pin will not resolve it and npm installs no binary at all — quietly,
+          # because an optional dependency that fails to resolve is skipped
+          # without a warning.
+          PKG_VERSION="$(node -p "require('./${PKG_DIR}/package.json').version")"
+          if [ "$PKG_VERSION" != "$VERSION" ]; then
+            echo "::error::${PKG_DIR} is at $PKG_VERSION but the tag is v$VERSION"
+            exit 1
+          fi
+
+          install -m 755 "target/${{ matrix.target }}/release/pristine" "${PKG_DIR}/pristine"
+
+          mkdir -p npm-dist
+          TARBALL="npm-dist/$(npm pack "$PKG_DIR" --json --pack-destination npm-dist | node -p 'JSON.parse(require("node:fs").readFileSync(0,"utf8"))[0].filename')"
+
+          # The sharpest edge in the npm half, and it is entirely silent: a
+          # `files` entry naming a file that does not exist is skipped with no
+          # warning and no non-zero exit. A release whose build step had failed
+          # would publish a manifest and nothing else, and the user would meet
+          # it as `pristine: command not found`. Ask the tarball.
+          echo "== $TARBALL =="
+          tar -tzf "$TARBALL"
+          if ! tar -tzf "$TARBALL" | grep -qx 'package/pristine'; then
+            echo "::error::${TARBALL} has no package/pristine — refusing to publish an empty platform package"
+            exit 1
+          fi
+
+      - name: Upload the platform package tarball
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-${{ matrix.npm }}
+          path: npm-dist/*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the Release and upload assets
+      id-token: write # cosign keyless (Sigstore OIDC) signing — no stored secret
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve version from tag
+        id: ver
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' packages/pristine/Cargo.toml | head -1)"
+          TAG_VERSION="${{ steps.ver.outputs.version }}"
+          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::tag v$TAG_VERSION does not match Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
+
+      # Downloaded artifacts land in `dist-assets/`, not `dist/`, because
+      # `dist/` is a tracked source directory here — it holds the formula
+      # generator. Unpacking build output on top of checked-out sources is how a
+      # globbed asset list ends up handing `gh` a directory, and how a release
+      # ships a file nobody meant to publish.
+      - name: Download the release tarballs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: dist-assets
+          merge-multiple: true
+
+      - name: Aggregate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist-assets
+          rm -f ./*.sha256 # fold the per-target files into one manifest
+          sha256sum ./*.tar.gz > SHA256SUMS
+          echo "== SHA256SUMS =="
+          cat SHA256SUMS
+
+      - name: Generate the Homebrew formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          bash dist/homebrew/gen-formula.sh \
+            --version "$VERSION" --checksums dist-assets/SHA256SUMS > dist-assets/pristine.rb
+          echo "== pristine.rb ==" && cat dist-assets/pristine.rb
+
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          if [ ! -f CHANGELOG.md ]; then
+            echo "No CHANGELOG.md yet; falling back to auto-generated notes." >&2
+            echo "no_notes=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          awk -v ver="$VERSION" '
+            $0 ~ "^## " ver "( |$)" { flag=1; next }
+            flag && /^## / { flag=0 }
+            flag { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' > notes.md
+          if [ ! -s notes.md ]; then
+            echo "No CHANGELOG entry for $VERSION; falling back to auto-generated notes." >&2
+            echo "no_notes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "no_notes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Keyless (Sigstore) signature over the checksum manifest — the identity
+      # is this workflow's OIDC token, so there is no private key to store.
+      # Verify with:
+      #   cosign verify-blob --certificate SHA256SUMS.pem \
+      #     --signature SHA256SUMS.sig \
+      #     --certificate-identity-regexp '.*' \
+      #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      #     SHA256SUMS
+      - name: Sign the checksum manifest (keyless)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist-assets
+          cosign sign-blob --yes \
+            --output-signature SHA256SUMS.sig \
+            --output-certificate SHA256SUMS.pem \
+            SHA256SUMS
+
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.ver.outputs.tag }}"
+          NOTES_ARGS=(--notes-file notes.md)
+          if [ "${{ steps.notes.outputs.no_notes }}" = "true" ]; then
+            NOTES_ARGS=(--generate-notes)
+          fi
+
+          # Named, not globbed: listing the assets makes the release's contents
+          # a thing this file states rather than a thing that depends on what
+          # happens to be lying in a directory.
+          ASSETS=(
+            dist-assets/*.tar.gz
+            dist-assets/SHA256SUMS
+            dist-assets/SHA256SUMS.sig
+            dist-assets/SHA256SUMS.pem
+            dist-assets/pristine.rb
+          )
+          for asset in "${ASSETS[@]}"; do
+            if [ ! -f "$asset" ]; then
+              echo "::error::release asset missing: $asset"
+              exit 1
+            fi
+          done
+
+          PRERELEASE=()
+          case "${{ steps.ver.outputs.version }}" in
+            *-*) PRERELEASE=(--prerelease) ;;
+          esac
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "pristine $TAG" "${NOTES_ARGS[@]}"
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
+          else
+            gh release create "$TAG" \
+              --title "pristine $TAG" \
+              "${NOTES_ARGS[@]}" \
+              "${PRERELEASE[@]}" \
+              "${ASSETS[@]}"
+          fi
+
+      # Push the formula this job just generated straight into the tap.
+      #
+      # `TAP_DEPLOY_KEY` is an **SSH deploy key** for
+      # AgentEnder/homebrew-pristine, which decides the mechanism: a deploy key
+      # authenticates git transport and nothing else, so `repository_dispatch` is
+      # not available — that is a REST call and needs a bearer token. So this
+      # writes to the tap directly rather than asking the tap to come and fetch.
+      #
+      # The trade is worth naming. A deploy key is scoped to one repository by
+      # construction rather than by a setting somebody has to get right, and it
+      # does not expire, so the tap cannot silently stop updating the way a
+      # lapsed PAT would. In exchange the formula arrives as a push from here
+      # rather than as a job whose logs live in the tap.
+      #
+      # The tap holds no repair workflow: one there would need to read release
+      # assets from this repository, and the tap's own GITHUB_TOKEN is scoped to
+      # the tap. When this step does not land, either re-run this workflow
+      # against the tag with `workflow_dispatch`, or push the released
+      # `pristine.rb` asset by hand — see "Homebrew" in docs/releasing.md.
+      #
+      # Skipped for a pre-release tag: a rehearsal must not move what
+      # `brew install` resolves to.
+      - name: Update the Homebrew tap
+        if: ${{ !contains(steps.ver.outputs.version, '-') }}
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # `printf` rather than `echo "$KEY"`: a secret pasted without a
+          # trailing newline makes OpenSSH reject the file as malformed, and the
+          # error it gives says nothing about newlines.
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$TAP_DEPLOY_KEY" > ~/.ssh/tap_key
+          chmod 600 ~/.ssh/tap_key
+
+          # Three options, each load-bearing:
+          #
+          #   IdentitiesOnly       so the runner's own agent, if it has one,
+          #                        cannot offer a different key and get us
+          #                        rejected before this one is tried.
+          #   StrictHostKeyChecking=yes
+          #                        refuse an unknown host outright. `accept-new`
+          #                        would be the same trust-on-first-use as the
+          #                        `ssh-keyscan` this replaced.
+          #   UserKnownHostsFile   GitHub's published host keys, committed at
+          #                        dist/homebrew/github_known_hosts. Scanning for
+          #                        them here would learn the key from the
+          #                        connection being checked, so whoever answered
+          #                        the scan would receive the formula and this
+          #                        key's authentication attempt while the job
+          #                        reported a clean push.
+          #
+          # The path is absolute: `git push` below runs after `cd tap`, so a
+          # relative one would resolve differently than it does for the clone and
+          # the push would fail on a host it had just accepted.
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/tap_key -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=${GITHUB_WORKSPACE}/dist/homebrew/github_known_hosts"
+
+          git clone --depth 1 git@github.com:AgentEnder/homebrew-pristine.git tap
+          mkdir -p tap/Formula
+          cp dist-assets/pristine.rb tap/Formula/pristine.rb
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/pristine.rb
+          if git diff --staged --quiet; then
+            echo "formula unchanged; nothing to push"
+            exit 0
+          fi
+          git commit -m "pristine ${VERSION}"
+          git push
+
+      # The key is on an ephemeral runner, but a release job that fails partway
+      # should not leave it sitting in the workspace for whatever runs next in
+      # the same job.
+      - name: Remove the tap deploy key
+        if: always()
+        run: rm -f ~/.ssh/tap_key
+
+  # Publishing the crate is irreversible: a version on crates.io can be yanked
+  # but never replaced. So it is its own job, gated on a `crates-io`
+  # environment, and it runs only once `publish` has put the signed binaries
+  # out.
+  #
+  # No stored registry token. `crates-io-auth-action` exchanges this job's OIDC
+  # identity for a short-lived crates.io token and revokes it in its post step,
+  # which is why nothing else in this repository holds a `CARGO_REGISTRY_TOKEN`.
+  publish-crate:
+    name: publish crate
+    needs: publish
+    runs-on: ubuntu-latest
+    environment: crates-io
+    # A pre-release tag (v0.1.0-rc.1) exercises the whole binary pipeline
+    # without spending a crates.io version, which is what makes a rehearsal
+    # cheap. Read off the ref rather than a `needs` output: a job-level `if`
+    # cannot see a step output from its own job, and an output the upstream job
+    # never declared evaluates to the empty string — which passes this test and
+    # publishes the rehearsal for real.
+    if: ${{ !contains(inputs.tag || github.ref_name, '-') }}
+    permissions:
+      id-token: write # mint the crates.io token
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
+
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+
+      # `--locked` so the crate that ships is built from the lockfile CI
+      # verified, and `-p pristine-cli` because that is the package name — the
+      # binary is `pristine` and the library is `pristine`, and neither is what
+      # cargo publishes.
+      - run: cargo publish --locked -p pristine-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  # The npm half, publishing the exact tarballs the build jobs proved carry a
+  # binary. Its own job for the same reason as the crate's: an npm version can
+  # be unpublished only within 72 hours, and the token that can do it has no
+  # business sitting in a job that also holds the tap's deploy key.
+  publish-npm:
+    name: publish npm packages
+    needs: publish
+    runs-on: ubuntu-latest
+    environment: npm
+    if: ${{ !contains(inputs.tag || github.ref_name, '-') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      # `registry-url` is what writes the .npmrc that reads NODE_AUTH_TOKEN.
+      # Without it `npm publish` authenticates as nobody and fails with a 404
+      # that reads like the package does not exist.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download the platform package tarballs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: npm-*
+          path: npm-dist
+          merge-multiple: true
+
+      # The wrapper carries no binary, so it is packed here rather than on a
+      # build runner — but it is still packed before it is published, so the
+      # assertion below is about the bytes that ship.
+      - name: Pack the wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `./npm/pristine`, not `npm/pristine` — see the note in the build job:
+          # the bare form is a GitHub owner/repo shorthand and npm treats it as
+          # one.
+          TARBALL="npm-dist/$(npm pack ./npm/pristine --json --pack-destination npm-dist | node -p 'JSON.parse(require("node:fs").readFileSync(0,"utf8"))[0].filename')"
+          echo "== $TARBALL =="
+          tar -tzf "$TARBALL"
+          # The shim IS the package. Without it npm installs a name and the
+          # `pristine` on the PATH is a broken symlink.
+          for required in package/bin/pristine.cjs package/lib/platform.cjs; do
+            if ! tar -tzf "$TARBALL" | grep -qx "$required"; then
+              echo "::error::the wrapper tarball has no $required"
+              exit 1
+            fi
+          done
+
+      # Platform packages first. The wrapper's `optionalDependencies` pin them
+      # exactly, so a wrapper published ahead of them is installable and broken
+      # for as long as the gap lasts.
+      #
+      # No `--provenance`: npm only generates it for a package built from a
+      # PUBLIC repository, and this one is private until the v1 scope lands.
+      # Turning it on before then fails the publish outright.
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          wrapper=""
+          platforms=()
+          for tarball in npm-dist/*.tgz; do
+            case "$tarball" in
+              npm-dist/agentender-pristine-[0-9]*) wrapper="$tarball" ;;
+              *) platforms+=("$tarball") ;;
+            esac
+          done
+
+          if [ ${#platforms[@]} -eq 0 ] || [ -z "$wrapper" ]; then
+            echo "::error::expected one wrapper and at least one platform tarball, got: $(echo npm-dist/*.tgz)"
+            exit 1
+          fi
+
+          for tarball in "${platforms[@]}"; do
+            echo "publishing $tarball"
+            npm publish "$tarball" --access public
+          done
+
+          echo "publishing $wrapper"
+          npm publish "$wrapper" --access public
