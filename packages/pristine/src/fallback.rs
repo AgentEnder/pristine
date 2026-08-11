@@ -14,6 +14,25 @@
 //! it is the reason this tier can be on by default without being reckless. Condition four falls
 //! out of evaluation order in [`crate::walk`]: tier one is asked first, and it prunes.
 //!
+//! ## A candidate may be a FILE, and then only conditions one, two and four apply
+//!
+//! Conditions one, two and four are statements about a path and hold unchanged. Condition
+//! three does not, and leaving it out is the design rather than an exemption: **the floor is
+//! about rows, not about safety.** A gitignored directory under 10 MiB is not worth a row
+//! because the list is sorted by size and it would be at the bottom of it. A 40-byte `.env` IS
+//! worth a row, and the reason has nothing to do with its size.
+//!
+//! A file is also **always priced**, where a tier-one directory lives in
+//! [`crate::size::Size::Unmeasured`] until somebody asks for a breakdown. One `lstat` — which
+//! the walk has already done — is the exact and complete answer in constant time, so the
+//! unpriced machinery never has to grow a file branch. That is a simplification rather than a
+//! special case.
+//!
+//! Because this is a different job from the one the tier does for directories — clearing fifty
+//! env files reclaims kilobytes, and the value is hygiene rather than space — it is asked for
+//! separately: see [`crate::walk::Walker::ignored_files`], which is off unless a caller says
+//! otherwise.
+//!
 //! ## The fifth condition, which `git clean` also enforces
 //!
 //! A directory holding a git checkout at any depth is not claimed either. This is not in the
@@ -55,7 +74,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use ignore::{IncrementalIgnore, WalkBuilder};
 
 use crate::git::{self, WorkTree};
-use crate::walk::{IgnoredClaim, WalkError};
+use crate::walk::WalkError;
 
 /// The default size floor: below this a directory is not worth a row, and tier two would
 /// otherwise report every scrap of ignored cache on the disk.
@@ -81,6 +100,14 @@ pub struct FallbackReport {
     pub holding_a_checkout: usize,
     /// Directories tier two claimed.
     pub hits: usize,
+    /// Whether tier two was asked to claim gitignored files as well as directories.
+    ///
+    /// Reported rather than inferred from `files` being zero, on this report's founding rule:
+    /// "there were none" and "nobody looked" are different facts and they look identical
+    /// without something that says which.
+    pub files_enabled: bool,
+    /// Gitignored files tier two claimed, which are a subset of `hits`.
+    pub files: usize,
 }
 
 impl FallbackReport {
@@ -104,6 +131,8 @@ pub(crate) struct Fallback {
     /// opinion, so the search for it is the one search allowed to leave the scan root.
     root_work_tree: Option<PathBuf>,
     min_size: u64,
+    /// Whether a gitignored file is a candidate. Off unless asked for — see the module docs.
+    files: bool,
     /// Keyed by work tree root. The `OnceLock` is what makes two threads arriving at the same
     /// repository run `git ls-files` once between them rather than once each.
     trees: Mutex<HashMap<PathBuf, Arc<Opened>>>,
@@ -114,14 +143,20 @@ type Opened = OnceLock<Result<Arc<WorkTree>, Arc<str>>>;
 
 impl Fallback {
     /// Prepares tier two for a scan of `scan_root`.
-    pub(crate) fn new(scan_root: &Path, min_size: u64) -> Self {
+    pub(crate) fn new(scan_root: &Path, min_size: u64, files: bool) -> Self {
         Self {
             scan_root: scan_root.to_path_buf(),
             root_work_tree: git::discover(scan_root),
             min_size,
+            files,
             trees: Mutex::new(HashMap::new()),
             outside_work_tree: AtomicUsize::new(0),
         }
+    }
+
+    /// Whether gitignored files are candidates at all.
+    pub(crate) fn claims_files(&self) -> bool {
+        self.files
     }
 
     /// Per-thread state for one walker thread.
@@ -138,6 +173,7 @@ impl Fallback {
     pub(crate) fn finish(
         &self,
         hits: usize,
+        files: usize,
         holding_a_checkout: usize,
     ) -> (FallbackReport, Vec<WalkError>) {
         let trees = lock(&self.trees);
@@ -162,6 +198,8 @@ impl Fallback {
             outside_work_tree: self.outside_work_tree.load(Ordering::Relaxed),
             holding_a_checkout,
             hits,
+            files_enabled: self.files,
+            files,
         };
         (report, errors)
     }
@@ -185,11 +223,24 @@ pub(crate) struct Thread<'a> {
 }
 
 impl Thread<'_> {
-    /// Whether tier two claims `dir`, judged on everything that can be answered without
-    /// touching the subtree. The walker applies the size floor afterwards, because that — and
-    /// the nested-checkout rule alongside it — is what costs a traversal.
-    pub(crate) fn judge(&mut self, dir: &Path) -> Option<IgnoredClaim> {
-        let Some(work_tree) = self.work_tree_of(dir) else {
+    /// Whether a gitignored file is a candidate at all. See [`Fallback::claims_files`].
+    pub(crate) fn claims_files(&self) -> bool {
+        self.shared.claims_files()
+    }
+
+    /// The work tree whose ignore stack and index say tier two may claim `path`, judged on
+    /// everything that can be answered without touching a subtree.
+    ///
+    /// `is_dir` is not a detail: git's own matcher answers differently for a directory and a
+    /// file, since a pattern ending in `/` matches only the first — so passing the wrong one
+    /// claims files a `.gitignore` never mentioned.
+    ///
+    /// For a directory the walker applies the size floor and the nested-checkout rule
+    /// afterwards, because those are what cost a traversal. **A file has neither**: it has no
+    /// subtree to hold a checkout, and the floor exists to keep a small ignored *directory* off
+    /// a list sorted by size — which is not the reason a 40-byte `.env` is worth a row.
+    pub(crate) fn judge(&mut self, path: &Path, is_dir: bool) -> Option<PathBuf> {
+        let Some(work_tree) = self.work_tree_of(path) else {
             self.shared
                 .outside_work_tree
                 .fetch_add(1, Ordering::Relaxed);
@@ -199,19 +250,21 @@ impl Thread<'_> {
         // means untouched.
         let tracked = self.tree(&work_tree)?;
 
-        let relative = dir.strip_prefix(&work_tree).ok()?.to_path_buf();
+        let relative = path.strip_prefix(&work_tree).ok()?.to_path_buf();
         let matcher = self.matcher(&work_tree);
-        if !matcher.matched(&relative, true).is_ignore() {
+        if !matcher.matched(&relative, is_dir).is_ignore() {
             return None;
         }
 
         // The safety property, and the one condition that costs somebody their work if it is
-        // approximated rather than checked.
-        if tracked.holds_tracked_path(dir) {
+        // approximated rather than checked. It reads exactly right for a file too: the index
+        // is searched by exact path as well as by prefix, so a tracked file that happens to
+        // match an ignore pattern is refused rather than claimed.
+        if tracked.holds_tracked_path(path) {
             return None;
         }
 
-        Some(IgnoredClaim { work_tree })
+        Some(work_tree)
     }
 
     /// The work tree containing `dir`, or `None` when it is not in one.

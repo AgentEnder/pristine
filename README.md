@@ -79,13 +79,17 @@ one.
   **all-ignored** (dependencies *plus* the gitignore fallback) and **all**. Underneath they are two
   independent axes — which *tier*, and which *kind* — and each step of the cycle moves exactly one
   of them, carrying the other forward. Each axis also has a key of its own: `t` moves the tier
-  axis, and `d`, `b` and `c` toggle dependencies, build output and caches. So a combination nobody
-  anticipated is still one a reader can ask for: "every cache a rule named" is `d` then `b` from
-  the default view, and no preset has to exist for it.
+  axis, and `u`, `d`, `b`, `c` and `n` toggle the five kinds. So a combination nobody anticipated
+  is still one a reader can ask for: "every cache a rule named" is `d` then `b` from the default
+  view, and no preset has to exist for it.
 
-  `default` narrows — it leaves out the gitignored tier — so the header says how many claims that
-  is, beside the number it qualifies. A filter that is on without saying what it dropped is the
-  same failure as one that silently keeps something back.
+  Gitignored **files** are a third axis, on `i`, and no preset touches it — a real `~/repos` holds
+  44,703 of them against 71 gitignored directories, so an unasked-for sweep would bury the 40 GB
+  `node_modules` under `.DS_Store` rows.
+
+  `default` narrows — it leaves out the gitignored tier, and files start out of view — so the
+  header says how many claims that is, beside the number it qualifies. A filter that is on without
+  saying what it dropped is the same failure as one that silently keeps something back.
 - **Changing the view never changes what is selected**, by any of those keys. Hiding a row is not
   unselecting it, and a mark keeps meaning the view it was made through: mark a directory under
   `dependencies`, widen to `all`, and the build artefacts beside them are still unmarked.
@@ -150,7 +154,8 @@ $ pristine ~/repos/pua > pua.txt
 5 directories reclaimable, 59.1 MiB priced, 4 not priced
 not priced: nothing looked inside. --breakdown prices every claim, --breakdown-under <PATH> just
 one subtree; both walk what they price.
-fallback tier: 1 directory found in 1 work tree above a 10.0 MiB floor
+fallback tier: 1 directory found in 1 work tree above a 10.0 MiB floor (directories only;
+--ignored-files claims gitignored files too)
 ```
 
 A dash is not a zero: nothing looked inside, because a matched directory is never enumerated by
@@ -204,12 +209,42 @@ holding a checkout. Outside a git work tree the tier is **inert**, and says so r
 reporting an empty result. With no repository the only signal left would be the directory's name,
 and a name is not evidence — guessing from one is how a cleaner deletes somebody's source.
 
+**Gitignored files, with `--ignored-files`.** The same tier, on leaves. A file that is ignored and
+untracked is a candidate whatever it is — the `.env` sitting in a repo you are about to archive is
+a real thing to want gone, and no competitor finds it either. It is a different job from the rest
+of the sweep and is spelled as one: clearing fifty env files reclaims kilobytes, so the value is
+hygiene rather than space, the size floor does not apply, and a file is always priced because one
+`lstat` is the exact answer. The rollup tree finds them either way and keeps them behind `i`.
+
 A tier-one hit is named — the ecosystem it belongs to and what kind of directory it is, from a
-closed vocabulary of three: **Dependencies**, **Build Artifacts**, **Cache**. That is the fact that
-prices the decision without pretending to know your machine: a cache is free to lose, an output is a
-compile, dependencies are a network fetch. A tier-two hit says `Gitignored, kind unknown`, which is
-all it honestly knows. The asymmetry against a named row is the point: it tells you which deletions
-are cheap.
+closed vocabulary **ordered by what it costs to lose**: **Unrecoverable**, **Dependencies**,
+**Build Artifacts**, **Cache**, **Noise**. That is the fact that prices the decision without
+pretending to know your machine: a cache is free to lose, an output is a compile, dependencies are
+a network fetch. A tier-two directory says `Gitignored, kind unknown`, which is all it honestly
+knows; a gitignored file can say more, because its *name* is sometimes evidence — `.env` and
+`id_rsa` are the only copy of something, `.DS_Store` and `*.log` are the copy of nothing. The
+asymmetry against a named row is the point: it tells you which deletions are cheap.
+
+### What separates a secret from a cache is which lens shows it
+
+An `Unrecoverable` file inverts the premise of everything else here: nothing brings it back. The
+safety that follows from it lives in **what a view shows**, and nowhere else — there is no special
+deletion path, no extra confirmation and no second flag:
+
+- **Nothing shows one unless you ask.** A sweep does not claim a gitignored file without
+  `--ignored-files`, and no lens displays one until `i` says so. That toggle is the gate, exactly
+  as `default` already hides the gitignored tier. A narrowed view never keeps something back
+  quietly: the header counts what is out of sight, from the first frame.
+- **A mark then behaves normally.** `space` on a directory takes its whole subtree, precious rows
+  included — a mark is a statement about a subtree and the partial-mark glyph on an ancestor has
+  to stay a true reading of it. Marks carry the lens they were made through, so widening the view
+  later never reaches back and adds one.
+- **The confirmation still names them.** The batch is listed with the unrecoverable entries first,
+  counted in a line of their own, and each one can be taken out with `space` — the same key that
+  drops any other line.
+
+The label is doing naming, not gating: `Unrecoverable` on a row tells you what you are looking at
+and changes what no key does.
 
 There is deliberately no field for the command that rebuilds a directory. `npm install` is a guess
 about a package manager nothing checked — the repo may use pnpm or yarn — and half the ruleset could

@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::rules::{Anchor, Kind, MarkersRequired, Rule, Ruleset};
 use crate::size::Size;
-use crate::walk::{Claim, Hit, IgnoredClaim, RuleClaim};
+use crate::walk::{Claim, Hit, IgnoredClaim, IgnoredFileClaim, RuleClaim};
 
 /// A tier-one claim at `path`, with a size and an mtime `seconds` after an arbitrary epoch.
 ///
@@ -67,6 +67,20 @@ pub(crate) fn gitignored(path: &str) -> Hit {
     let mut made = hit(path, Size::Measured(1), 0);
     made.claim = Claim::Ignored(IgnoredClaim {
         work_tree: PathBuf::from("/scan"),
+    });
+    made
+}
+
+/// A tier-two claim on a **file**, of whatever `kind` its name would have said.
+///
+/// Always priced, because a real one always is: one `lstat` is the complete answer for a leaf,
+/// so a fixture that could make an unpriced file claim would be able to describe a state the
+/// walk cannot produce.
+pub(crate) fn gitignored_file(path: &str, kind: Option<Kind>) -> Hit {
+    let mut made = hit(path, Size::Measured(1), 0);
+    made.claim = Claim::IgnoredFile(IgnoredFileClaim {
+        work_tree: PathBuf::from("/scan"),
+        kind,
     });
     made
 }
