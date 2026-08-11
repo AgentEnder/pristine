@@ -10,9 +10,10 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use pristine::{Deleter, Plan, Planner, Refusal, Target};
+use pristine::{Deleter, Plan, Planner, Refusal, Removed, Target};
 use tempfile::TempDir;
 
 /// Creates `path` and every parent, then writes `bytes` bytes of filler into it.
@@ -808,4 +809,65 @@ fn several_targets_are_removed_in_one_batch() {
     for target in &targets {
         assert!(!target.exists(), "{} survived", target.display());
     }
+}
+
+#[test]
+fn a_watcher_is_told_about_each_target_as_it_finishes_and_is_told_the_same_thing_twice() {
+    let (_tmp, base) = fixture();
+    let targets: Vec<PathBuf> = (0..32)
+        .map(|n| base.join(format!("p{n}/node_modules")))
+        .collect();
+    for target in &targets {
+        write(&target.join("dep/index.js"), 1024);
+    }
+
+    let watched = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&watched);
+    let removal = Deleter::new()
+        .watching(move |removed| sink.lock().unwrap().push(removed.clone()))
+        .remove(&plan_for(&base, &targets));
+
+    // The live view drops a row on each of these, and the report printed afterwards lists
+    // what was removed. A row dropped for a target the report then calls untouched — or a
+    // target removed that no row ever heard about — is the two disagreeing, so they are one
+    // condition and this is the test that says so.
+    let mut watched: Vec<_> = watched.lock().unwrap().iter().map(summarise).collect();
+    let mut reported: Vec<_> = removal.removed.iter().map(summarise).collect();
+    watched.sort();
+    reported.sort();
+    assert_eq!(watched.len(), 32);
+    assert_eq!(watched, reported);
+}
+
+#[test]
+fn a_watcher_is_told_when_a_target_was_only_partly_removed() {
+    let (_tmp, base) = fixture();
+    let target = base.join("checkout/node_modules");
+    write(&target.join("dep/index.js"), 1024);
+    mkdir(&target.join("inner/.git"));
+
+    let watched = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&watched);
+    let removal = Deleter::new()
+        .watching(move |removed| sink.lock().unwrap().push(removed.clone()))
+        .remove(&plan_for(&base, std::slice::from_ref(&target)));
+
+    // The sweep refused the checkout inside, so the target itself is still standing — and a
+    // front end that dropped its row on the strength of "the deleter got to it" would tell a
+    // reader their work tree is gone while it is still on disk.
+    assert!(target.exists());
+    let watched = watched.lock().unwrap();
+    assert_eq!(watched.len(), 1);
+    assert!(!watched[0].complete, "{:?}", watched[0]);
+    assert_eq!(removal.removed.len(), 1);
+}
+
+/// A `Removed` reduced to the fields two readers of it have to agree on.
+fn summarise(removed: &Removed) -> (PathBuf, u64, u64, bool) {
+    (
+        removed.path.clone(),
+        removed.bytes,
+        removed.entries,
+        removed.complete,
+    )
 }

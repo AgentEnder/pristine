@@ -72,7 +72,7 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use cap_primitives::ambient_authority;
@@ -94,7 +94,7 @@ const OVERSUBSCRIPTION: usize = 4;
 const MAX_THREADS: usize = 64;
 
 /// A directory offered for removal.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     /// Where it is, as the caller knows it. Resolved when the plan is built.
     pub path: PathBuf,
@@ -395,10 +395,25 @@ impl Planner {
     }
 }
 
+/// Somebody watching a removal happen, one target at a time. See [`Deleter::watching`].
+type Watcher = Arc<dyn Fn(&Removed) + Send + Sync>;
+
 /// Removes what a [`Plan`] says to remove, and nothing else.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Deleter {
     threads: Option<usize>,
+    watching: Option<Watcher>,
+}
+
+impl fmt::Debug for Deleter {
+    /// Hand-written because a closure has no `Debug`, and the only interesting thing about
+    /// one here is whether anybody is listening.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Deleter")
+            .field("threads", &self.threads)
+            .field("watching", &self.watching.is_some())
+            .finish()
+    }
 }
 
 impl Deleter {
@@ -413,6 +428,24 @@ impl Deleter {
     #[must_use]
     pub fn threads(mut self, threads: usize) -> Self {
         self.threads = Some(threads);
+        self
+    }
+
+    /// Reports each target as it finishes, rather than only in the [`Removal`] at the end.
+    ///
+    /// The batch CLI has no use for this — it prints one report when the removal is over —
+    /// but a live view does: a row for a directory that is already gone is a row a reader can
+    /// still put a cursor on, and one they can watch a second delete keystroke land on. The
+    /// front end takes each of these and drops the row, which is also why its cursor is
+    /// anchored to a path rather than to a position.
+    ///
+    /// Called from the pool, so `sink` is `Send + Sync` and may be called from several
+    /// threads at once and in any order. It sees exactly what [`Removal::removed`] will
+    /// contain — same condition, same values — because both come from
+    /// [`Sweep::reported`].
+    #[must_use]
+    pub fn watching(mut self, sink: impl Fn(&Removed) + Send + Sync + 'static) -> Self {
+        self.watching = Some(Arc::new(sink));
         self
     }
 
@@ -461,7 +494,13 @@ impl Deleter {
                         let Some(target) = plan.targets.get(at) else {
                             break;
                         };
-                        mine.push(Sweep::new(plan, &root).run(target));
+                        let sweep = Sweep::new(plan, &root).run(target);
+                        if let (Some(watching), Some(removed)) =
+                            (self.watching.as_ref(), sweep.reported())
+                        {
+                            watching(&removed);
+                        }
+                        mine.push(sweep);
                     }
                     lock(&collected).append(&mut mine);
                 });
@@ -472,16 +511,7 @@ impl Deleter {
             .into_inner()
             .unwrap_or_else(PoisonError::into_inner)
         {
-            // A record only for a target something actually happened to, so `removed` means
-            // what it says rather than "was considered".
-            if sweep.entries > 0 || sweep.complete {
-                removal.removed.push(Removed {
-                    path: sweep.path,
-                    bytes: sweep.bytes,
-                    entries: sweep.entries,
-                    complete: sweep.complete,
-                });
-            }
+            removal.removed.extend(sweep.reported());
             removal.kept.append(&mut sweep.kept);
             removal.failures.append(&mut sweep.failures);
         }
@@ -596,6 +626,22 @@ impl<'a> Sweep<'a> {
         };
         self.complete = self.entry(&parent, &name, &target.path);
         self
+    }
+
+    /// What this sweep did, or `None` when nothing happened to the target.
+    ///
+    /// A record only for a target something actually happened to, so [`Removal::removed`]
+    /// means what it says rather than "was considered". One function rather than the same
+    /// condition written twice, because the other reader is [`Deleter::watching`] and a live
+    /// view that dropped rows the final report then listed as untouched would be worse than
+    /// having no progress at all.
+    fn reported(&self) -> Option<Removed> {
+        (self.entries > 0 || self.complete).then(|| Removed {
+            path: self.path.clone(),
+            bytes: self.bytes,
+            entries: self.entries,
+            complete: self.complete,
+        })
     }
 
     /// Opens the directory that holds the target, by walking down from the root's descriptor
