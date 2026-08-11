@@ -31,8 +31,8 @@ fn project_root(hit: &Hit) -> &Path {
     }
 }
 
-fn regenerate(hit: &Hit) -> &str {
-    hit.regenerate().expect("a tier-one hit names a command")
+fn label(hit: &Hit) -> String {
+    hit.label().into_owned()
 }
 
 /// Creates `path` and every parent, then writes `bytes` bytes of filler into it.
@@ -182,9 +182,9 @@ fn target_is_rust_or_maven_according_to_the_marker() {
 
     assert_eq!(hits.len(), 2);
     assert_eq!(rule(&hits[0]).id, "cargo");
-    assert_eq!(regenerate(&hits[0]), "cargo build");
+    assert_eq!(label(&hits[0]), "Rust Build Artifacts");
     assert_eq!(rule(&hits[1]).id, "maven");
-    assert_eq!(regenerate(&hits[1]), "mvn package");
+    assert_eq!(label(&hits[1]), "Maven Build Artifacts");
 }
 
 #[test]
@@ -232,7 +232,12 @@ fn build_is_claimed_when_gradle_owns_it() {
     touch(&tmp.path().join("svc/build/libs/svc.jar"));
     touch(&tmp.path().join("svc/.gradle/8.5/checksums.bin"));
 
-    assert_eq!(rule_ids(tmp.path()), ["gradle", "gradle"]);
+    // One ecosystem, two kinds, so two rules: `.gradle` is a cache and `build` is output, and
+    // a rule carrying both could only label one of them honestly.
+    assert_eq!(rule_ids(tmp.path()), ["gradle-caches", "gradle"]);
+    let hits = scan(tmp.path());
+    assert_eq!(label(&hits[0]), "Gradle Cache");
+    assert_eq!(label(&hits[1]), "Gradle Build Artifacts");
 }
 
 #[test]
@@ -320,6 +325,24 @@ fn markers_required_all_needs_every_marker() {
 }
 
 #[test]
+fn unitys_import_cache_and_its_compiled_output_are_labelled_apart() {
+    let tmp = TempDir::new().unwrap();
+    mkdir(&tmp.path().join("game/Assets"));
+    mkdir(&tmp.path().join("game/ProjectSettings"));
+    // `Library` is the asset import cache and `Obj` holds compiled intermediates. One rule
+    // over both could only have named one of them honestly, which is the invariant the kind
+    // vocabulary makes checkable rather than remembered.
+    mkdir(&tmp.path().join("game/Library"));
+    mkdir(&tmp.path().join("game/Obj"));
+
+    let hits = scan(tmp.path());
+
+    assert_eq!(rule_ids(tmp.path()), ["unity", "unity-build"]);
+    assert_eq!(label(&hits[0]), "Unity Cache");
+    assert_eq!(label(&hits[1]), "Unity Build Artifacts");
+}
+
+#[test]
 fn an_unreal_build_directory_is_left_alone_because_it_holds_authored_files() {
     let tmp = TempDir::new().unwrap();
     touch(&tmp.path().join("game/Game.uproject"));
@@ -366,7 +389,7 @@ fn the_git_directory_is_never_walked() {
 }
 
 #[test]
-fn every_hit_carries_its_regeneration_command_and_its_age() {
+fn every_hit_carries_its_label_and_its_age() {
     let tmp = TempDir::new().unwrap();
     touch(&tmp.path().join("app/package.json"));
     touch(&tmp.path().join("app/node_modules/dep/index.js"));
@@ -374,8 +397,9 @@ fn every_hit_carries_its_regeneration_command_and_its_age() {
     let hits = scan(tmp.path());
     let hit = &hits[0];
 
-    // No lockfile at all, so the fallback — but still a command, not a menu.
-    assert_eq!(regenerate(hit), "npm install");
+    // The ecosystem and the kind, composed: what the directory IS, which is a fact about it
+    // rather than a guess about the machine it would be rebuilt on.
+    assert_eq!(label(hit), "Node Dependencies");
     let modified = hit
         .modified
         .expect("a directory we just created has an mtime");
@@ -386,33 +410,10 @@ fn every_hit_carries_its_regeneration_command_and_its_age() {
 }
 
 #[test]
-fn the_lockfile_decides_which_package_manager_a_node_hit_names() {
-    for (lockfile, expected) in [
-        ("pnpm-lock.yaml", "pnpm install"),
-        ("yarn.lock", "yarn install"),
-        ("package-lock.json", "npm ci"),
-        ("npm-shrinkwrap.json", "npm ci"),
-        ("bun.lockb", "bun install"),
-        ("deno.lock", "deno install"),
-    ] {
-        let tmp = TempDir::new().unwrap();
-        touch(&tmp.path().join("app/package.json"));
-        touch(&tmp.path().join("app").join(lockfile));
-        touch(&tmp.path().join("app/node_modules/dep/index.js"));
-
-        let hits = scan(tmp.path());
-
-        assert_eq!(hits.len(), 1, "{lockfile}");
-        assert_eq!(regenerate(&hits[0]), expected, "for {lockfile}");
-    }
-}
-
-#[test]
-fn a_workspace_lockfile_above_the_package_still_names_the_package_manager() {
+fn a_nested_package_is_claimed_for_the_package_that_owns_it() {
     let tmp = TempDir::new().unwrap();
-    // The shape every pnpm/nx/turbo monorepo has: one lockfile at the root, a package.json
-    // and a node_modules per package. Looking only beside the package.json finds nothing.
-    touch(&tmp.path().join("repo/pnpm-lock.yaml"));
+    // The shape every pnpm/nx/turbo monorepo has: one manifest at the root and one per
+    // package, each with its own `node_modules`.
     touch(&tmp.path().join("repo/package.json"));
     touch(&tmp.path().join("repo/packages/ui/package.json"));
     touch(
@@ -427,24 +428,9 @@ fn a_workspace_lockfile_above_the_package_still_names_the_package_manager() {
         hits[0].path,
         tmp.path().join("repo/packages/ui/node_modules")
     );
-    // The claim still belongs to the package, but the command comes from the workspace.
+    // The nearer manifest is the one that justifies the claim.
     assert_eq!(project_root(&hits[0]), tmp.path().join("repo/packages/ui"));
-    assert_eq!(regenerate(&hits[0]), "pnpm install");
-}
-
-#[test]
-fn a_lockfile_above_the_scan_root_is_not_consulted() {
-    let tmp = TempDir::new().unwrap();
-    touch(&tmp.path().join("pnpm-lock.yaml"));
-    touch(&tmp.path().join("repo/package.json"));
-    touch(&tmp.path().join("repo/node_modules/dep/index.js"));
-
-    // Scanning `repo` alone: the lockfile is outside the tree we were pointed at, so it is
-    // not evidence we are entitled to use.
-    let hits = scan(&tmp.path().join("repo"));
-
-    assert_eq!(hits.len(), 1);
-    assert_eq!(regenerate(&hits[0]), "npm install");
+    assert_eq!(label(&hits[0]), "Node Dependencies");
 }
 
 #[test]
@@ -760,7 +746,7 @@ fn a_user_rule_extends_the_built_in_set() {
         ecosystem = "My Ecosystem"
         markers = ["Makefile.myecosystem"]
         targets = [".myecosystem-out"]
-        regenerate = "make"
+        kind = "build"
     "#;
     let rules = Arc::new(Ruleset::with_overrides(user).unwrap());
 

@@ -34,6 +34,38 @@ pub enum Anchor {
     Ancestor,
 }
 
+/// What a reclaimable directory *is*, from a vocabulary of three.
+///
+/// The vocabulary is closed on purpose, and it is the half of a label that a machine can act
+/// on: a kind sorts, groups and filters, so "show me every cache" is a question the front end
+/// can answer. A free-text sentence never could.
+///
+/// It also carries the cost, which is the one thing the regeneration command it replaced was
+/// genuinely for. A cache is free, an output is a compile, dependencies are a network fetch —
+/// and unlike a command string, that reading holds without knowing anything about the machine
+/// it would be paid on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    /// Installed third-party code: `node_modules`, `.venv`, `vendor`.
+    Dependencies,
+    /// Compiled output: `target`, `bin`, `obj`, `dist`.
+    Build,
+    /// Regenerated automatically, and the cheapest of the three to lose: `__pycache__`,
+    /// `.nx/cache`, `.gradle`, `.ipynb_checkpoints`.
+    Cache,
+}
+
+impl fmt::Display for Kind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Dependencies => "Dependencies",
+            Self::Build => "Build Artifacts",
+            Self::Cache => "Cache",
+        })
+    }
+}
+
 /// Whether one marker is enough, or all of them are needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -52,8 +84,14 @@ pub enum MarkersRequired {
 pub struct Rule {
     /// Stable identifier. A user rule with the same id replaces the built-in one.
     pub id: String,
-    /// Human-readable label for the ecosystem, for display.
+    /// Human-readable name of the ecosystem: the first half of the label.
     pub ecosystem: String,
+    /// What the directories this rule claims are: the second half of the label.
+    ///
+    /// A rule whose targets do not all share one kind is two rules, which is why `python` and
+    /// `python-caches` are separate and why `gradle`'s `build` and `.gradle` are. One rule
+    /// covering both could only label one of them honestly.
+    pub kind: Kind,
     /// File or directory names proving the anchor is a project of this kind. A name
     /// containing `*` or `?` is a glob and costs a directory listing to check.
     pub markers: Vec<String>,
@@ -66,33 +104,21 @@ pub struct Rule {
     /// Where the markers are looked for.
     #[serde(default)]
     pub anchor: Anchor,
-    /// The command that brings the directory back when nothing in `regenerate_when` applies.
-    /// Mandatory: it is what turns "is this safe to delete" into "am I willing to pay for it".
-    pub regenerate: String,
-    /// Refinements of `regenerate`, chosen by a marker found at or above the project root.
-    /// The first entry whose marker is found wins.
-    #[serde(default)]
-    pub regenerate_when: Vec<RegenerateWhen>,
     /// An optional caveat to surface next to the hit.
     #[serde(default)]
     pub note: Option<String>,
 }
 
-/// A more specific regeneration command, unlocked by the presence of a marker.
-///
-/// `node_modules` is the case this exists for. "npm ci / pnpm install / yarn — whichever
-/// lockfile is present" is a sentence, not a command: it cannot be run, and it leaves the
-/// user to work out something the filesystem already knows. A `pnpm-lock.yaml` beside (or
-/// above) the `package.json` settles it.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RegenerateWhen {
-    /// The file whose presence selects this command. Searched for at the project root and
-    /// then upward, because a workspace keeps one lockfile at its root while every package
-    /// under it has its own `package.json` and its own `node_modules`.
-    pub marker: String,
-    /// The command to report instead.
-    pub regenerate: String,
+impl Rule {
+    /// What the directories this rule claims are, named: the ecosystem and the kind.
+    ///
+    /// Composed rather than written out per rule, because thirty hand-written strings are
+    /// thirty chances to drift apart — and because the half that a reader groups by has to be
+    /// the same word every time it appears.
+    #[must_use]
+    pub fn label(&self) -> String {
+        format!("{} {}", self.ecosystem, self.kind)
+    }
 }
 
 /// A parsed, validated and compiled set of rules.
@@ -203,18 +229,6 @@ impl Ruleset {
             if rule.targets.is_empty() {
                 return Err(RuleError::NoTargets(rule.id.clone()));
             }
-            // Searched for by `stat` rather than by listing, so a glob would silently never
-            // match. Refuse it instead.
-            if let Some(when) = rule
-                .regenerate_when
-                .iter()
-                .find(|when| when.marker.contains(['*', '?', '[', '{']))
-            {
-                return Err(RuleError::Glob(
-                    when.marker.clone(),
-                    "a regenerate_when marker is looked up by name and cannot be a glob".to_owned(),
-                ));
-            }
             if let Some(other) = rules.iter().filter(|r| r.id == rule.id).nth(1) {
                 return Err(RuleError::DuplicateId(other.id.clone()));
             }
@@ -271,7 +285,7 @@ impl std::error::Error for RuleError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Anchor, MarkersRequired, RuleError, Ruleset};
+    use super::{Anchor, Kind, MarkersRequired, RuleError, Ruleset};
 
     #[test]
     fn the_builtin_ruleset_parses() {
@@ -283,21 +297,68 @@ mod tests {
     }
 
     #[test]
-    fn every_builtin_rule_is_marker_anchored_and_says_how_to_regenerate() {
+    fn every_builtin_rule_is_marker_anchored_and_names_what_it_claims() {
         for rule in Ruleset::builtin().unwrap().rules() {
             assert!(!rule.markers.is_empty(), "{} has no marker", rule.id);
             assert!(!rule.targets.is_empty(), "{} reclaims nothing", rule.id);
             assert!(
-                !rule.regenerate.is_empty(),
-                "{} cannot be regenerated",
-                rule.id
-            );
-            assert!(
                 !rule.ecosystem.is_empty(),
-                "{} has no ecosystem label",
+                "{} has no ecosystem name",
                 rule.id
             );
         }
+    }
+
+    #[test]
+    fn a_label_is_the_ecosystem_and_the_kind() {
+        let ruleset = Ruleset::builtin().unwrap();
+        let labelled = |id: &str| {
+            ruleset
+                .rules()
+                .iter()
+                .find(|rule| rule.id == id)
+                .unwrap_or_else(|| panic!("no rule for {id}"))
+                .label()
+        };
+        assert_eq!(labelled("node"), "Node Dependencies");
+        assert_eq!(labelled("dotnet"), ".NET Build Artifacts");
+        assert_eq!(labelled("nx-caches"), "Nx Cache");
+        // One ecosystem, two kinds, two rules — the split the vocabulary makes explicit.
+        assert_eq!(labelled("python"), "Python Dependencies");
+        assert_eq!(labelled("python-caches"), "Python Cache");
+    }
+
+    #[test]
+    fn a_rule_that_does_not_say_what_it_claims_is_rejected() {
+        // Not defaulted: a kind that can be omitted is a kind that is silently wrong, and it
+        // is the field a reader groups and filters by.
+        let err = Ruleset::parse(
+            r#"
+            [[rules]]
+            id = "nameless"
+            ecosystem = "Nameless"
+            markers = ["m"]
+            targets = ["out"]
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RuleError::Parse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_kind_outside_the_vocabulary_is_rejected() {
+        let err = Ruleset::parse(
+            r#"
+            [[rules]]
+            id = "inventive"
+            ecosystem = "Inventive"
+            markers = ["m"]
+            targets = ["out"]
+            kind = "sediment"
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RuleError::Parse(_)), "got {err:?}");
     }
 
     #[test]
@@ -338,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn anchors_and_marker_modes_round_trip_from_toml() {
+    fn anchors_marker_modes_and_kinds_round_trip_from_toml() {
         let ruleset = Ruleset::parse(
             r#"
             [[rules]]
@@ -348,14 +409,15 @@ mod tests {
             markers_required = "all"
             markers = ["m1", "m2"]
             targets = ["out"]
-            regenerate = "make"
+            kind = "build"
             "#,
         )
         .unwrap();
         let rule = &ruleset.rules()[0];
         assert_eq!(rule.anchor, Anchor::SelfDir);
         assert_eq!(rule.markers_required, MarkersRequired::All);
-        assert_eq!(rule.anchor, Anchor::SelfDir);
+        assert_eq!(rule.kind, Kind::Build);
+        assert_eq!(rule.label(), "A Build Artifacts");
     }
 
     #[test]
@@ -374,7 +436,7 @@ mod tests {
             ecosystem = "Rust"
             markers = ["Cargo.toml"]
             targets = ["target", "coverage"]
-            regenerate = "cargo build --release"
+            kind = "build"
             "#,
         )
         .unwrap();
@@ -382,7 +444,6 @@ mod tests {
         assert_eq!(ruleset.rules().len(), builtin.rules().len());
         let cargo = &ruleset.rules()[cargo_at];
         assert_eq!(cargo.targets, ["target", "coverage"]);
-        assert_eq!(cargo.regenerate, "cargo build --release");
     }
 
     #[test]
@@ -394,7 +455,7 @@ mod tests {
             ecosystem = "Reckless"
             markers = []
             targets = ["build"]
-            regenerate = "make"
+            kind = "build"
             "#,
         )
         .unwrap_err();
@@ -411,7 +472,7 @@ mod tests {
             markers = ["m"]
             target = ["build"]
             targets = ["build"]
-            regenerate = "make"
+            kind = "build"
             "#,
         )
         .unwrap_err();
@@ -427,14 +488,14 @@ mod tests {
             ecosystem = "A"
             markers = ["a"]
             targets = ["out"]
-            regenerate = "make"
+            kind = "build"
 
             [[rules]]
             id = "dup"
             ecosystem = "B"
             markers = ["b"]
             targets = ["out"]
-            regenerate = "make"
+            kind = "build"
             "#,
         )
         .unwrap_err();

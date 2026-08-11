@@ -21,7 +21,7 @@
 //! here is not a cosmetic bug: it is a press that opens, marks or prices a row nobody aimed
 //! at. So the tree's columns come out of one [`columns`] call that both lays the table out
 //! and answers the hit test, and a row's own cells — the mark box, the indent, the expander —
-//! are spelled by the constants [`label`] draws them with.
+//! are spelled by the constants [`name`] draws them with.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
@@ -41,10 +41,11 @@ use crate::walk::WalkError;
 const SIZE: u16 = 11;
 /// Cells for `3 months`.
 const AGE: u16 = 9;
-/// Cells for the regeneration command, when the terminal is wide enough to carry one.
-const REGENERATE: u16 = 24;
-/// Below this the regeneration column is dropped: a path a reader cannot read is worse than a
-/// command they have to press `Enter` on the row to see.
+/// Cells for the label, when the terminal is wide enough to carry one. Enough for the longest
+/// the shipped ruleset composes, `Haskell / Stack Build Artifacts`.
+const LABEL: u16 = 31;
+/// Below this the label column is dropped: a path a reader cannot read is worse than a name
+/// they can get at by selecting the row.
 const NARROW: u16 = 90;
 /// The blank cells between two columns.
 const SPACING: u16 = 2;
@@ -362,14 +363,13 @@ pub struct Columns {
     pub size: Rect,
     /// How long ago it was touched.
     pub age: Rect,
-    /// What brings a claim back, when the terminal is wide enough to carry the column.
-    pub regenerate: Option<Rect>,
+    /// What a claim is, when the terminal is wide enough to carry the column.
+    pub label: Option<Rect>,
 }
 
 /// Splits the tree pane into its columns.
 fn columns(area: Rect) -> Columns {
-    // A path a reader cannot read is worse than a command they have to press `Enter` on the
-    // row to see.
+    // A path a reader cannot read is worse than a name they can get at by selecting the row.
     let wide = area.width >= NARROW;
     let mut widths = vec![
         Constraint::Min(20),
@@ -377,14 +377,14 @@ fn columns(area: Rect) -> Columns {
         Constraint::Length(AGE),
     ];
     if wide {
-        widths.push(Constraint::Length(REGENERATE));
+        widths.push(Constraint::Length(LABEL));
     }
     let split = Layout::horizontal(widths).spacing(SPACING).split(area);
     Columns {
         name: split[0],
         size: split[1],
         age: split[2],
-        regenerate: split.get(3).copied(),
+        label: split.get(3).copied(),
     }
 }
 
@@ -424,13 +424,14 @@ fn heading(frame: &mut Frame, area: Rect, at: Columns, sort: Sort) {
             },
         );
     }
-    if let Some(rect) = at.regenerate {
-        // Named but not a button: nothing orders a level by the command that rebuilds it, so
-        // a press here deliberately does nothing rather than reversing a neighbour the
-        // reader did not aim at. See [`heading_at`].
+    if let Some(rect) = at.label {
+        // Named but not a button: an ancestor row has no label of its own, so a level sorted
+        // by this column would sort most of itself by a blank. A press here deliberately does
+        // nothing rather than reversing a neighbour the reader did not aim at. See
+        // [`heading_at`].
         frame.render_widget(
             Paragraph::new(Span::styled(
-                "how to get it back",
+                "what it is",
                 Style::default().fg(Color::Rgb(70, 70, 84)),
             )),
             Rect {
@@ -449,7 +450,7 @@ fn heading(frame: &mut Frame, area: Rect, at: Columns, sort: Sort) {
 /// first `height` of them either way, but every row handed to it is a `Vec` of styled spans
 /// allocated first and thrown away second.
 fn tree(view: &View, at: Columns, height: usize) -> Table<'static> {
-    let wide = at.regenerate.is_some();
+    let wide = at.label.is_some();
     let rows: Vec<TableRow> = view
         .rows()
         .iter()
@@ -461,13 +462,13 @@ fn tree(view: &View, at: Columns, height: usize) -> Table<'static> {
             let roll = view.roll(row.id);
             let selected = view.cursor() == Some(index);
             let mut cells = vec![
-                Cell::from(Line::from(label(view, row.id, row.depth))),
+                Cell::from(Line::from(name(view, row.id, row.depth))),
                 Cell::from(Text::from(roll.label()).alignment(Alignment::Right)),
                 Cell::from(Text::from(age(node.modified)).alignment(Alignment::Right)),
             ];
             if wide {
                 cells.push(Cell::from(Span::styled(
-                    regenerate(view, row.id),
+                    label(view, row.id),
                     Style::default().fg(Color::DarkGray),
                 )));
             }
@@ -490,8 +491,8 @@ fn tree(view: &View, at: Columns, height: usize) -> Table<'static> {
         Constraint::Length(at.size.width),
         Constraint::Length(at.age.width),
     ];
-    if let Some(regenerate) = at.regenerate {
-        widths.push(Constraint::Length(regenerate.width));
+    if let Some(label) = at.label {
+        widths.push(Constraint::Length(label.width));
     }
     Table::new(rows, widths).column_spacing(SPACING)
 }
@@ -501,7 +502,7 @@ fn tree(view: &View, at: Columns, height: usize) -> Table<'static> {
 /// The cell offsets are [`BOX`], [`MARKER`] and [`INDENT`] rather than literals, because
 /// [`zone_at`] resolves a press by them: a mark box drawn one cell wider than the hit test
 /// believes is a click that selects where it meant to mark.
-fn label(view: &View, id: NodeId, depth: usize) -> Vec<Span<'static>> {
+fn name(view: &View, id: NodeId, depth: usize) -> Vec<Span<'static>> {
     let node = view.tree().node(id);
     let (marker, colour) = match view.mark_of(id) {
         Mark::None => ("[ ] ", Color::DarkGray),
@@ -537,15 +538,14 @@ fn label(view: &View, id: NodeId, depth: usize) -> Vec<Span<'static>> {
     ]
 }
 
-/// What brings this row back, when anything knows.
+/// What this row is, when anything knows.
 ///
 /// Only on a claim: an ancestor covers several rules at once, and a directory holding a
-/// `node_modules` and a `target` has no single command that rebuilds it. The tier-two gap is
-/// carried through rather than papered over — "no known way" is the information that the
-/// deletion is not a cheap one.
-fn regenerate(view: &View, id: NodeId) -> String {
+/// `node_modules` and a `target` is not one artefact. The tier-two gap is carried through
+/// rather than papered over — a row that says only "gitignored" is a row nothing has named.
+fn label(view: &View, id: NodeId) -> String {
     match &view.tree().node(id).hit {
-        Some(hit) => hit.regenerate().unwrap_or("no known way back").to_owned(),
+        Some(hit) => hit.label().into_owned(),
         None => String::new(),
     }
 }
@@ -844,15 +844,15 @@ fn heading_at(at: Columns, x: u16) -> Spot {
     if x < at.age.x {
         return Spot::Heading(Order::Size);
     }
-    match at.regenerate {
-        Some(regenerate) if x >= regenerate.x => Spot::Nowhere,
+    match at.label {
+        Some(label) if x >= label.x => Spot::Nowhere,
         _ => Spot::Heading(Order::Age),
     }
 }
 
 /// Which part of a row's name column cell `x` is in.
 ///
-/// Walked through the same offsets [`label`] draws with, so each target is where its glyph
+/// Walked through the same offsets [`name`] draws with, so each target is where its glyph
 /// is rather than where a second description says it should be.
 fn zone_at(at: Columns, depth: usize, x: u16) -> Zone {
     let offset = usize::from(x.saturating_sub(at.name.x));
@@ -910,10 +910,11 @@ mod tests {
     }
 
     #[test]
-    fn a_row_carries_its_marker_its_rollup_and_what_brings_it_back() {
+    fn a_row_carries_its_marker_its_rollup_and_what_it_is() {
         let mut view = view();
         view.apply(Action::Cursor(Motion::Down));
         view.apply(Action::Mark);
+        view.apply(Action::Expand);
         let frame = painted(&mut view, 100, 8);
 
         assert!(frame[0].contains("/scan"), "{frame:#?}");
@@ -921,12 +922,20 @@ mod tests {
             frame[0].contains("2.0 MiB reclaimable in 2 directories"),
             "{frame:#?}"
         );
-        // The marked row, its rolled-up size, and — because the terminal is wide enough —
-        // the command that brings it back.
+        // The marked row and its rolled-up size…
         let marked = frame.iter().find(|line| line.contains("nx")).unwrap();
         assert!(marked.contains("[x]"), "{marked}");
-        assert!(marked.contains("▸"), "{marked}");
+        assert!(marked.contains("▾"), "{marked}");
         assert!(marked.contains("2.0 MiB"), "{marked}");
+        // …and — because the terminal is wide enough — what the claim under it IS. The
+        // ancestor above carries no label of its own: a directory holding a `node_modules`
+        // and a `target` is not one artefact.
+        let claim = frame
+            .iter()
+            .find(|line| line.contains("node_modules"))
+            .unwrap();
+        assert!(claim.contains("Node Dependencies"), "{claim}");
+        assert!(!marked.contains("Node Dependencies"), "{marked}");
         // …and the row nobody has priced shows a dash rather than a zero.
         let unpriced = frame.iter().find(|line| line.contains("old")).unwrap();
         assert!(unpriced.contains("—"), "{unpriced}");
@@ -1007,12 +1016,18 @@ mod tests {
     }
 
     #[test]
-    fn a_narrow_terminal_drops_the_regeneration_column_rather_than_the_path() {
+    fn a_narrow_terminal_drops_the_label_column_rather_than_the_path() {
         let mut view = view();
+        view.apply(Action::Cursor(Motion::Down));
+        view.apply(Action::Expand);
         let frame = painted(&mut view, 48, 8);
         let row = frame.iter().find(|line| line.contains("nx")).unwrap();
         assert!(row.contains("2.0 MiB"), "{row}");
-        assert!(!row.contains("install"), "{row}");
+        let claim = frame
+            .iter()
+            .find(|line| line.contains("node_modules"))
+            .unwrap();
+        assert!(!claim.contains("Dependencies"), "{claim}");
     }
 
     // ---- what a press lands on --------------------------------------------------------
@@ -1136,12 +1151,12 @@ mod tests {
                 frame[1]
             );
         }
-        // The one part of the line that is not a button: nothing orders a level by the
-        // command that rebuilds it, so a press there does nothing rather than reversing the
-        // neighbour the reader did not aim at.
-        let regenerate = placed.columns.unwrap().regenerate.unwrap();
+        // The one part of the line that is not a button: an ancestor row carries no label, so
+        // a press there does nothing rather than reversing the neighbour the reader did not
+        // aim at.
+        let label = placed.columns.unwrap().label.unwrap();
         assert_eq!(
-            press_on(&view, &placed, Position::new(regenerate.x, head.y)),
+            press_on(&view, &placed, Position::new(label.x, head.y)),
             Spot::Nowhere
         );
     }

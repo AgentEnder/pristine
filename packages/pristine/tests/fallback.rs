@@ -146,7 +146,7 @@ fn an_ignored_directory_with_nothing_tracked_under_it_is_reclaimable() {
 }
 
 #[test]
-fn a_tier_two_hit_admits_it_does_not_know_how_to_regenerate() {
+fn a_tier_two_hit_admits_it_does_not_know_what_the_directory_is() {
     let tmp = TempDir::new().unwrap();
     init_repo(tmp.path());
     fs::write(tmp.path().join(".gitignore"), "sediment/\n").unwrap();
@@ -161,9 +161,11 @@ fn a_tier_two_hit_admits_it_does_not_know_how_to_regenerate() {
 
     assert_eq!(hits.len(), 2);
     assert_eq!(hits[0].path, tmp.path().join("app/node_modules"));
-    assert_eq!(hits[0].regenerate(), Some("npm install"));
+    assert_eq!(hits[0].label(), "Node Dependencies");
     assert_eq!(hits[1].path, tmp.path().join("sediment"));
-    assert_eq!(hits[1].regenerate(), None);
+    // Not a blank and not a guess: what this tier knows is that git hides the directory, and
+    // saying only that is what keeps the asymmetry against the named row above it.
+    assert_eq!(hits[1].label(), "Gitignored, kind unknown");
     assert!(hits[1].rule().is_none());
 }
 
@@ -283,17 +285,16 @@ fn a_tier_one_rule_keeps_what_it_claims() {
     let tmp = TempDir::new().unwrap();
     init_repo(tmp.path());
     // The overwhelmingly common shape: the directory is gitignored *and* a rule knows it.
-    // Tier one must win, or every `node_modules` on the machine loses its `pnpm install`.
+    // Tier one must win, or every `node_modules` on the machine loses its name.
     fs::write(tmp.path().join(".gitignore"), "node_modules/\n").unwrap();
     touch(&tmp.path().join("package.json"));
-    touch(&tmp.path().join("pnpm-lock.yaml"));
     write(&tmp.path().join("node_modules/dep/index.js"), OVER);
 
     let hits = scan(tmp.path());
 
     assert_eq!(hits.len(), 1);
     assert!(matches!(hits[0].claim, Claim::Rule(_)));
-    assert_eq!(hits[0].regenerate(), Some("pnpm install"));
+    assert_eq!(hits[0].label(), "Node Dependencies");
 }
 
 #[test]

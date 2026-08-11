@@ -1,5 +1,5 @@
 //! `pristine` finds reclaimable build artifacts and vendored dependency directories across
-//! every ecosystem on a machine, and tells you what regenerates each one before you delete it.
+//! every ecosystem on a machine, and names what each one is before you delete it.
 //!
 //! The core is a single parallel walk that prunes at every directory it claims, driven by a
 //! ruleset that lives in TOML rather than in code:
@@ -37,9 +37,9 @@
 //! A curated ruleset only ever covers the ecosystems somebody wrote a rule for, so there is a
 //! second tier underneath it: inside a git work tree, a directory that is gitignored, holds no
 //! tracked file and no git checkout at any depth, and clears a size floor is reclaimable by
-//! inference even when no rule names it. It reports honestly that it does not know how to
-//! regenerate what it found, and outside a work tree it is inert rather than guessing from
-//! directory names. See [`fallback`].
+//! inference even when no rule names it. It reports honestly that it does not know what the
+//! directory is, and outside a work tree it is inert rather than guessing from directory
+//! names. See [`fallback`].
 //!
 //! Removing what either tier found is [`delete`], and it is split in two on purpose. A
 //! [`Planner`] resolves every path and applies every check in the safety model; a [`Deleter`]
@@ -77,9 +77,9 @@ pub use delete::{
 pub use fallback::{DEFAULT_MIN_SIZE, FallbackReport};
 pub use git::{GitError, WorkTree};
 pub use repo::{Class, Enumeration, Repo, RepoError, Reset, Selected, Selection};
-pub use rules::{Anchor, MarkersRequired, RegenerateWhen, Rule, RuleError, Ruleset};
+pub use rules::{Anchor, Kind, MarkersRequired, Rule, RuleError, Ruleset};
 pub use size::{Measurement, Measurer, Size, SizeMode, Survey};
 pub use tree::{Node, NodeId, Order, Sort, Tree};
 pub use walk::{
-    Claim, Found, Hit, IgnoredClaim, Priced, RuleClaim, WalkError, WalkOutcome, Walker,
+    Claim, Found, Hit, IgnoredClaim, Priced, RuleClaim, UNLABELLED, WalkError, WalkOutcome, Walker,
 };

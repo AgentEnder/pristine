@@ -10,7 +10,15 @@
 #
 # Fields:
 #   id           stable identifier. A user rule with the same id REPLACES the built-in one.
-#   ecosystem    human label for the UI.
+#   ecosystem    human name for the ecosystem, and the first half of the label.
+#   kind         what the directories are, from a closed vocabulary of three. The second half
+#                of the label, and the half a reader can sort, group and filter by:
+#                  "dependencies"  installed third-party code — `node_modules`, `.venv`
+#                  "build"         compiled output — `target`, `bin`, `obj`, `dist`
+#                  "cache"         regenerated automatically, cheapest to lose — `__pycache__`
+#                A RULE WHOSE TARGETS DO NOT ALL SHARE ONE KIND IS TWO RULES. That is why
+#                `python` and `python-caches` are separate, and why Gradle's `build` and
+#                `.gradle` are: one rule covering both could label only one of them honestly.
 #   markers      evidence that the anchor directory really is a project of this kind. Literal
 #                names are checked with one stat; a name containing `*` or `?` costs one
 #                read_dir, so prefer literals.
@@ -26,50 +34,43 @@
 #                  "ancestor" the nearest ancestor carrying a marker, searched upward to the
 #                             scan root. For artefacts that are scattered through a project
 #                             rather than parked at its root, like `__pycache__`.
-#   regenerate   the command that brings it back. This is what turns "is this safe to delete"
-#                into "am I willing to pay for it", so it is mandatory.
 #   note         optional caveat surfaced next to the hit.
+#
+# THERE IS NO FIELD FOR THE COMMAND THAT REBUILDS A DIRECTORY, and there deliberately is not.
+# It cannot be one: `regenerate = "npm install"` is a guess about a package manager nothing
+# here checked, and half the ruleset could only fill it in with a sentence ("rebuilt on the
+# next import"), which is not a command. The kind carries what that field was actually for —
+# a cache is free, an output is a compile, dependencies are a network fetch — and unlike a
+# command string it is true without knowing anything about the machine.
 #
 # Rules are evaluated in order and the first match wins, so put the more specific rule first
 # where two could claim the same directory.
 
-# The lockfile picks the command. "whichever lockfile is present" is a sentence, not
-# something a user can run, and the filesystem already knows the answer. The search runs from
-# the project root upward so a workspace — one lockfile at the root, a `package.json` and a
-# `node_modules` per package — still names the right package manager for every package.
 [[rules]]
 id = "node"
 ecosystem = "Node"
+kind = "dependencies"
 markers = ["package.json"]
 targets = ["node_modules"]
-regenerate = "npm install"
-regenerate_when = [
-    { marker = "pnpm-lock.yaml", regenerate = "pnpm install" },
-    { marker = "yarn.lock", regenerate = "yarn install" },
-    { marker = "bun.lock", regenerate = "bun install" },
-    { marker = "bun.lockb", regenerate = "bun install" },
-    { marker = "package-lock.json", regenerate = "npm ci" },
-    { marker = "npm-shrinkwrap.json", regenerate = "npm ci" },
-    { marker = "deno.lock", regenerate = "deno install" },
-]
 
 [[rules]]
 id = "cargo"
 ecosystem = "Rust"
+kind = "build"
 markers = ["Cargo.toml"]
 targets = ["target"]
-regenerate = "cargo build"
 
 [[rules]]
 id = "go"
 ecosystem = "Go"
+kind = "dependencies"
 markers = ["go.mod"]
 targets = ["vendor"]
-regenerate = "go mod vendor"
 
 [[rules]]
 id = "python"
 ecosystem = "Python"
+kind = "dependencies"
 markers = [
     "pyproject.toml",
     "requirements.txt",
@@ -78,13 +79,15 @@ markers = [
     "Pipfile",
 ]
 targets = [".venv", "venv", ".tox"]
-regenerate = "uv sync / python -m venv .venv && pip install -r requirements.txt"
 
 # Split from `python` because these are scattered through a package tree rather than parked
-# at its root: `src/pkg/sub/__pycache__` is normal and its parent holds no manifest.
+# at its root: `src/pkg/sub/__pycache__` is normal and its parent holds no manifest. The kind
+# differs too, and that is the other half of the reason: an interpreter cache is not a virtual
+# environment full of downloaded wheels.
 [[rules]]
 id = "python-caches"
 ecosystem = "Python"
+kind = "cache"
 anchor = "ancestor"
 markers = [
     "pyproject.toml",
@@ -94,117 +97,152 @@ markers = [
     "Pipfile",
 ]
 targets = ["__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"]
-regenerate = "rebuilt automatically on the next import / test run"
 
 [[rules]]
 id = "pixi"
 ecosystem = "Pixi"
+kind = "dependencies"
 markers = ["pixi.toml", "pixi.lock"]
 targets = [".pixi"]
-regenerate = "pixi install"
 
 [[rules]]
 id = "jupyter"
 ecosystem = "Jupyter"
+kind = "cache"
 markers = ["*.ipynb"]
 targets = [".ipynb_checkpoints"]
-regenerate = "recreated by Jupyter on the next save"
 
 [[rules]]
 id = "dotnet"
 ecosystem = ".NET"
+kind = "build"
 markers = ["*.csproj", "*.fsproj", "*.vbproj", "*.sln", "*.slnx"]
 targets = ["bin", "obj"]
-regenerate = "dotnet build"
 
 [[rules]]
 id = "gradle"
 ecosystem = "Gradle"
+kind = "build"
 markers = [
     "build.gradle",
     "build.gradle.kts",
     "settings.gradle",
     "settings.gradle.kts",
 ]
-targets = ["build", ".gradle"]
-regenerate = "gradle build"
+targets = ["build"]
+
+[[rules]]
+id = "gradle-caches"
+ecosystem = "Gradle"
+kind = "cache"
+markers = [
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts",
+]
+targets = [".gradle"]
 
 [[rules]]
 id = "maven"
 ecosystem = "Maven"
+kind = "build"
 markers = ["pom.xml"]
 targets = ["target"]
-regenerate = "mvn package"
 
 [[rules]]
 id = "sbt"
 ecosystem = "SBT"
+kind = "build"
 markers = ["build.sbt"]
 targets = ["target", "project/target"]
-regenerate = "sbt compile"
 
 [[rules]]
 id = "composer"
 ecosystem = "PHP / Composer"
+kind = "dependencies"
 markers = ["composer.json"]
 targets = ["vendor"]
-regenerate = "composer install"
 
+# `.bundle` is neither installed code nor output, and the judgement is recorded rather than
+# left to be re-litigated: it is the state `bundle install --path` writes beside the gems it
+# vendored, so it shares their kind and comes back with them.
 [[rules]]
 id = "bundler"
 ecosystem = "Ruby / Bundler"
+kind = "dependencies"
 markers = ["Gemfile"]
 targets = ["vendor/bundle", ".bundle"]
-regenerate = "bundle install"
 
 [[rules]]
 id = "elixir"
 ecosystem = "Elixir"
+kind = "dependencies"
 markers = ["mix.exs"]
-targets = ["_build", "deps"]
-regenerate = "mix deps.get && mix compile"
+targets = ["deps"]
+
+[[rules]]
+id = "elixir-build"
+ecosystem = "Elixir"
+kind = "build"
+markers = ["mix.exs"]
+targets = ["_build"]
 
 [[rules]]
 id = "swift"
 ecosystem = "Swift"
+kind = "build"
 markers = ["Package.swift"]
 targets = [".build"]
-regenerate = "swift build"
 
 [[rules]]
 id = "cocoapods"
 ecosystem = "CocoaPods"
+kind = "dependencies"
 markers = ["Podfile"]
 targets = ["Pods"]
-regenerate = "pod install"
 
 [[rules]]
 id = "dart"
 ecosystem = "Dart / Flutter"
+kind = "build"
 markers = ["pubspec.yaml"]
-targets = [".dart_tool", "build"]
-regenerate = "flutter pub get (dart pub get for a non-Flutter package)"
+targets = ["build"]
+
+[[rules]]
+id = "dart-caches"
+ecosystem = "Dart / Flutter"
+kind = "cache"
+markers = ["pubspec.yaml"]
+targets = [".dart_tool"]
 
 [[rules]]
 id = "zig"
 ecosystem = "Zig"
+kind = "build"
 markers = ["build.zig"]
-targets = [".zig-cache", "zig-cache", "zig-out"]
-regenerate = "zig build"
+targets = ["zig-out"]
+
+[[rules]]
+id = "zig-caches"
+ecosystem = "Zig"
+kind = "cache"
+markers = ["build.zig"]
+targets = [".zig-cache", "zig-cache"]
 
 [[rules]]
 id = "stack"
 ecosystem = "Haskell / Stack"
+kind = "build"
 markers = ["stack.yaml"]
 targets = [".stack-work"]
-regenerate = "stack build"
 
 [[rules]]
 id = "cabal"
 ecosystem = "Haskell / Cabal"
+kind = "build"
 markers = ["*.cabal", "cabal.project"]
 targets = ["dist-newstyle", "dist"]
-regenerate = "cabal build"
 
 # Self-anchored, and this is the rule the whole marker-anchoring argument was made for: a
 # directory named `build` in a CMake project is as likely to be hand-written source as it is
@@ -213,19 +251,32 @@ regenerate = "cabal build"
 [[rules]]
 id = "cmake"
 ecosystem = "CMake"
+kind = "build"
 anchor = "self"
 markers = ["CMakeCache.txt"]
 targets = ["build", "_build", "out", "cmake-build-*", "build-*"]
-regenerate = "cmake -B <dir> && cmake --build <dir>"
 
+# `Library` is the asset import cache and `Temp` is play-mode and build scratch. A cache by
+# kind, but an expensive one to refill, which is what the note is for: the kind says how the
+# directory comes back and the note says what it costs when that is unusual.
 [[rules]]
 id = "unity"
 ecosystem = "Unity"
+kind = "cache"
 markers = ["ProjectSettings", "Assets"]
 markers_required = "all"
-targets = ["Library", "Temp", "Obj"]
-regenerate = "Unity reimports on the next open"
+targets = ["Library", "Temp"]
 note = "a Unity reimport is slow — minutes to hours on a large project"
+
+# `Obj` holds compiled intermediates from script compilation, which is output rather than an
+# import cache — so it is its own rule, on the invariant one row up.
+[[rules]]
+id = "unity-build"
+ecosystem = "Unity"
+kind = "build"
+markers = ["ProjectSettings", "Assets"]
+markers_required = "all"
+targets = ["Obj"]
 
 # `Build/` is NOT claimed, though kondo claims it. An Unreal project keeps authored
 # per-platform build configuration under it — `Build/IOS/` provisioning and icons,
@@ -235,28 +286,43 @@ note = "a Unity reimport is slow — minutes to hours on a large project"
 [[rules]]
 id = "unreal"
 ecosystem = "Unreal Engine"
+kind = "build"
 markers = ["*.uproject"]
-targets = ["Binaries", "Intermediate", "DerivedDataCache"]
-regenerate = "regenerate project files, then rebuild from the editor or UnrealBuildTool"
+targets = ["Binaries", "Intermediate"]
 note = "`Build/` and `Saved/` are not claimed: both hold authored files alongside output"
+
+[[rules]]
+id = "unreal-caches"
+ecosystem = "Unreal Engine"
+kind = "cache"
+markers = ["*.uproject"]
+targets = ["DerivedDataCache"]
 
 [[rules]]
 id = "godot"
 ecosystem = "Godot"
+kind = "cache"
 markers = ["project.godot"]
 targets = [".godot", ".import"]
-regenerate = "Godot reimports assets on the next open"
 
 [[rules]]
 id = "react-native"
 ecosystem = "React Native"
+kind = "build"
 markers = ["metro.config.js", "metro.config.cjs", "react-native.config.js"]
-targets = ["android/build", "android/app/build", "ios/build", ".expo"]
-regenerate = "npx react-native run-android / run-ios rebuilds it"
+targets = ["android/build", "android/app/build", "ios/build"]
+
+[[rules]]
+id = "react-native-caches"
+ecosystem = "React Native"
+kind = "cache"
+markers = ["metro.config.js", "metro.config.cjs", "react-native.config.js"]
+targets = [".expo"]
 
 [[rules]]
 id = "nextjs"
 ecosystem = "Next.js"
+kind = "build"
 markers = [
     "next.config.js",
     "next.config.mjs",
@@ -264,29 +330,42 @@ markers = [
     "next.config.ts",
 ]
 targets = [".next"]
-regenerate = "next build"
 
 [[rules]]
 id = "turborepo"
 ecosystem = "Turborepo"
+kind = "cache"
 anchor = "ancestor"
 markers = ["turbo.json"]
 targets = [".turbo"]
-regenerate = "turbo run build"
 
 [[rules]]
 id = "nx"
 ecosystem = "Nx"
+kind = "build"
 markers = ["nx.json"]
-targets = [".nx/cache", ".nx/workspace-data", "dist"]
-regenerate = "nx reset, then rebuild"
+targets = ["dist"]
+
+[[rules]]
+id = "nx-caches"
+ecosystem = "Nx"
+kind = "cache"
+markers = ["nx.json"]
+targets = [".nx/cache", ".nx/workspace-data"]
 
 [[rules]]
 id = "terraform"
 ecosystem = "Terraform"
+kind = "dependencies"
 markers = ["*.tf", "*.tf.json"]
-targets = [".terraform", ".terragrunt-cache"]
-regenerate = "terraform init"
+targets = [".terraform"]
+
+[[rules]]
+id = "terraform-caches"
+ecosystem = "Terraform"
+kind = "cache"
+markers = ["*.tf", "*.tf.json"]
+targets = [".terragrunt-cache"]
 
 # Bazel's `bazel-*` entries are symlinks into an output base that usually lives outside the
 # scan root, so the bytes they report are the links' own and not the output base's. They are
@@ -294,7 +373,7 @@ regenerate = "terraform init"
 [[rules]]
 id = "bazel"
 ecosystem = "Bazel"
+kind = "build"
 markers = ["MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel"]
 targets = ["bazel-*"]
-regenerate = "bazel build"
 note = "these are symlinks; the space is in the output base, which `bazel clean --expunge` frees"
