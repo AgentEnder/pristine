@@ -527,6 +527,8 @@ pub struct View {
     expanded: HashSet<NodeId>,
     /// The roots of the marked subtrees. See the module docs.
     marks: HashSet<NodeId>,
+    /// How many times that set has changed. See [`View::mark_stamp`].
+    mark_stamp: u64,
     /// What is marked strictly below each node — what makes a partial state O(1) to ask about
     /// instead of a subtree walk per row per frame.
     ///
@@ -641,6 +643,7 @@ impl View {
             tree,
             sort: Sort::default(),
             marks: HashSet::new(),
+            mark_stamp: 0,
             below: HashMap::new(),
             rows: Vec::new(),
             cursor: None,
@@ -890,8 +893,12 @@ impl View {
         // directory that is no longer on the disk, and a mark on one would put it in the next
         // batch.
         let (tree, moving) = (&self.tree, &self.moving);
+        let held = self.marks.len();
         self.marks
             .retain(|&id| tree.is_attached(id) && !(moving.is_freeing(id) || moving.is_spent(id)));
+        if self.marks.len() != held {
+            self.mark_stamp += 1;
+        }
         self.expanded.retain(|&id| self.tree.is_attached(id));
         self.kept.retain(|&id, _| self.tree.is_attached(id));
         // A claim the reader deleted while a pricing thread was inside it never gets its
@@ -1184,6 +1191,21 @@ impl View {
         } else {
             Mark::None
         }
+    }
+
+    /// How many times the marked set has changed since the view opened.
+    ///
+    /// For a reader of the view that has to answer "is this the same picture as last frame"
+    /// without rebuilding the picture — [`super::treemap`], whose rectangles change colour on
+    /// a mark. Nothing else says so: a mark moves no bytes and no claims, so the tree's own
+    /// [`Tree::stamp`](crate::tree::Tree::stamp) is silent about it.
+    ///
+    /// A count and not a hash of the set, because the two states a hash of what is marked
+    /// would most easily call equal — unmarking one directory and marking its equally sized
+    /// neighbour — are the ones a reader is most likely to produce.
+    #[must_use]
+    pub fn mark_stamp(&self) -> u64 {
+        self.mark_stamp
     }
 
     /// What share of this row's subtree is marked, between 0.0 and 1.0.
@@ -2109,17 +2131,26 @@ impl View {
     }
 
     fn clear_marks(&mut self) {
+        if !self.marks.is_empty() {
+            self.mark_stamp += 1;
+        }
         self.marks.clear();
         self.below.clear();
         self.stale = true;
     }
 
     fn add_mark(&mut self, id: NodeId) {
-        self.stale = self.marks.insert(id) || self.stale;
+        if self.marks.insert(id) {
+            self.stale = true;
+            self.mark_stamp += 1;
+        }
     }
 
     fn drop_mark(&mut self, id: NodeId) {
-        self.stale = self.marks.remove(&id) || self.stale;
+        if self.marks.remove(&id) {
+            self.stale = true;
+            self.mark_stamp += 1;
+        }
     }
 
     /// Rebuilds what is marked below each node, from the marks that are left.

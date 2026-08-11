@@ -68,6 +68,8 @@ pub struct Node {
     /// Private, and the one field here that is: it is the tree's own bookkeeping rather than
     /// anything about the directory, and [`Tree::is_attached`] is the question worth asking.
     attached: bool,
+    /// Which change was the last one at or below this node. See [`Tree::stamp`].
+    stamp: u64,
 }
 
 /// How a level orders its children.
@@ -159,6 +161,8 @@ pub struct Tree {
     /// instead of taking it out of the arena — see there for why an id has to stay valid for
     /// the life of the tree even after the directory behind it is gone.
     live: usize,
+    /// How many changes this tree has taken. See [`Tree::stamp`].
+    changes: u64,
 }
 
 impl Tree {
@@ -177,12 +181,14 @@ impl Tree {
             hit: None,
             children: Vec::new(),
             attached: true,
+            stamp: 0,
         };
         Self {
             nodes: vec![node],
             index: HashMap::new(),
             root,
             live: 1,
+            changes: 0,
         }
     }
 
@@ -198,6 +204,10 @@ impl Tree {
 
         let mut parent = self.root();
         let mut path = self.root.clone();
+        // After the out-of-root refusal above, so a hit this tree will not take stamps
+        // nothing: a caller watching the stamp would otherwise rebuild a picture of a tree
+        // that had not changed.
+        self.changes += 1;
         self.credit(parent, bytes, unmeasured, modified);
 
         for component in relative.components() {
@@ -218,6 +228,7 @@ impl Tree {
                     hit: None,
                     children: Vec::new(),
                     attached: true,
+                    stamp: self.changes,
                 });
                 self.nodes[parent].children.push(id);
                 self.index.insert((parent, name), id);
@@ -234,11 +245,13 @@ impl Tree {
 
     /// Adds one claim's worth of everything to a node on its ancestor chain.
     fn credit(&mut self, id: NodeId, bytes: u64, unmeasured: usize, modified: Option<SystemTime>) {
+        let stamp = self.changes;
         let node = &mut self.nodes[id];
         node.reclaimable += bytes;
         node.unmeasured += unmeasured;
         node.claims += 1;
         node.modified = node.modified.max(modified);
+        node.stamp = stamp;
     }
 
     /// Puts a number on a claim that was filed without one, and adds it to every ancestor.
@@ -264,7 +277,10 @@ impl Tree {
         }
         hit.size = size;
 
+        self.changes += 1;
+        let stamp = self.changes;
         for id in chain {
+            self.nodes[id].stamp = stamp;
             self.nodes[id].reclaimable += bytes;
             // Saturating because the alternative is a silent wrap to `usize::MAX` in release,
             // which would render as an enormous unpriced count. The guard above makes it
@@ -302,7 +318,10 @@ impl Tree {
         let bytes = bytes.min(held);
         hit.size = Size::Measured(held - bytes);
 
+        self.changes += 1;
+        let stamp = self.changes;
         for id in chain {
+            self.nodes[id].stamp = stamp;
             self.nodes[id].reclaimable -= bytes;
         }
         Some(id)
@@ -336,11 +355,13 @@ impl Tree {
         let bytes = hit.size.bytes().unwrap_or(0);
         let unmeasured = usize::from(hit.size.bytes().is_none());
 
+        self.changes += 1;
         for &ancestor in &chain {
             let node = &mut self.nodes[ancestor];
             node.reclaimable -= bytes;
             node.unmeasured -= unmeasured;
             node.claims -= 1;
+            node.stamp = self.changes;
         }
 
         self.detach(id);
@@ -494,6 +515,32 @@ impl Tree {
     #[must_use]
     pub fn minted(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Which change was the last one at or below `id`.
+    ///
+    /// The question is "has anything under this directory moved since I last looked", and the
+    /// answer is this number being different — not bigger, though it always is. It is exact
+    /// in both directions, which is the whole point: a summary of what is under a node
+    /// (bytes, claims, how many are unpriced) is three numbers that a deletion and an arrival
+    /// in the same frame put back exactly where they were, and a caller that spends a
+    /// megabyte redrawing a picture is a caller that would then not redraw it.
+    ///
+    /// Free to maintain, because every rollup here already walks the chain from the claim to
+    /// the root — a claim's bytes reach the root the same way this does. So it costs one
+    /// store per ancestor on a write and nothing at all on a read, where asking the same
+    /// question by rebuilding what the caller draws costs whatever that is.
+    ///
+    /// **What it deliberately does not report is [`Tree::sort_by`]**, which moves children
+    /// about without changing what is under anybody. A caller whose output depends on sibling
+    /// order has to watch the sort itself.
+    ///
+    /// # Panics
+    ///
+    /// If `id` did not come from this tree.
+    #[must_use]
+    pub fn stamp(&self, id: NodeId) -> u64 {
+        self.nodes[id].stamp
     }
 
     /// Whether there is nothing left to reclaim — either the walk found nothing, or
@@ -801,6 +848,59 @@ mod tests {
 
         assert_eq!(tree.reclaimable(), 70);
         assert_eq!(tree.unmeasured(), 0);
+    }
+
+    #[test]
+    fn a_change_stamps_every_directory_above_it_and_nothing_beside_it() {
+        let mut tree = Tree::new("/scan");
+        tree.insert(fixture::hit("/scan/here/node_modules", Size::Unmeasured, 0));
+        tree.insert(hit("/scan/there/target", 100));
+        let here = tree.find(Path::new("/scan/here")).unwrap();
+        let there = tree.find(Path::new("/scan/there")).unwrap();
+
+        // Every way a claim's numbers move, and each of them has to reach the root while
+        // leaving the directory beside it alone: a caller asking "has anything under here
+        // changed" asks the ancestor, and gets a wrong answer either way round.
+        let beside = tree.stamp(there);
+        let mut last = tree.stamp(here);
+        for change in ["price", "shrink", "arrive", "remove"] {
+            let root = tree.stamp(tree.root());
+            match change {
+                "price" => tree.price(Path::new("/scan/here/node_modules"), Size::Measured(50)),
+                "shrink" => tree.shrink(Path::new("/scan/here/node_modules"), 10),
+                // The one that happens 16,013 times over a real scan.
+                "arrive" => tree.insert(hit("/scan/here/again/target", 1)),
+                _ => tree.remove(Path::new("/scan/here/node_modules")),
+            }
+            .unwrap_or_else(|| panic!("{change} changed nothing, so it proves nothing"));
+            assert!(
+                tree.stamp(tree.root()) > root,
+                "{change} never reached the root"
+            );
+            assert!(
+                tree.stamp(here) > last,
+                "{change} never reached the directory"
+            );
+            assert_eq!(tree.stamp(there), beside, "{change} stamped a sibling");
+            last = tree.stamp(here);
+        }
+    }
+
+    #[test]
+    fn a_hit_the_tree_refuses_stamps_nothing() {
+        let mut tree = Tree::new("/scan");
+        tree.insert(hit("/scan/a/node_modules", 100));
+        let quiet = tree.stamp(tree.root());
+
+        // Every one of these changes nothing, so a reader watching the stamp to decide
+        // whether to spend a megabyte redrawing must not be told otherwise.
+        assert!(tree.insert(hit("/elsewhere/node_modules", 1)).is_none());
+        assert!(
+            tree.price(Path::new("/scan/nowhere"), Size::Measured(1))
+                .is_none()
+        );
+        assert!(tree.remove(Path::new("/scan/a")).is_none());
+        assert_eq!(tree.stamp(tree.root()), quiet);
     }
 
     #[test]
