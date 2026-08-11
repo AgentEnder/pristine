@@ -584,3 +584,55 @@ fn a_checkout_under_a_claim_is_reported_rather_than_silently_skipped() {
     );
     assert!(run.stdout.contains("checkout"), "{}", run.stdout);
 }
+
+// ---- which front end a run gets ---------------------------------------------------------
+
+#[test]
+fn a_run_whose_output_is_not_a_terminal_prints_the_listing_rather_than_opening_a_tree() {
+    let tmp = TempDir::new().unwrap();
+    write(&tmp.path().join("app/package.json"), 2);
+    write(&tmp.path().join("app/node_modules/dep/index.js"), OVER);
+
+    // Every test in this file has been proving this by accident since the TUI landed —
+    // `Stdio::piped` is not a terminal — so it is worth one test that means to. A live view
+    // written into a pipe is escape sequences in somebody's data.
+    let listing = succeeds(tmp.path(), &[]);
+    assert!(listing.contains("app/node_modules"), "{listing}");
+    assert!(listing.contains("1 directory reclaimable"), "{listing}");
+    assert!(
+        !listing.contains('\u{1b}'),
+        "the listing carries escape sequences"
+    );
+}
+
+#[test]
+fn the_sweep_has_a_name_as_well_as_being_the_default() {
+    let tmp = TempDir::new().unwrap();
+    write(&tmp.path().join("app/package.json"), 2);
+    write(&tmp.path().join("app/node_modules/dep/index.js"), OVER);
+
+    let bare = succeeds(tmp.path(), &["--breakdown"]);
+    let named = Command::new(env!("CARGO_BIN_EXE_pristine"))
+        .arg("sweep")
+        .arg(tmp.path())
+        .arg("--breakdown")
+        .output()
+        .unwrap();
+    assert!(named.status.success());
+    assert_eq!(bare, String::from_utf8_lossy(&named.stdout));
+}
+
+#[test]
+fn asking_for_the_listing_at_a_terminal_is_a_flag_rather_than_a_redirect() {
+    let tmp = TempDir::new().unwrap();
+    write(&tmp.path().join("app/package.json"), 2);
+    write(&tmp.path().join("app/node_modules/dep/index.js"), OVER);
+
+    // The flag has to work where the redirect is not wanted — a person reading the listing
+    // through a pager. This asserts it parses and prints the same thing; the terminal half is
+    // what a test cannot have.
+    assert_eq!(
+        succeeds(tmp.path(), &["--no-tui"]),
+        succeeds(tmp.path(), &[])
+    );
+}

@@ -1,9 +1,14 @@
 //! `pristine` finds reclaimable build artifacts and vendored dependency directories across
 //! every ecosystem on a machine, and tells you what regenerates each one before you delete it.
 //!
-//! The command line here is deliberately thin — the rollup tree TUI (#602) is the real front
-//! end — but several of the promises made elsewhere are properties of the *program* rather
-//! than of the library, and no library test can hold them.
+//! There are two front ends and this file picks between them. At a terminal a sweep opens the
+//! rollup tree ([`pristine::tui`]), which is where marking a subtree and deleting a batch live;
+//! anywhere else — a pipe, a file, CI, or `--no-tui` — it prints the listing below. A live view
+//! written into somebody's data would be escape sequences, and a script cannot answer a
+//! keystroke.
+//!
+//! The listing is deliberately thin, but several of the promises made elsewhere are properties
+//! of the *program* rather than of the library, and no library test can hold them.
 //!
 //! Properties of the output:
 //!
@@ -20,8 +25,8 @@
 //!
 //! This front end paints once, at the end, because it sorts by size — so it is the one
 //! consumer that cannot show off the streaming underneath it. Claims and their prices arrive
-//! as separate events from [`Walker::run`] and are folded back together here. The TUI (#602)
-//! is what the split is for: rows the moment they are found, numbers filling in behind.
+//! as separate events from [`Walker::run`] and are folded back together here. The tree is what
+//! the split is for: rows the moment they are found, numbers filling in behind.
 //!
 //! Properties of the run:
 //!
@@ -33,9 +38,9 @@
 //!   `pristine /does/not/exist` prints "0 directories reclaimable" and no script can tell that
 //!   from a clean machine except by the status.
 //!
-//! Selecting *which* directories to remove is the TUI's job. Until it exists `--delete` means
-//! all of them — from both tiers — which is why every guard above matters more here than it
-//! eventually will.
+//! Selecting *which* directories to remove is the tree's job, so `--delete` here means all of
+//! them, from both tiers. That is not a gap: it is what a script wants, and it is why the
+//! guards above are the only thing standing between a flag and a home directory.
 //!
 //! All of that is the *sweep*, which is what a bare `pristine [PATH]` does. `pristine repo`
 //! is the second mode: one git checkout, cleaned the way `git clean -fdx` cleans it, with the
@@ -50,7 +55,7 @@
 //!   still refuses to delete without it.
 
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -59,9 +64,11 @@ use std::time::Duration;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use pristine::delete::confirm;
 use pristine::repo::{Class, Repo, Reset, Selected, Selection};
+use pristine::size::human;
+use pristine::tui;
 use pristine::{
     DEFAULT_MIN_SIZE, Deleter, Enumeration, FallbackReport, Found, Hit, Plan, Planner, Removal,
-    Ruleset, Size, SizeMode, Target, WalkOutcome, Walker,
+    Ruleset, SizeMode, Target, WalkOutcome, Walker,
 };
 
 /// A language-agnostic reclaimable-space finder and cleaner.
@@ -82,6 +89,16 @@ struct Cli {
 /// The mode that is not the sweep.
 #[derive(Debug, Subcommand)]
 enum Mode {
+    /// Find reclaimable directories across every project under PATH. What a bare
+    /// `pristine [PATH]` does, spelled out.
+    ///
+    /// Both spellings exist because both are wanted and neither can be dropped. `pristine ~`
+    /// is what a person types, and `pristine sweep ~` is what a doc writes when the sentence
+    /// beside it is about `pristine repo` — a mode with a name reads badly against one
+    /// without. The only thing this costs is that a directory literally called `sweep` has to
+    /// be spelled `./sweep`.
+    Sweep(Sweep),
+
     /// Clean one git checkout: the `git clean -fdx` replacement.
     ///
     /// Nothing here is enumerated by pristine. `git clean -n -d` and `git clean -n -d -X` are
@@ -161,9 +178,33 @@ struct Sweep {
     /// backup volume that happens to be mounted inside it.
     #[arg(long, value_name = "BOOL", default_value_t = true, action = ArgAction::Set)]
     one_file_system: bool,
+
+    /// Print the listing instead of opening the rollup tree.
+    ///
+    /// The tree is what a terminal gets; this is the same run without it. Redirecting output
+    /// already does this, so the flag is for the case redirection cannot express: a person at
+    /// a terminal who wants the flat listing to read or to pipe through `less`.
+    #[arg(long)]
+    no_tui: bool,
 }
 
 impl Sweep {
+    /// Whether this run opens the rollup tree.
+    ///
+    /// Three ways to say no, and each is a different kind of no. `--no-tui` is the reader
+    /// asking for the listing. An action flag — `--delete`, `--dry-run`, `--yes` — is a run
+    /// that has already made the decision the tree exists to help make, and putting a live
+    /// view in front of it would be asking the same question twice. And a stdout that is not
+    /// a terminal is a pipe, a file or CI, none of which can answer a keystroke: a TUI there
+    /// would write escape sequences into somebody's data.
+    fn interactive(&self) -> bool {
+        !self.no_tui
+            && !self.delete
+            && !self.dry_run
+            && !self.yes
+            && std::io::stdout().is_terminal()
+    }
+
     /// How hard the scan should work for each claim's size.
     ///
     /// Unpriced is the default and stays the default. What the two flags buy is that the
@@ -331,7 +372,8 @@ fn main() -> ExitCode {
     let mut out = stdout.lock();
     let done = match &cli.mode {
         Some(Mode::Repo(args)) => clean(args, &mut out),
-        None => run(&cli.sweep, &mut out),
+        Some(Mode::Sweep(sweep)) => sweep_with(sweep, &mut out),
+        None => sweep_with(&cli.sweep, &mut out),
     };
     match done {
         // Anything the run could not do — a path it could not read, a directory it could not
@@ -344,6 +386,40 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The sweep, through whichever front end this run is entitled to.
+///
+/// The tree is the answer to "how much do I get back", because that question is about
+/// *subtrees* and a listing can only answer it about directories. The listing is what a script
+/// gets, and it is the same scan underneath — see [`Sweep::interactive`] for the three ways a
+/// run says it does not want the tree.
+fn sweep_with(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::error::Error>> {
+    if !cli.interactive() {
+        return run(cli, out);
+    }
+    let ruleset = Arc::new(Ruleset::load(None)?);
+    let outcome = tui::run(
+        &tui::Options {
+            root: cli.root.clone(),
+            min_size: cli.min_size,
+            size_mode: tui::size_mode(cli.size_mode()?),
+            one_file_system: cli.one_file_system,
+            older_than: cli.older_than,
+        },
+        ruleset,
+    )?;
+    // A live view says everything it knows while the reader is there to read it — an
+    // unreadable path in the header, a failed removal in the footer — and a script reads none
+    // of that. The status is the one channel both front ends share, so it says the same thing
+    // in both: this run could not do everything it was asked.
+    for failure in &outcome.errors {
+        match &failure.path {
+            Some(path) => eprintln!("pristine: {}: {}", path.display(), failure.message),
+            None => eprintln!("pristine: {}", failure.message),
+        }
+    }
+    Ok(outcome.whole())
 }
 
 /// Returns whether everything asked for actually happened — both halves of it. A scan that
@@ -771,7 +847,7 @@ fn row(hit: &Hit, root: &Path) -> String {
     );
     format!(
         "{:>10}  {:<60}  {regenerate}",
-        size(hit.size),
+        hit.size.label(),
         path.display()
     )
 }
@@ -851,7 +927,7 @@ fn write_plan(out: &mut impl Write, plan: &Plan, unit: Noun) -> std::io::Result<
     let root = plan.root();
     for target in plan.targets() {
         let path = target.path.strip_prefix(root).unwrap_or(&target.path);
-        writeln!(out, "{:>10}  {}", size(target.size), path.display())?;
+        writeln!(out, "{:>10}  {}", target.size.label(), path.display())?;
     }
     writeln!(
         out,
@@ -950,35 +1026,6 @@ const WORK_TREE: Noun = ("work tree", "work trees");
 
 fn plural(count: usize, (one, many): Noun) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
-}
-
-/// A claim's size, or a dash when nothing has looked. Not zero and not an error: measuring a
-/// tier-one claim means enumerating the subtree the scan deliberately pruned at.
-fn size(size: Size) -> String {
-    match size {
-        Size::Measured(bytes) => human(bytes),
-        Size::Unmeasured => "—".to_owned(),
-    }
-}
-
-/// Bytes in the units a person reads, binary because that is what the sizes are.
-fn human(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "a display rounded to one decimal place has none to lose"
-    )]
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
 }
 
 /// A size as a person writes one.

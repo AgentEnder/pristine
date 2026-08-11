@@ -15,7 +15,7 @@ use std::sync::mpsc::{channel, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 
-use pristine::{Claim, Found, Hit, Rule, Ruleset, Size, SizeMode, Walker};
+use pristine::{Claim, Found, Hit, Order, Rule, Ruleset, Size, SizeMode, Sort, Walker};
 use tempfile::TempDir;
 
 /// Every fixture in this file is tier one, so a hit that carries no rule is a failure rather
@@ -689,7 +689,7 @@ fn children_sort_within_their_own_level() {
     );
 
     let (mut tree, _) = breakdown(tmp.path()).run_to_tree();
-    tree.sort_by_reclaimable();
+    tree.sort_by(Sort::by(Order::Size));
 
     let top: Vec<_> = tree
         .children(tree.root())
