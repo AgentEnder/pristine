@@ -127,10 +127,17 @@ like the tag does not exist. Two paths work with what already exists:
 
 ```sh
 # From ~/repos/homebrew-pristine, with the access you already have.
+mkdir -p Formula
 gh release download v0.1.0 --repo AgentEnder/pristine \
   --pattern pristine.rb --output Formula/pristine.rb --clobber
-git commit -am "pristine 0.1.0" && git push
+git add Formula/pristine.rb
+git commit -m "pristine 0.1.0" && git push
 ```
+
+`git add`, not `git commit -a`. On a tap that has never had a formula, `pristine.rb` is a new file,
+`-a` stages only what git already tracks, and the command commits nothing, prints "nothing added to
+commit" and **exits 0** — so a chained `&& git push` runs and pushes nothing. You are told the repair
+worked while `brew install` still resolves to the previous release.
 
 or re-run this workflow with `workflow_dispatch` against the tag, which regenerates the formula from
 that tag's checksums and pushes it again. A re-run against a version already on crates.io or npm will

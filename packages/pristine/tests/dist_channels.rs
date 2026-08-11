@@ -499,6 +499,55 @@ fn the_tap_push_checks_the_host_key_against_pinned_content() {
     }
 }
 
+/// The documented way to repair the tap by hand has to actually commit the
+/// formula.
+///
+/// The tap holds no repair workflow — one would need a cross-repository
+/// credential — so this procedure is the fallback when the deploy-key push does
+/// not land, and it is reached exactly when something has already gone wrong.
+///
+/// `git commit -am` is the trap, and it fails in the worst available way. The
+/// formula is a NEW file in the tap, `-a` stages only files git already tracks,
+/// so the command commits nothing, prints "nothing added to commit", and **exits
+/// 0** — which lets a following `&& git push` run and push nothing. The operator
+/// is told the repair worked and `brew install` still resolves to the old
+/// release. Verified, not assumed.
+#[test]
+fn the_documented_tap_repair_procedure_stages_the_formula() {
+    let docs = read("docs/releasing.md");
+    let block = docs
+        .split("```")
+        .find(|b| b.contains("gh release download"))
+        .expect("docs/releasing.md must document how to repair the tap by hand");
+
+    assert!(
+        block.contains("git add "),
+        "the repair procedure must `git add` the formula. It is a new file in the tap, so \
+         `commit -a` stages nothing, exits 0, and a chained push pushes nothing:\n{block}"
+    );
+    assert!(
+        !block.contains("commit -a"),
+        "`git commit -a` cannot stage a formula the tap does not track yet, and it exits 0 \
+         while doing nothing:\n{block}"
+    );
+    assert!(
+        block.contains("mkdir -p Formula"),
+        "create Formula/ explicitly rather than relying on `gh release download --output` to \
+         make the parent directory; that is gh behaviour, not a documented guarantee:\n{block}"
+    );
+
+    // The repair workflow this replaced was deleted because it authenticated
+    // with the tap's own GITHUB_TOKEN, which cannot read a private sibling's
+    // release assets. A pointer to it left behind sends someone to a file that
+    // is not there, at the moment they are already recovering from a failure.
+    for file in [".github/workflows/release.yml", "docs/releasing.md"] {
+        assert!(
+            !read(file).contains("update-formula"),
+            "{file} still points at update-formula.yml, which was deleted from the tap"
+        );
+    }
+}
+
 /// A pre-release tag must not move what `brew install` resolves to.
 ///
 /// A `v0.1.0-rc.1` exercises the whole binary pipeline without spending a

@@ -380,8 +380,13 @@ jobs:
       # construction rather than by a setting somebody has to get right, and it
       # does not expire, so the tap cannot silently stop updating the way a
       # lapsed PAT would. In exchange the formula arrives as a push from here
-      # rather than as a job whose logs live in the tap. The tap keeps
-      # `update-formula.yml` as the repair path for when this step did not land.
+      # rather than as a job whose logs live in the tap.
+      #
+      # The tap holds no repair workflow: one there would need to read release
+      # assets from this repository, and the tap's own GITHUB_TOKEN is scoped to
+      # the tap. When this step does not land, either re-run this workflow
+      # against the tag with `workflow_dispatch`, or push the released
+      # `pristine.rb` asset by hand — see "Homebrew" in docs/releasing.md.
       #
       # Skipped for a pre-release tag: a rehearsal must not move what
       # `brew install` resolves to.
