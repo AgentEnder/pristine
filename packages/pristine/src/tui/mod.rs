@@ -881,6 +881,13 @@ mod loop_tests {
         }
     }
 
+    /// How many keys a script will press before it gives up and quits anyway.
+    ///
+    /// Only reached by a run that never satisfies its `until`, which is a real failure — the
+    /// point of the ceiling is that such a run *ends*, so the test reports what it found
+    /// instead of hanging with no output.
+    const PATIENCE: usize = 10_000;
+
     /// A keyboard that types the same short phrase over and over.
     ///
     /// Repeated rather than sequenced because the loop and the walk are concurrent: the row
@@ -890,6 +897,18 @@ mod loop_tests {
     struct Script {
         keys: Vec<KeyCode>,
         at: usize,
+        /// Presses `q` instead of the next key, once this says the run has done its job.
+        ///
+        /// A `q` *inside* the cycle would undo the repetition the cycle exists for: the first
+        /// pass would end the run whether or not the walker had published anything yet, so on
+        /// a machine under load the `x` lands on an empty batch, nothing is removed, and the
+        /// assertion fires on scheduling rather than on a fault. Measured, not guessed — the
+        /// test failed that way under three spinning cores, on this commit and on the one
+        /// before any of this work.
+        ///
+        /// So the quit is a condition, which is the discipline the sibling test already
+        /// applies to breaking the terminal: wait for the thing to have actually happened.
+        until: Option<Box<dyn Fn() -> bool + Send>>,
     }
 
     impl Events for Script {
@@ -898,7 +917,13 @@ mod loop_tests {
         }
 
         fn read(&mut self) -> io::Result<Event> {
-            let code = self.keys[self.at % self.keys.len()];
+            let leaving =
+                self.at >= PATIENCE || self.until.as_ref().is_some_and(|finished| finished());
+            let code = if leaving {
+                KeyCode::Char('q')
+            } else {
+                self.keys[self.at % self.keys.len()]
+            };
             self.at += 1;
             Ok(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
         }
@@ -973,6 +998,9 @@ mod loop_tests {
                 KeyCode::Enter,
             ],
             at: 0,
+            // Nothing to wait for: this run is ended by the terminal failing, which is the
+            // whole subject of the test.
+            until: None,
         };
 
         let outcome = drive(
@@ -1014,15 +1042,20 @@ mod loop_tests {
             broken: Arc::new(AtomicBool::new(false)),
         })
         .unwrap();
+        let gone = target.clone();
         let mut keys = Script {
             keys: vec![
                 KeyCode::Char(' '),
                 KeyCode::Char('x'),
                 KeyCode::Right,
                 KeyCode::Enter,
-                KeyCode::Char('q'),
             ],
             at: 0,
+            // The target is `rmdir`ed only once every child under it is gone, so this becomes
+            // true exactly when the batch the test is about has finished. A `q` before then
+            // would be the script racing the walker rather than the loop doing its job — and
+            // a `q` after it is held by the view anyway until the removal reports.
+            until: Some(Box::new(move || !gone.exists())),
         };
 
         let mut chrome = Chrome::new(
