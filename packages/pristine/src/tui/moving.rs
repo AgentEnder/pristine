@@ -418,6 +418,14 @@ impl Moving {
     /// the same accounting, so keeping both would count every byte twice. The dimmed rows stay
     /// where they are: what they are worth on screen is zero either way, and it is the *tree*
     /// that still has to lose them.
+    ///
+    /// **Everything dropped here is transient, which is a constraint on the caller as much as
+    /// a description.** A target the sweep finished with is on its way out of the tree anyway;
+    /// a target it could not finish is *staying*, and the only record that it is smaller than
+    /// it was is the figure about to be cleared. So an incomplete target's reduction has to be
+    /// made durable before this runs, or its row and every total above it spring back to what
+    /// they were worth before the deletion — see [`super::state::View::deleted`], which is the
+    /// one caller, and [`crate::tree::Tree::shrink`], which is where the bytes go.
     pub fn banked(&mut self) {
         self.freeing.clear();
         self.settled = 0;

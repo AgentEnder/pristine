@@ -260,6 +260,40 @@ impl Tree {
         Some(current)
     }
 
+    /// Takes bytes off a claim that is still there, and off every ancestor with it.
+    ///
+    /// What a **partial** removal is, seen from here. A sweep that went into a target and came
+    /// out again — a checkout inside it, an unreadable corner — leaves a directory that still
+    /// exists and is smaller than it was, which is a state [`Tree::remove`] cannot express and
+    /// [`Tree::price`] refuses to. Without it the reduction can only live in the front end's
+    /// per-frame progress, and progress is by definition dropped when the batch reports: the
+    /// row and its ancestors would spring back to their original sizes the moment a removal
+    /// finished, so a half-emptied directory would report its full weight and the headline
+    /// reclaimable figure would *rise* after a delete. That is the one direction a tool that
+    /// deletes may not be wrong in.
+    ///
+    /// Clamped at the claim's own size rather than saturating on each ancestor separately: a
+    /// deduction bigger than the claim would leave every rollup above it disagreeing with the
+    /// sum of what is beneath, and a rollup that cannot be re-derived from its children is the
+    /// bug [`Tree::remove`]'s mtime recomputation exists to avoid.
+    ///
+    /// Returns `None`, changing nothing, when the path is not a claim in this tree or carries
+    /// no size — an unpriced claim has contributed no bytes to anything, so there are none to
+    /// take back off.
+    pub fn shrink(&mut self, path: &Path, bytes: u64) -> Option<NodeId> {
+        let chain = self.chain(path)?;
+        let &id = chain.last()?;
+        let hit = self.nodes[id].hit.as_mut()?;
+        let held = hit.size.bytes()?;
+        let bytes = bytes.min(held);
+        hit.size = Size::Measured(held - bytes);
+
+        for id in chain {
+            self.nodes[id].reclaimable -= bytes;
+        }
+        Some(id)
+    }
+
     /// Takes a claim out of the tree, with everything it was contributing to its ancestors.
     ///
     /// This is what a deletion is, seen from here, and it is the only way a node ever leaves.
@@ -608,6 +642,60 @@ mod tests {
         assert_eq!(tree.node(surviving).path, PathBuf::from("/scan/repo"));
         assert!(tree.find(Path::new("/scan/repo/a")).is_none());
         assert_eq!(names(&tree, "/scan/repo"), ["b"]);
+    }
+
+    #[test]
+    fn shrinking_a_claim_takes_the_bytes_off_it_and_off_every_ancestor() {
+        let mut tree = Tree::new("/scan");
+        tree.insert(hit("/scan/repo/a/node_modules", 100));
+        tree.insert(hit("/scan/repo/b/node_modules", 50));
+
+        // A sweep that freed 60 of the 100 and then met something it would not cross. The
+        // directory is still there, so the claim stays — worth what survived.
+        let claim = tree
+            .shrink(Path::new("/scan/repo/a/node_modules"), 60)
+            .unwrap();
+
+        assert_eq!(
+            tree.node(claim).hit.as_ref().unwrap().size,
+            Size::Measured(40)
+        );
+        assert_eq!(tree.reclaimable(), 90);
+        assert_eq!(tree.claims(), 2, "a claim that survived stopped counting");
+        assert_eq!(
+            tree.node(tree.find(Path::new("/scan/repo")).unwrap())
+                .reclaimable,
+            90
+        );
+    }
+
+    #[test]
+    fn shrinking_by_more_than_a_claim_holds_empties_it_rather_than_going_negative() {
+        let mut tree = Tree::new("/scan");
+        tree.insert(hit("/scan/repo/node_modules", 100));
+
+        // The deleter counts allocated bytes as it goes and the claim's price was measured
+        // earlier, so the two can disagree — a file grew, or a hard link was counted once
+        // there and not here. Every ancestor is clamped by the same figure, so the rollups
+        // still sum to what is beneath them.
+        tree.shrink(Path::new("/scan/repo/node_modules"), 400)
+            .unwrap();
+
+        assert_eq!(tree.reclaimable(), 0);
+        assert_eq!(tree.claims(), 1);
+    }
+
+    #[test]
+    fn shrinking_an_unpriced_claim_has_nothing_to_take_back_off() {
+        let mut tree = Tree::new("/scan");
+        tree.insert(fixture::hit("/scan/repo/node_modules", Size::Unmeasured, 0));
+
+        // It contributed no bytes to any ancestor, so there are none to subtract — and
+        // inventing a size here would turn "nobody has looked" into a measurement.
+        assert_eq!(tree.shrink(Path::new("/scan/repo/node_modules"), 50), None);
+
+        assert_eq!(tree.reclaimable(), 0);
+        assert_eq!(tree.unmeasured(), 1);
     }
 
     #[test]

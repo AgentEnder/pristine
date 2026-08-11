@@ -473,11 +473,23 @@ fn status(view: &View) -> Paragraph<'static> {
                 .add_modifier(Modifier::BOLD),
         )
     });
+    let said = Style::default().fg(Color::Black).bg(Color::Yellow);
+    // Where the deleter is, which the freed counter beside it cannot say: bytes report how
+    // much has gone and nothing about how much is left, so a count against the batch's own
+    // size is what tells a third of the way through from nearly finished.
+    //
+    // **Beside a notice rather than instead of one.** The only thing that speaks while a
+    // removal is running is `q`, which is held back until the batch finishes and says so — and
+    // a reader who pressed a key and got nothing back has no way to tell a refusal from a
+    // terminal that stopped listening.
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if let Some(removing) = view.removing() {
+        spans.push(Span::styled(format!(" {} ", removing.label()), said));
+    }
     if let Some(notice) = view.notice() {
-        let mut spans = vec![Span::styled(
-            format!(" {notice} "),
-            Style::default().fg(Color::Black).bg(Color::Yellow),
-        )];
+        spans.push(Span::styled(format!(" {notice} "), said));
+    }
+    if !spans.is_empty() {
         spans.extend(freed);
         return Paragraph::new(Line::from(spans));
     }
@@ -786,6 +798,46 @@ mod tests {
             !row_with(&frame, "node_modules").contains("kept"),
             "{frame:#?}"
         );
+    }
+
+    #[test]
+    fn the_footer_says_where_the_deleter_is_and_not_only_what_it_has_given_back() {
+        let mut view = view();
+        view.ask(Pending {
+            targets: vec![
+                "/scan/nx/node_modules".into(),
+                "/scan/old/target".into(),
+                "/scan/gone".into(),
+                "/scan/also-gone".into(),
+            ],
+            bytes: 2 * 1024 * 1024,
+            unpriced: 0,
+            kept: Vec::new(),
+            answer: Answer::Delete,
+        });
+        view.apply(Action::Answer);
+        view.removed(Path::new("/scan/nx/node_modules"), 1024 * 1024, true);
+        view.animate(std::time::Instant::now());
+        let frame = painted(&mut view, 100, 8);
+
+        // A running byte total says how much has gone and nothing about how much is left, so
+        // a reader cannot tell a third of the way through from nearly finished. The count
+        // against the batch's own size can, and it is beside the bytes rather than instead of
+        // them: the pair is what somebody who walked away comes back to read.
+        assert!(
+            frame[7].contains("removing 1 of 4 directories"),
+            "{frame:#?}"
+        );
+        assert!(frame[7].contains("25%"), "{frame:#?}");
+        assert!(frame[7].contains("freed 1.0 MiB"), "{frame:#?}");
+
+        // And the one thing that speaks while a removal runs still gets through. `q` is held
+        // back until the batch finishes; a reader who pressed it and saw nothing change would
+        // have no way to tell a refusal from a terminal that had stopped listening.
+        view.apply(Action::Quit);
+        let frame = painted(&mut view, 100, 8);
+        assert!(frame[7].contains("removing 1 of 4"), "{frame:#?}");
+        assert!(frame[7].contains("the removal has to finish"), "{frame:#?}");
     }
 
     #[test]

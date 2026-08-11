@@ -49,7 +49,7 @@ use ratatui::crossterm::event::{DisableFocusChange, EnableFocusChange};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate, SetTitle};
 
-use super::state::View;
+use super::state::{View, percent};
 use crate::size::human;
 
 /// How long a run has to have taken before finishing it is worth a notification.
@@ -259,9 +259,14 @@ impl Decor {
 /// reader who is elsewhere wants to know, and the order is what makes that true.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
-    /// A removal is running. No denominator — the deleter reports targets as it finishes
-    /// them, not bytes it still owes.
-    Deleting,
+    /// A removal is running, and this much of its batch is behind it.
+    ///
+    /// The one bar here with a denominator that does not move. The batch's size is fixed when
+    /// the reader answers the confirmation, where the pricing bar below counts against a total
+    /// the walk is still adding to — so this is the fraction a reader who has left the terminal
+    /// can actually plan around, and a running byte total on its own cannot say whether a long
+    /// delete is a third of the way through or nearly done.
+    Deleting(u8),
     /// The pricing pool is behind the walk, by this percentage.
     Pricing(u8),
     /// Walking, with nothing outstanding to price.
@@ -283,8 +288,8 @@ impl Status {
     #[must_use]
     pub fn of(view: &View, freed: u64) -> Self {
         let total = view.total();
-        if view.is_deleting() {
-            return Self::Deleting;
+        if let Some(removing) = view.removing() {
+            return Self::Deleting(removing.percent());
         }
         if view.is_scanning() {
             let priced = total.claims - total.unpriced;
@@ -302,7 +307,7 @@ impl Status {
     /// The window title.
     fn title(&self) -> String {
         match self {
-            Self::Deleting => "pristine — deleting".to_owned(),
+            Self::Deleting(percent) => format!("pristine — deleting {percent}%"),
             Self::Pricing(percent) => format!("pristine — pricing {percent}%"),
             Self::Scanning(bytes) | Self::Idle(bytes) => format!("pristine — {}", human(*bytes)),
             Self::Freed(bytes) => format!("pristine — freed {}", human(*bytes)),
@@ -312,22 +317,14 @@ impl Status {
     /// The taskbar's bar.
     fn bar(&self) -> Bar {
         match self {
-            // Both of these are work with no honest fraction attached, which is what the
-            // indeterminate state is for. Reporting 0% instead would read as stuck.
-            Self::Deleting | Self::Scanning(_) => Bar::Working,
-            Self::Pricing(percent) => Bar::At(*percent),
+            // Walking has no honest fraction attached — nothing knows how many directories
+            // are under a path until they have been visited — which is what the indeterminate
+            // state is for. Reporting 0% instead would read as stuck.
+            Self::Scanning(_) => Bar::Working,
+            Self::Deleting(percent) | Self::Pricing(percent) => Bar::At(*percent),
             Self::Freed(_) | Self::Idle(_) => Bar::Off,
         }
     }
-}
-
-/// One of `1 - x/y` as a percentage, saturating rather than wrapping.
-fn percent(part: usize, whole: usize) -> u8 {
-    if whole == 0 {
-        return 0;
-    }
-    let scaled = part.saturating_mul(100) / whole;
-    u8::try_from(scaled.min(100)).unwrap_or(100)
 }
 
 /// The state of the taskbar's progress bar, in `ConEmu`'s vocabulary.
@@ -581,8 +578,10 @@ mod tests {
     use crate::fixture::{hit, priced};
     use crate::size::Size;
     use crate::tree::Tree;
-    use crate::tui::state::View;
+    use crate::tui::keymap::Action;
+    use crate::tui::state::{Answer, Pending, View};
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::time::Duration;
 
     /// Everything on, which is what a terminal this can identify gets.
@@ -850,8 +849,52 @@ mod tests {
         // because that is the number the reader went away to wait for.
         assert_eq!(Status::of(&view, 4096), Status::Freed(4096));
 
+        // …until a removal starts, which outranks everything: it is the one thing running, and
+        // unlike the walk it can say how far through it is.
         view.deleting_for_test();
-        assert_eq!(Status::of(&view, 4096), Status::Deleting);
+        assert_eq!(Status::of(&view, 4096), Status::Deleting(0));
+    }
+
+    #[test]
+    fn a_removal_reports_where_it_has_got_to_rather_than_only_that_it_is_running() {
+        let mut view = view();
+        view.found(priced("/scan/a/node_modules", 1024));
+        view.found(priced("/scan/b/node_modules", 1024));
+        view.found(priced("/scan/c/node_modules", 1024));
+        view.found(priced("/scan/d/node_modules", 1024));
+        view.scanned();
+        view.ask(Pending {
+            targets: ["a", "b", "c", "d"]
+                .iter()
+                .map(|name| PathBuf::from(format!("/scan/{name}/node_modules")))
+                .collect(),
+            bytes: 4096,
+            unpriced: 0,
+            kept: Vec::new(),
+            answer: Answer::Delete,
+        });
+        view.apply(Action::Answer);
+
+        // A bar rather than the indeterminate throbber the walk gets: the denominator was
+        // fixed by the confirmation, so every target that comes back moves it by a knowable
+        // amount. This is the whole difference between "something is happening" and "you are
+        // half way".
+        assert_eq!(Status::of(&view, 0), Status::Deleting(0));
+        assert_eq!(Status::of(&view, 0).bar().code(), (1, 0));
+
+        view.removed(std::path::Path::new("/scan/a/node_modules"), 1024, true);
+        assert_eq!(Status::of(&view, 0), Status::Deleting(25));
+        view.removed(std::path::Path::new("/scan/b/node_modules"), 512, false);
+        // A target the sweep could not finish is still a target it is no longer working on,
+        // so it counts: the bar says where the deleter is, not how much of the batch worked.
+        assert_eq!(Status::of(&view, 0), Status::Deleting(50));
+        assert_eq!(Status::of(&view, 0).bar().code(), (1, 50));
+
+        // And the batch reporting takes the bar down, whether or not it reached the end — a
+        // target nothing happened to is never reported, so 100% is not something to wait for.
+        view.deleted("freed 1.5 KiB".to_owned(), 1536);
+        assert_eq!(Status::of(&view, 1536), Status::Freed(1536));
+        assert_eq!(Status::of(&view, 1536).bar().code(), (0, 0));
     }
 
     #[test]

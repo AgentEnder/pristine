@@ -122,6 +122,82 @@ impl Roll {
     }
 }
 
+/// How far through its batch a running removal is.
+///
+/// A running byte total is the wrong thing on its own, and real use is what showed it: bytes
+/// say how much has gone but not how much is left to go, so a reader watching a long delete
+/// cannot tell a third of the way through from nearly finished. A **count of targets against
+/// the batch's own total** can, and this is the one phase of the run where the denominator is
+/// honest without qualification — it is fixed the instant the reader answers the confirmation,
+/// where the pricing bar's denominator grows as the walk finds claims faster than the pool can
+/// price them.
+///
+/// It is a lower bound, and deliberately so. The deleter speaks only for a target something
+/// actually *happened* to, so a batch where one turned out to be gone already ends at eleven of
+/// twelve rather than counting a directory nobody touched. The state ends when the batch
+/// reports, not when the count reaches its total.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Removing {
+    /// Targets the confirmed plan handed to the deleter.
+    total: usize,
+    /// Targets the deleter has reported finishing with, whole or in part.
+    done: usize,
+}
+
+impl Removing {
+    /// The start of a batch of `total` targets.
+    fn new(total: usize) -> Self {
+        Self { total, done: 0 }
+    }
+
+    /// Notes one more target the deleter has come back out of.
+    ///
+    /// Capped at the total rather than allowed past it: the count is a position in a batch of
+    /// known size, and a `13 of 12` would say the batch was not what the confirmation said it
+    /// was — which is the one thing the dialog promises.
+    fn finished(&mut self) {
+        self.done = self.done.saturating_add(1).min(self.total);
+    }
+
+    /// Targets done, and how many there are.
+    #[must_use]
+    pub fn counted(self) -> (usize, usize) {
+        (self.done, self.total)
+    }
+
+    /// How far through, for the footer and for the dock.
+    #[must_use]
+    pub fn percent(self) -> u8 {
+        percent(self.done, self.total)
+    }
+
+    /// What the footer says, which is where the deleter is rather than only what it has given
+    /// back. The freed counter beside it already carries the bytes.
+    #[must_use]
+    pub fn label(self) -> String {
+        format!(
+            "removing {} of {} · {}%",
+            self.done,
+            plural(self.total, "directory", "directories"),
+            self.percent()
+        )
+    }
+}
+
+/// `part` of `whole` as a percentage, saturating rather than wrapping.
+///
+/// Lives here rather than beside its other caller in [`super::chrome`] so that the dependency
+/// runs the way the layering does: the chrome reads the view, and the view knows nothing about
+/// a terminal. One implementation, because a footer and a taskbar bar that rounded differently
+/// would be two claims about the same run.
+pub(super) fn percent(part: usize, whole: usize) -> u8 {
+    if whole == 0 {
+        return 0;
+    }
+    let scaled = part.saturating_mul(100) / whole;
+    u8::try_from(scaled.min(100)).unwrap_or(100)
+}
+
 /// The question the delete key asks, and everything it is holding while it asks.
 ///
 /// It carries the **targets the plan resolved**, not "whatever is marked when the answer is
@@ -363,8 +439,9 @@ pub struct View {
     pending: Option<Pending>,
     /// Whether the walk is still running, for the header.
     scanning: bool,
-    /// Whether a removal is in flight. A second one would race the first over the same tree.
-    deleting: bool,
+    /// The removal in flight, and where it has got to. A second one would race the first over
+    /// the same tree, so its presence is also what refuses one.
+    removing: Option<Removing>,
     /// Whether the reader has asked to leave and is waiting on a removal to finish.
     ///
     /// `q` is reserved everywhere, and it stays reserved — but it cannot *end* a run that is
@@ -435,7 +512,7 @@ impl View {
             help: None,
             pending: None,
             scanning: true,
-            deleting: false,
+            removing: None,
             quitting: false,
             notice: None,
             stale: true,
@@ -509,6 +586,14 @@ impl View {
     /// consequences are not: the row is out of the batch and out of the marks from the moment
     /// the sweep first touched it.
     pub fn removed(&mut self, path: &Path, bytes: u64, complete: bool) {
+        // Counted before the row is looked up, and counted whether or not the sweep finished:
+        // this says where the deleter *is*, and a target it went into and came back out of is
+        // one it is no longer working on. A target whose row has already gone from the tree —
+        // the reader filtered it away, an earlier batch took it — has still been dealt with,
+        // so a progress bar that skipped it would stall short of the truth.
+        if let Some(removing) = &mut self.removing {
+            removing.finished();
+        }
         let Some(id) = self.tree.find(path) else {
             return;
         };
@@ -548,8 +633,24 @@ impl View {
     /// by the same code, so keeping both would count each one twice. The running figures are
     /// dropped in the same breath that this one lands, which is why the counter hands over
     /// without so much as a flicker.
+    ///
+    /// **A target the sweep could not finish has to be reconciled into the tree first.** Its
+    /// row is staying — the directory is still on disk — and what it is worth is what survived,
+    /// which until this point has only ever been said by the deleter's progress. Progress is
+    /// the thing being dropped here, so the reduction is made durable before it goes: a claim
+    /// whose bytes went but whose row remains springs straight back to its original size
+    /// otherwise, and the headline reclaimable figure *rises* after a partial delete while
+    /// `freed` says those same bytes are gone. A complete removal needs none of this, because
+    /// its claim leaves the tree outright when its dimmed beat is over.
     pub fn deleted(&mut self, notice: String, freed: u64) {
-        self.deleting = false;
+        for (id, bytes) in self.moving.leaving().collect::<Vec<_>>() {
+            if self.moving.is_spent(id) {
+                continue;
+            }
+            let path = self.tree.node(id).path.clone();
+            self.tree.shrink(&path, bytes);
+        }
+        self.removing = None;
         self.notice = Some(notice);
         self.freed = freed;
         self.moving.banked();
@@ -986,7 +1087,13 @@ impl View {
     /// Whether a removal is in flight.
     #[must_use]
     pub fn is_deleting(&self) -> bool {
-        self.deleting
+        self.removing.is_some()
+    }
+
+    /// Where the removal in flight has got to, if there is one.
+    #[must_use]
+    pub fn removing(&self) -> Option<Removing> {
+        self.removing
     }
 
     /// Puts the view mid-removal without one having happened.
@@ -995,7 +1102,7 @@ impl View {
     /// door into that state runs an actual removal against an actual filesystem.
     #[cfg(test)]
     pub(crate) fn deleting_for_test(&mut self) {
-        self.deleting = true;
+        self.removing = Some(Removing::new(1));
     }
 
     /// What just happened, for the footer.
@@ -1111,7 +1218,7 @@ impl View {
     /// rows keep disappearing as the deleter finishes each target. Tearing the batch in half
     /// would not be.
     fn quit(&mut self) -> Effect {
-        if self.deleting {
+        if self.is_deleting() {
             self.quitting = true;
             self.notice = Some("the removal has to finish — closing the moment it does".to_owned());
             return Effect::None;
@@ -1122,7 +1229,7 @@ impl View {
     /// Whether a quit that was held back by a removal can be honoured now.
     #[must_use]
     pub fn wants_to_quit(&self) -> bool {
-        self.quitting && !self.deleting
+        self.quitting && !self.is_deleting()
     }
 
     /// One rung down the ladder: whatever is in front of the reader, taken away.
@@ -1212,11 +1319,13 @@ impl View {
         match pending.answer {
             Answer::Cancel => Effect::None,
             Answer::Delete => {
-                self.deleting = true;
-                self.notice = Some(format!(
-                    "removing {}…",
-                    plural(pending.targets.len(), "directory", "directories")
-                ));
+                // The batch's size is fixed here and nowhere else, which is what makes the
+                // progress a fraction rather than a running total. No notice beside it: the
+                // footer draws the count while this is set, and a static "removing 12
+                // directories…" sitting next to a live "removing 4 of 12" would be two
+                // statements about one batch that stop agreeing on the second target.
+                self.removing = Some(Removing::new(pending.targets.len()));
+                self.notice = None;
                 Effect::Delete(pending.targets)
             }
         }
@@ -1224,7 +1333,7 @@ impl View {
 
     /// `x`: hand the marked batch out to be planned.
     fn commit(&mut self) -> Effect {
-        if self.deleting {
+        if self.is_deleting() {
             self.notice = Some("a removal is already running".to_owned());
             return Effect::None;
         }
@@ -2589,6 +2698,96 @@ mod tests {
         );
         assert!(!view.is_spent(claim), "a row that survived was collapsed");
         assert_eq!(view.drawn(claim).bytes, 50);
+    }
+
+    #[test]
+    fn a_running_removal_counts_targets_against_the_batch_it_was_given() {
+        let mut view = view();
+        view.ask(pending(&[
+            "/scan/nx/node_modules",
+            "/scan/nx/packages/ui/node_modules",
+            "/scan/old/target",
+        ]));
+        view.apply(Action::Highlight(Turn::Next));
+        view.apply(Action::Answer);
+
+        // The denominator is fixed here, by the question the reader answered — which is what
+        // separates this bar from the pricing one, whose total grows as the walk finds claims.
+        assert_eq!(view.removing().unwrap().counted(), (0, 3));
+        assert_eq!(view.removing().unwrap().percent(), 0);
+        assert_eq!(
+            view.removing().unwrap().label(),
+            "removing 0 of 3 directories · 0%"
+        );
+
+        view.removed(Path::new("/scan/nx/node_modules"), 200, true);
+        assert_eq!(view.removing().unwrap().counted(), (1, 3));
+
+        // A target the sweep went into and came back out of counts too: this says where the
+        // deleter *is*, and it is no longer working on that one. It is not a claim that the
+        // target was removed — the row is still there saying what is left of it.
+        view.removed(Path::new("/scan/nx/packages/ui/node_modules"), 40, false);
+        assert_eq!(view.removing().unwrap().counted(), (2, 3));
+        assert_eq!(view.removing().unwrap().percent(), 66);
+
+        // The third target turns out to be gone already, so the deleter never reports it —
+        // `Sweep::reported` only speaks for a target something happened to. The count
+        // therefore stops at two of three, which is true, and the batch reporting is what
+        // ends the state rather than the count reaching its total.
+        view.deleted("removed 240 B from 1 directory".to_owned(), 240);
+        assert!(view.removing().is_none());
+        assert!(!view.is_deleting());
+    }
+
+    #[test]
+    fn a_second_removal_is_refused_while_one_is_running() {
+        let mut view = view();
+        view.ask(pending(&["/scan/old/target"]));
+        view.apply(Action::Highlight(Turn::Next));
+        view.apply(Action::Answer);
+
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Mark);
+        assert_eq!(view.apply(Action::Commit), Effect::None);
+        assert_eq!(view.notice(), Some("a removal is already running"));
+    }
+
+    #[test]
+    fn a_part_emptied_row_does_not_spring_back_when_the_batch_reports() {
+        let mut view = view();
+        let start = Instant::now();
+        view.animate(start);
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Expand);
+        let claim = at(&view, "/scan/nx/node_modules");
+        let root = view.tree().root();
+
+        // 150 of the target's 200 bytes go, and then the sweep comes out again — a checkout
+        // inside it, an unreadable corner. Both events, because that is the order the deleter
+        // reports in and the reduction has to survive either one arriving last.
+        view.freeing(Path::new("/scan/nx/node_modules"), 150);
+        view.removed(Path::new("/scan/nx/node_modules"), 150, false);
+        view.animate(start);
+        assert_eq!(view.drawn(claim).bytes, 50);
+        assert_eq!(view.drawn_total().bytes, 160);
+
+        // The batch reports. Its per-target figures are dropped for the report's own
+        // arithmetic — and until this was fixed, the *reduction* went with them: the tree still
+        // held 200 for a directory that has 50 left, so the row and the headline both jumped
+        // back to what they were worth before a single byte was deleted. That is the direction
+        // a cleaner may never be wrong in, because the number that rose is the one a reader
+        // came back to check.
+        view.deleted("freed 150 B".to_owned(), 150);
+        view.animate(start + DIM * 2);
+
+        assert_eq!(view.drawn(claim).bytes, 50, "the row sprang back");
+        assert_eq!(view.drawn_total().bytes, 160, "the headline rose again");
+        // Durably, not just on this frame: the tree itself is what a later sort, filter or
+        // second batch reads, and it has to agree with the screen.
+        assert_eq!(view.roll(claim).bytes, 50);
+        assert_eq!(view.roll(root).bytes, 160);
+        // And the freed figure is untouched — the bytes are counted once, by the batch.
+        assert_eq!(view.drawn_freed(), 150);
     }
 
     #[test]
