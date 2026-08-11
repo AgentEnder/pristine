@@ -817,6 +817,7 @@ mod tests {
         });
         view.apply(Action::Answer);
         view.removed(Path::new("/scan/nx/node_modules"), 1024 * 1024, true);
+        view.swept();
         view.animate(std::time::Instant::now());
         let frame = painted(&mut view, 100, 8);
 

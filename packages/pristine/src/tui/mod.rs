@@ -468,6 +468,9 @@ fn drain(view: &mut View, inbox: &Receiver<Message>, outcome: &mut Outcome) {
             Ok(Message::Removing(Step::Finished(removed))) => {
                 view.removed(&removed.path, removed.bytes, removed.complete);
             }
+            // Where the batch has got to, which is a different question from what happened to
+            // any row — a target that failed before unlinking anything still counts here.
+            Ok(Message::Removing(Step::Swept(_))) => view.swept(),
             Ok(Message::Deleted(removal)) => {
                 outcome.failures += removal.failures.len();
                 outcome.freed += removal.bytes_freed();
@@ -688,6 +691,28 @@ mod tests {
         assert_eq!(view.drawn_total().bytes, 0);
         assert_eq!(view.drawn_freed(), 1000);
         assert!(view.is_spent(row));
+    }
+
+    #[test]
+    fn the_batchs_position_advances_on_a_target_the_deleter_could_not_touch() {
+        use crate::delete::Step;
+
+        let (post, inbox) = channel();
+        let mut view = view();
+        let mut outcome = Outcome::default();
+        // One target, and the deleter fails on it before unlinking anything — so there is no
+        // `Finished` and no row to move, only the pool saying it has moved on.
+        view.deleting_for_test();
+        assert_eq!(view.removing().unwrap().counted(), (0, 1));
+
+        post.send(Message::Removing(Step::Swept("/scan/a/target".into())))
+            .unwrap();
+        drain(&mut view, &inbox, &mut outcome);
+
+        // The wiring is the point: a missing arm here would leave the bar at zero for the
+        // whole run and say nothing about it.
+        assert_eq!(view.removing().unwrap().counted(), (1, 1));
+        assert_eq!(view.removing().unwrap().percent(), 100);
     }
 
     #[test]

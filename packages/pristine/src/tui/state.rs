@@ -586,14 +586,6 @@ impl View {
     /// consequences are not: the row is out of the batch and out of the marks from the moment
     /// the sweep first touched it.
     pub fn removed(&mut self, path: &Path, bytes: u64, complete: bool) {
-        // Counted before the row is looked up, and counted whether or not the sweep finished:
-        // this says where the deleter *is*, and a target it went into and came back out of is
-        // one it is no longer working on. A target whose row has already gone from the tree —
-        // the reader filtered it away, an earlier batch took it — has still been dealt with,
-        // so a progress bar that skipped it would stall short of the truth.
-        if let Some(removing) = &mut self.removing {
-            removing.finished();
-        }
         let Some(id) = self.tree.find(path) else {
             return;
         };
@@ -606,6 +598,25 @@ impl View {
             self.moving.frees(id, bytes);
         }
         self.stale = true;
+    }
+
+    /// The deleter has moved off a target, whatever it managed to do to it.
+    ///
+    /// **This and [`View::removed`] answer different questions, which is why the progress
+    /// counts here and the rows move there.** A target that failed before unlinking a single
+    /// entry, or that had already vanished, is one the deleter is no longer working on — it
+    /// belongs to where the batch has got to, and to nothing else. Counting the position on
+    /// removals instead would leave a batch that failed on every target reading 0% for its
+    /// whole life and then vanishing, which reports the *outcome* under the guise of the
+    /// position; and even one such target leaves the bar permanently short of where the
+    /// deleter actually is.
+    ///
+    /// It deliberately does not touch the tree. Nothing happened to that directory, so there
+    /// is nothing for its row to say.
+    pub fn swept(&mut self) {
+        if let Some(removing) = &mut self.removing {
+            removing.finished();
+        }
     }
 
     /// Directories a removal left standing, with the reason each one was left.
@@ -2720,23 +2731,66 @@ mod tests {
             "removing 0 of 3 directories · 0%"
         );
 
+        // The count moves on the deleter leaving a target, never on what it did there — the
+        // row work is `removed`'s and the position is this. A removal reports both, in that
+        // order, and only the second one advances the bar.
         view.removed(Path::new("/scan/nx/node_modules"), 200, true);
+        assert_eq!(
+            view.removing().unwrap().counted(),
+            (0, 3),
+            "the position moved on what happened to a row"
+        );
+        view.swept();
         assert_eq!(view.removing().unwrap().counted(), (1, 3));
 
-        // A target the sweep went into and came back out of counts too: this says where the
-        // deleter *is*, and it is no longer working on that one. It is not a claim that the
-        // target was removed — the row is still there saying what is left of it.
+        // A target the sweep went into and came back out of counts the same: it is not a claim
+        // that the target was removed — the row is still there saying what is left of it.
         view.removed(Path::new("/scan/nx/packages/ui/node_modules"), 40, false);
+        view.swept();
         assert_eq!(view.removing().unwrap().counted(), (2, 3));
         assert_eq!(view.removing().unwrap().percent(), 66);
 
-        // The third target turns out to be gone already, so the deleter never reports it —
-        // `Sweep::reported` only speaks for a target something happened to. The count
-        // therefore stops at two of three, which is true, and the batch reporting is what
-        // ends the state rather than the count reaching its total.
+        // The third target turns out to be gone already, so nothing happened to it and no row
+        // moves — but the deleter still worked through it and said so, so the count reaches
+        // its total rather than stopping one short for the rest of the run.
+        view.swept();
+        assert_eq!(view.removing().unwrap().counted(), (3, 3));
+        assert_eq!(view.removing().unwrap().percent(), 100);
+
         view.deleted("removed 240 B from 1 directory".to_owned(), 240);
         assert!(view.removing().is_none());
         assert!(!view.is_deleting());
+    }
+
+    #[test]
+    fn a_batch_that_fails_on_everything_still_shows_the_deleter_working_through_it() {
+        let mut view = view();
+        view.ask(pending(&[
+            "/scan/nx/node_modules",
+            "/scan/nx/packages/ui/node_modules",
+            "/scan/old/target",
+        ]));
+        view.apply(Action::Highlight(Turn::Next));
+        view.apply(Action::Answer);
+
+        // Every target fails before unlinking a single entry, so not one of them is a removal
+        // and not one row moves. The deleter is working through them all the same, and a bar
+        // that read 0% for the whole run and then vanished would be reporting the OUTCOME
+        // while claiming to report the position.
+        for done in 1..=3 {
+            view.swept();
+            assert_eq!(view.removing().unwrap().counted(), (done, 3));
+        }
+        assert_eq!(view.removing().unwrap().percent(), 100);
+        assert_eq!(
+            view.removing().unwrap().label(),
+            "removing 3 of 3 directories · 100%"
+        );
+
+        // …and nothing was deleted, which is the other half of the same claim: the position
+        // says where the deleter got to and never that anything went.
+        assert_eq!(view.roll(view.tree().root()).bytes, 310);
+        assert_eq!(view.roll(view.tree().root()).claims, 3);
     }
 
     #[test]

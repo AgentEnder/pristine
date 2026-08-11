@@ -400,16 +400,34 @@ type Watcher = Arc<dyn Fn(&Step) + Send + Sync>;
 
 /// What a removal reports while it is happening.
 ///
-/// Two events rather than one, for the same reason [`crate::Found`] has three: the bytes leave
-/// the disk over seconds and the target finishes once, and those are different facts. A live
-/// view needs both — a row cannot show its size falling toward zero if the only news it ever
-/// gets is that the directory has already gone.
+/// Three events rather than one, for the same reason [`crate::Found`] has three: the bytes
+/// leave the disk over seconds, the target is removed once, and the pool moves off it once.
+/// A live view needs all three — a row cannot show its size falling toward zero if the only
+/// news it ever gets is that the directory has already gone.
+///
+/// **[`Finished`](Self::Finished) and [`Swept`](Self::Swept) are different questions and that
+/// is why both exist.** "What happened to this directory" is answered only for a target
+/// something happened to, because a row dropped for a target the final report then lists as
+/// untouched is the view and the report disagreeing. "Where has the deleter got to" is
+/// answered for every target, because a batch that fails on all of them has still been worked
+/// through — and a position indicator that reads zero throughout is describing the outcome
+/// rather than the position.
 #[derive(Debug, Clone)]
 pub enum Step {
     /// Bytes have left the disk and this target is still being swept.
     Freeing(Freeing),
-    /// The sweep is finished with this target, in whole or in part.
+    /// The sweep removed something from this target, in whole or in part.
+    ///
+    /// Emitted only when [`Removal::removed`] will carry this target too, which is the
+    /// condition a row disappearing is allowed to rest on.
     Finished(Removed),
+    /// The pool has moved off this target, whatever it managed — including nothing.
+    ///
+    /// One per target in the plan, always, and always after any [`Finished`](Self::Finished)
+    /// for the same path. It is deliberately *not* a claim that anything was deleted: a target
+    /// that failed before unlinking a single entry, or that had already vanished, is one the
+    /// deleter is no longer working on, and that is the whole of what this says.
+    Swept(PathBuf),
 }
 
 /// How far into one target a sweep has got.
@@ -543,10 +561,16 @@ impl Deleter {
                             break;
                         };
                         let sweep = Sweep::new(plan, &root, self.watching.as_ref()).run(target);
-                        if let (Some(watching), Some(removed)) =
-                            (self.watching.as_ref(), sweep.reported())
-                        {
-                            watching(&Step::Finished(removed));
+                        if let Some(watching) = self.watching.as_ref() {
+                            if let Some(removed) = sweep.reported() {
+                                watching(&Step::Finished(removed));
+                            }
+                            // Unconditional, and after the report above: this one says the
+                            // pool has moved on rather than that anything went, so a target
+                            // that failed before unlinking an entry counts here and nowhere
+                            // else. Without it a batch that fails on every target reports no
+                            // progress at all right up to the moment it ends.
+                            watching(&Step::Swept(target.path.clone()));
                         }
                         mine.push(sweep);
                     }

@@ -868,7 +868,7 @@ fn a_watcher_is_told_how_far_a_target_has_got_while_it_is_still_going() {
         .iter()
         .filter_map(|step| match step {
             Step::Freeing(freeing) => Some(freeing),
-            Step::Finished(_) => None,
+            Step::Finished(_) | Step::Swept(_) => None,
         })
         .collect();
 
@@ -906,10 +906,81 @@ fn a_watcher_is_told_how_far_a_target_has_got_while_it_is_still_going() {
         .filter(|step| matches!(step, Step::Finished(_)))
         .count();
     assert_eq!(finished, 1);
+    // The pool moving off the target is the last word on it, and it comes after the report of
+    // what was removed — a consumer that drops a row on `Finished` and advances a position on
+    // `Swept` must never see the position move first.
     assert!(
-        matches!(steps.last(), Some(Step::Finished(_))),
+        matches!(steps.last(), Some(Step::Swept(path)) if path == &target),
         "the sweep reported progress after it had finished"
     );
+    let order: Vec<&str> = steps
+        .iter()
+        .rev()
+        .take(2)
+        .map(|step| match step {
+            Step::Freeing(_) => "freeing",
+            Step::Finished(_) => "finished",
+            Step::Swept(_) => "swept",
+        })
+        .collect();
+    assert_eq!(order, ["swept", "finished"]);
+}
+
+#[test]
+fn a_watcher_is_told_the_pool_moved_on_even_from_a_target_nothing_happened_to() {
+    // The batch's position and the batch's outcome are different facts, and this is the case
+    // that separates them: a target the deleter worked through and could not touch at all.
+    // Counted as a removal it is nothing — `Removal::removed` must not claim it and no row may
+    // disappear for it — but the deleter has demonstrably moved past it, so a progress
+    // indicator that ignored it would sit below where the deleter is for the rest of the run.
+    let (_tmp, base) = fixture();
+    let doomed = base.join("vanishes/node_modules");
+    let survives = base.join("app/node_modules");
+    write(&doomed.join("dep/index.js"), 1024);
+    write(&survives.join("dep/index.js"), 1024);
+
+    let plan = plan_for(&base, &[doomed.clone(), survives.clone()]);
+    // Planned, then the ground moves: the directory holding the target is gone by the time the
+    // sweep tries to open its way down to it, so it fails before unlinking a single entry.
+    fs::remove_dir_all(base.join("vanishes")).unwrap();
+
+    let steps = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&steps);
+    let removal = Deleter::new()
+        .watching(move |step| sink.lock().unwrap().push(step.clone()))
+        .remove(&plan);
+
+    let steps = steps.lock().unwrap();
+    let swept: Vec<&PathBuf> = steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::Swept(path) => Some(path),
+            Step::Freeing(_) | Step::Finished(_) => None,
+        })
+        .collect();
+    let finished: Vec<&Removed> = steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::Finished(removed) => Some(removed),
+            Step::Freeing(_) | Step::Swept(_) => None,
+        })
+        .collect();
+
+    // Every target in the plan, whatever became of it — which is what makes the count reach
+    // its total rather than stopping one short for the rest of the run.
+    assert_eq!(swept.len(), 2, "{swept:?}");
+    assert!(
+        swept.contains(&&doomed) && swept.contains(&&survives),
+        "{swept:?}"
+    );
+
+    // And the existing rule is untouched: only the target something happened to is reported,
+    // and it is the same one the final report lists.
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].path, survives);
+    assert_eq!(removal.removed.len(), 1);
+    assert_eq!(removal.removed[0].path, survives);
+    assert_eq!(removal.failures.len(), 1, "{:?}", removal.failures);
 }
 
 #[test]
