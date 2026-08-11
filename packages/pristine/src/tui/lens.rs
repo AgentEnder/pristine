@@ -79,7 +79,7 @@ impl Tier {
 
 /// Which tiers are on screen. Both axes are sets, which is what makes an unanticipated
 /// combination expressible without a new mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct Tiers {
     /// Whether rule-named claims are shown.
     pub named: bool,
@@ -158,7 +158,7 @@ impl Tiers {
 /// Spelled as three named booleans rather than as a bitset, because there are exactly three of
 /// them and a closed vocabulary is the one place where writing the members out is shorter than
 /// the machinery for not writing them out.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct Kinds {
     /// Installed third-party code.
     pub dependencies: bool,
@@ -382,6 +382,18 @@ impl PartialEq for Lens {
 }
 
 impl Eq for Lens {}
+
+impl std::hash::Hash for Lens {
+    /// Exactly what [`Lens::eq`] reads, in the same order, because a hash that disagreed with
+    /// equality is a lens that changed without anybody watching it being told — and
+    /// [`super::treemap`] watches this one to decide whether a picture is still the right
+    /// one. The pattern goes in as its source text for equality's own reason.
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.tiers.hash(state);
+        self.kinds.hash(state);
+        self.pattern.as_ref().map(Regex::as_str).hash(state);
+    }
+}
 
 impl Lens {
     /// A lens on the two axes directly, which is the general door: [`Lens::showing`] is the

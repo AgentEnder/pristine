@@ -233,6 +233,18 @@ pub fn focus(view: &View) -> Option<NodeId> {
     Some(id)
 }
 
+/// Whether there is a map of `root` in `area` at all.
+///
+/// [`plan`]'s first question, split out because it is also the one the pane asks on **every**
+/// frame: a directory the deleter has emptied has no map, and taking a picture down is not a
+/// redraw to be held back until the view settles. Stated once rather than in the two places
+/// that ask it, so they cannot come to disagree about what an empty map is — and it costs
+/// nothing to ask, being a rolled-up count already on the node.
+#[must_use]
+pub fn mappable(view: &View, root: NodeId, area: Area) -> bool {
+    view.roll(root).claims > 0 && area.w >= 1.0 && area.h >= 1.0
+}
+
 /// The map of `root` inside `area`, or `None` when there is nothing honest to draw.
 ///
 /// `None` rather than an empty rectangle in two cases, and they are different: a directory
@@ -240,10 +252,10 @@ pub fn focus(view: &View) -> Option<NodeId> {
 /// subtree is both unpriced and uncounted has nothing to divide it *by*.
 #[must_use]
 pub fn plan(view: &View, root: NodeId, area: Area) -> Option<Map> {
-    let roll = view.roll(root);
-    if roll.claims == 0 || area.w < 1.0 || area.h < 1.0 {
+    if !mappable(view, root, area) {
         return None;
     }
+    let roll = view.roll(root);
     // The split comes first, before a single rectangle is placed: what is unknown is not a
     // leftover of the layout, it is a share of the map reserved before the layout runs.
     let share = if roll.unpriced == 0 {

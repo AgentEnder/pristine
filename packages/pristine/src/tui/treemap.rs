@@ -30,12 +30,27 @@
 //! the image is emitted only when the picture actually **changes** — and the two kinds of
 //! change are treated differently, because they have different deadlines:
 //!
-//! - **Steering** — the cursor moving, a drill-in, the pane resizing — is the reader's own
-//!   hand and is redrawn on the next frame, always.
+//! - **Steering** — the cursor moving, a drill-in, a mark, a filter, the pane resizing — is
+//!   the reader's own hand and is redrawn on the next frame, always.
 //! - **Arriving** — a price landing, a claim appearing, a row being deleted — happens
 //!   hundreds of times a second during a breakdown and is redrawn at most every
 //!   [`SETTLE`]. A map that repaints 10 times a second while 16,013 prices land is a map
 //!   nobody can read anyway.
+//!
+//! **"Has it changed" is answered from what the map is made of, never from the map.** The
+//! spike asked it by squarifying the whole thing and comparing, which cost 467 µs on a frame
+//! where nothing had happened — 200× what the animation beside it spends to answer the same
+//! question, paid forever, on a pane showing the picture it showed last frame. Reading the
+//! inputs instead costs **50 ns**: a [`View::map_stamp`](super::state::View::map_stamp) for
+//! the mapped subtree, and a hash of the handful of values the reader controls.
+//!
+//! That stamp is **lens-aware**, and it has to be. A run opens on a view that hides the
+//! gitignored tier, so tier-two claims stream in under the very directory the map is of while
+//! changing not one rectangle; answering each of those with the tree's own stamp would be a
+//! megabyte down the pty to redraw the picture already on it.
+//!
+//! Taking the picture **down** is not a redraw and is never throttled — see
+//! [`tiles::mappable`].
 //!
 //! See the note in brain — `areas/pristine/design/2026-08-11-treemap-spike.md` — for what
 //! this measured out at, and for the verdict.
@@ -132,11 +147,13 @@ pub struct Screen<W: Write> {
     allowed: bool,
     /// Whether there is an image on the terminal right now.
     up: bool,
-    /// What the picture on screen is of — the whole map, so anything that changes it shows.
-    picture: u64,
-    /// What the reader's own hand has set: which directory, which row, how big the pane.
-    /// Changes to this are never throttled.
+    /// What the reader's own hand had set when the picture went up: which directory, which
+    /// row, what is marked, what the filter shows, how big the pane. Changes to this are
+    /// never throttled.
     steering: u64,
+    /// What the mapped subtree was showing when the picture went up. See
+    /// [`View::map_stamp`].
+    arriving: u64,
     /// When the image was last written.
     since: Option<Instant>,
 }
@@ -148,8 +165,8 @@ impl<W: Write> Screen<W> {
             out,
             allowed,
             up: false,
-            picture: 0,
             steering: 0,
+            arriving: 0,
             since: None,
         }
     }
@@ -175,27 +192,62 @@ impl<W: Write> Screen<W> {
         let Some(root) = tiles::focus(view) else {
             return self.hide();
         };
-        let Some(map) = tiles::plan(view, root, Area::of(f64::from(width), f64::from(height)))
-        else {
+        let area = Area::of(f64::from(width), f64::from(height));
+        // Asked on every frame and never throttled, because it is not a redraw: a map of a
+        // directory the deleter has just emptied is a picture of something that is no longer
+        // there, and on this tool that is a picture of what was about to be deleted. It is
+        // also free — see [`tiles::mappable`].
+        if !tiles::mappable(view, root, area) {
             return self.hide();
-        };
+        }
 
         // Two fingerprints, because the two kinds of change have different deadlines. The
         // reader's hand is answered on the next frame; the pool's arrivals wait for `SETTLE`,
         // which is what stops 16,013 prices from each buying a megabyte of redraw.
-        let steering = fingerprint(&(root, view.cursor(), pane.cells, pane.cell));
-        let picture = fingerprint(&map);
+        //
+        // Both are taken from what the map is made **of** rather than from the map, and
+        // that is the whole of this. Asking "did the picture change" by building the picture
+        // and comparing costs a squarify, a collapse and two strings per rectangle on every
+        // frame forever — 467 µs against the 2 µs the animation beside it spends to answer
+        // the same question, on a pane showing what it showed last frame.
+        //
+        // The inputs are: which directory is mapped, where the cursor is, what is marked,
+        // what the lens shows, how big the pane is, and whether anything under the mapped
+        // directory has moved. Nothing else reaches [`tiles::plan`] — the order the tree
+        // holds its children in does not, because the map sorts its own rectangles by weight.
+        let steering = fingerprint(&(
+            root,
+            // By `NodeId` and never by row index: rows re-sort as prices land, so an index
+            // that stayed the same names a different directory, and one that changed names
+            // the same one.
+            view.row().map(|row| row.id),
+            view.mark_stamp(),
+            // The whole lens and not just its `/` pattern: the tier and kind axes decide what
+            // [`View::roll`] counts, so a rectangle's area is as much theirs as the pattern's.
+            view.lens(),
+            pane.cells,
+            pane.cell,
+        ));
+        // The map's own stamp and not the tree's: the tree's is lens-blind, and a run opens on
+        // a view that hides a whole tier. See [`View::map_stamp`].
+        let arriving = view.map_stamp(root);
         let steered = steering != self.steering;
         let settled = self
             .since
             .is_none_or(|last| now.saturating_duration_since(last) >= SETTLE);
-        if self.up && picture == self.picture {
+        // Nothing the map is drawn from has moved, so what is on the terminal is still the
+        // right picture — and it is the still frame, which is nearly all of them.
+        if self.up && !steered && arriving == self.arriving {
             return Ok(());
         }
         if self.up && !steered && !settled {
             return Ok(());
         }
 
+        // Only now, once something is known to have changed, is the map worth laying out.
+        let Some(map) = tiles::plan(view, root, area) else {
+            return self.hide();
+        };
         let canvas = paint::paint(&map, width, height);
         let at = (pane.cells.y + 1, pane.cells.x + 1);
         let cells = (pane.cells.width, pane.cells.height);
@@ -211,8 +263,8 @@ impl<W: Write> Screen<W> {
         // The fingerprints only afterwards, and that is the other half: a write that failed
         // has left the screen in a state this cannot describe, so the next `show` has to
         // treat it as a picture it has not drawn and send it again.
-        self.picture = picture;
         self.steering = steering;
+        self.arriving = arriving;
         self.since = Some(now);
         Ok(())
     }
@@ -232,8 +284,8 @@ impl<W: Write> Screen<W> {
         if !self.up {
             return Ok(());
         }
-        self.picture = 0;
         self.steering = 0;
+        self.arriving = 0;
         self.since = None;
         self.put(&Image::gone())?;
         // Cleared only once the delete has actually gone out, which is the mirror of the
@@ -281,7 +333,7 @@ fn fingerprint(of: &impl Hash) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{MIN_WIDTH, Pane, SETTLE, Screen, kitty, paint, tiles};
-    use crate::fixture::{hit, priced};
+    use crate::fixture::{gitignored, hit, priced};
     use crate::size::Size;
     use crate::tree::Tree;
     use crate::tui::keymap::{Action, Motion};
@@ -292,11 +344,20 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
+    /// A view with the map turned on, which is the only kind that draws one.
+    ///
+    /// Said out loud in every fixture here rather than defaulted, because it is what decides
+    /// whether [`View::map_stamp`] has its lens-aware table behind it or falls back to the
+    /// tree's lens-blind one — so a test that left it off would be asserting about a run
+    /// nobody has.
     fn view() -> View {
         let mut tree = Tree::new("/scan");
         tree.insert(priced("/scan/nx/node_modules", 8 * 1024 * 1024));
         tree.insert(priced("/scan/pua/target", 2 * 1024 * 1024));
-        View::new(tree)
+        let mut view = View::new(tree);
+        view.allow_maps(true);
+        view.sync();
+        view
     }
 
     fn pane() -> Pane {
@@ -386,6 +447,8 @@ mod tests {
         tree.insert(priced("/scan/nx/node_modules", 8 * 1024 * 1024));
         tree.insert(hit("/scan/pua/target", Size::Unmeasured, 0));
         let mut view = View::new(tree);
+        view.allow_maps(true);
+        view.sync();
         let mut screen = screen();
         let now = Instant::now();
         screen.show(&view, pane(), now).unwrap();
@@ -405,6 +468,265 @@ mod tests {
 
         screen.show(&view, pane(), now + SETTLE).unwrap();
         assert!(screen.sink().len() > first, "the map never caught up");
+    }
+
+    #[test]
+    fn the_map_of_a_directory_that_has_been_deleted_comes_down_without_waiting_to_settle() {
+        // [`SETTLE`] holds back *redraws*, and taking the picture down is not one. The
+        // difference is the whole of what the pane is for: a map that is 250 ms late is a map
+        // nobody notices, and a map of a directory that is no longer on the disk is a picture
+        // of what was about to be deleted, still up after it has gone.
+        let mut tree = Tree::new("/scan");
+        tree.insert(priced("/scan/only/node_modules", 8 * 1024 * 1024));
+        let mut view = View::new(tree);
+        view.allow_maps(true);
+        view.sync();
+        let mut screen = screen();
+        let now = Instant::now();
+        view.animate(now);
+        screen.show(&view, pane(), now).unwrap();
+        let before = screen.sink().len();
+
+        view.removed(
+            std::path::Path::new("/scan/only/node_modules"),
+            8 * 1024 * 1024,
+            true,
+        );
+        let later = now + crate::tui::moving::DIM;
+        view.animate(later);
+
+        // Well inside the settle, which is what an arrival would be made to wait for.
+        assert!(crate::tui::moving::DIM < SETTLE);
+        screen.show(&view, pane(), later).unwrap();
+        let said = written(&screen);
+        assert!(
+            said.len() > before && said.ends_with("d=I,i=1976622,q=2\x1b\\"),
+            "the map outlived the directory it was of"
+        );
+    }
+
+    #[test]
+    fn an_arrival_outside_the_mapped_directory_is_not_a_redraw() {
+        // The property that makes this affordable at all, and the one a fingerprint taken
+        // over the whole view rather than over the mapped subtree would lose: during a
+        // breakdown 16,013 prices land, and the reader is looking at one directory. A
+        // megabyte spent redrawing a picture that did not change is the cost this whole pane
+        // is arguing with.
+        let mut tree = Tree::new("/scan");
+        tree.insert(priced("/scan/here/one/node_modules", 4 * 1024 * 1024));
+        tree.insert(priced("/scan/here/two/node_modules", 2 * 1024 * 1024));
+        tree.insert(priced("/scan/there/target", 1024));
+        let mut view = View::new(tree);
+        view.allow_maps(true);
+        view.sync();
+        view.apply(Action::Cursor(Motion::Down));
+        let here = view
+            .tree()
+            .find(std::path::Path::new("/scan/here"))
+            .unwrap();
+        assert_eq!(tiles::focus(&view), Some(here));
+
+        let mut screen = screen();
+        let now = Instant::now();
+        screen.show(&view, pane(), now).unwrap();
+        let first = screen.sink().len();
+
+        // Big enough to sort above the mapped directory, so the row the cursor is on lands at
+        // a different index: rows are named by `NodeId` and never by where they happen to be
+        // this frame, here as everywhere else.
+        view.found(priced("/scan/there/huge/node_modules", 64 * 1024 * 1024));
+        view.sync();
+        assert_eq!(
+            tiles::focus(&view),
+            Some(here),
+            "the map moved off its own directory"
+        );
+
+        screen.show(&view, pane(), now + SETTLE).unwrap();
+        assert_eq!(
+            screen.sink().len(),
+            first,
+            "a claim landing somewhere else redrew a picture that did not change"
+        );
+    }
+
+    #[test]
+    fn a_mark_is_the_readers_own_hand_rather_than_an_arrival_and_is_not_made_to_wait() {
+        let mut screen = screen();
+        let mut view = view();
+        let now = Instant::now();
+        view.apply(Action::Cursor(Motion::Down));
+        screen.show(&view, pane(), now).unwrap();
+        let before = screen.sink().len();
+
+        // A mark moves no bytes and no claims — it turns a rectangle aqua — so nothing the
+        // tree reports would say the picture changed. It is still the reader's own hand, and
+        // [`SETTLE`] is for the arrivals nobody asked for.
+        view.apply(Action::Mark);
+        screen.show(&view, pane(), now).unwrap();
+        assert!(
+            screen.sink().len() > before,
+            "a mark waited for a settle that is not for it"
+        );
+    }
+
+    #[test]
+    fn a_filter_redraws_the_map_it_narrows_at_once() {
+        let mut screen = screen();
+        let mut view = view();
+        let now = Instant::now();
+        screen.show(&view, pane(), now).unwrap();
+        let before = screen.sink().len();
+
+        // Half the rectangles stop existing and the tree behind them never moved. The reader
+        // typed this, so it is answered on the next frame.
+        view.apply(Action::OpenFilter);
+        for character in "target".chars() {
+            view.apply(Action::Type(character));
+        }
+        view.apply(Action::Submit);
+        screen.show(&view, pane(), now).unwrap();
+        assert!(
+            screen.sink().len() > before,
+            "the map went on showing what the filter took away"
+        );
+    }
+
+    #[test]
+    fn a_claim_the_view_hides_arriving_under_the_mapped_directory_is_not_a_redraw() {
+        // The lens-blind half of the tree's own stamp, and the case a run meets from its
+        // first frame: `default` hides the gitignored tier, so tier-two claims stream in
+        // under the very directory the map is of while changing not one rectangle. Answering
+        // each of those is a megabyte down the pty to redraw the picture already on it.
+        let mut tree = Tree::new("/scan");
+        tree.insert(priced("/scan/here/one/node_modules", 4 * 1024 * 1024));
+        tree.insert(priced("/scan/here/two/node_modules", 2 * 1024 * 1024));
+        let mut view = View::new(tree);
+        view.allow_maps(true);
+        view.sync();
+        view.apply(Action::Cursor(Motion::Down));
+        let here = view
+            .tree()
+            .find(std::path::Path::new("/scan/here"))
+            .unwrap();
+        assert_eq!(tiles::focus(&view), Some(here));
+
+        let mut screen = screen();
+        let now = Instant::now();
+        screen.show(&view, pane(), now).unwrap();
+        let first = screen.sink().len();
+        let was = view.roll(here);
+
+        // Inside the mapped directory, and enormous — but the view a run opens on does not
+        // show the gitignored tier, so the map has nothing to say about it.
+        let mut unseen = gitignored("/scan/here/three/vendor");
+        unseen.size = Size::Measured(64 * 1024 * 1024);
+        view.found(unseen);
+        view.sync();
+        assert_eq!(
+            view.roll(here),
+            was,
+            "the fixture no longer makes the point — the claim has to be invisible"
+        );
+
+        screen.show(&view, pane(), now + SETTLE).unwrap();
+        assert_eq!(
+            screen.sink().len(),
+            first,
+            "a claim the view hides redrew a map that cannot draw it"
+        );
+
+        // …and the moment the reader widens the view to include it, it is a new picture.
+        view.apply(Action::CycleTiers);
+        screen.show(&view, pane(), now + SETTLE).unwrap();
+        assert!(
+            screen.sink().len() > first,
+            "the map never caught up with the view widening"
+        );
+    }
+
+    #[test]
+    fn narrowing_the_view_by_kind_redraws_the_map_it_narrows() {
+        // The lens is more than its `/` pattern: what [`View::roll`] counts is the tier and
+        // kind axes as well, so a rectangle's area is theirs too. A fingerprint that watched
+        // only the pattern would leave `b` on a map of dependencies.
+        let mut tree = Tree::new("/scan");
+        tree.insert(priced("/scan/a/node_modules", 8 * 1024 * 1024));
+        tree.insert(priced("/scan/b/target", 2 * 1024 * 1024));
+        let mut view = View::new(tree);
+        view.allow_maps(true);
+        view.sync();
+        let mut screen = screen();
+        let now = Instant::now();
+        screen.show(&view, pane(), now).unwrap();
+        let before = screen.sink().len();
+
+        view.apply(Action::ToggleKind(crate::rules::Kind::Build));
+        screen.show(&view, pane(), now).unwrap();
+        assert!(
+            screen.sink().len() > before,
+            "the map went on drawing what the view stopped showing"
+        );
+    }
+
+    #[test]
+    fn a_claim_arriving_as_another_leaves_is_a_new_picture_even_though_the_totals_match() {
+        // The trap in deriving the fingerprint from what the map is made *of*: the obvious
+        // cheap summary — this subtree's bytes, claims and unpriced count — is three numbers
+        // that a deletion and an arrival in the same frame put back exactly where they were.
+        // A false "unchanged" here is a stale picture of a tree that has moved, which on this
+        // tool is a stale picture of what is about to be deleted.
+        let mut tree = Tree::new("/scan");
+        tree.insert(hit("/scan/going/node_modules", Size::Unmeasured, 0));
+        tree.insert(hit("/scan/staying/target", Size::Unmeasured, 0));
+        let mut view = View::new(tree);
+        view.allow_maps(true);
+        view.sync();
+        let mut screen = screen();
+        let now = Instant::now();
+        view.animate(now);
+        screen.show(&view, pane(), now).unwrap();
+        let before = screen.sink().len();
+        let totals = view.total();
+
+        view.removed(std::path::Path::new("/scan/going/node_modules"), 0, true);
+        // The drained row leaves the tree here, and the walk finds another in the same frame.
+        let later = now + crate::tui::moving::DIM;
+        view.animate(later);
+        view.found(hit("/scan/arrived/node_modules", Size::Unmeasured, 0));
+        view.sync();
+
+        assert_eq!(
+            view.total(),
+            totals,
+            "the fixture no longer makes the point — the totals have to be identical"
+        );
+        screen.show(&view, pane(), later + SETTLE).unwrap();
+        assert!(
+            screen.sink().len() > before,
+            "the map is still drawing a directory that has been deleted"
+        );
+    }
+
+    #[test]
+    fn cycling_the_sort_is_not_a_new_picture() {
+        // The one input left out of the fingerprint on purpose, so it is asserted rather than
+        // assumed: the map orders its own rectangles by weight with the id breaking ties, so
+        // what order the tree holds its children in is not something the picture can see.
+        let mut screen = screen();
+        let mut view = view();
+        let now = Instant::now();
+        screen.show(&view, pane(), now).unwrap();
+        let before = screen.sink().len();
+
+        view.apply(Action::CycleSort);
+        view.sync();
+        screen.show(&view, pane(), now + SETTLE).unwrap();
+        assert_eq!(
+            screen.sink().len(),
+            before,
+            "re-sorting the tree spent a megabyte on the same picture"
+        );
     }
 
     /// A terminal that takes every byte and then refuses to flush them.
@@ -539,7 +861,13 @@ mod tests {
             ));
         }
         let mut view = View::new(tree);
+        view.allow_maps(true);
+        view.sync();
         view.viewport(50);
+        // As a run that draws one has it, so the still frame below is measured against the
+        // lens-aware stamp rather than the fallback. See [`View::map_stamp`].
+        view.allow_maps(true);
+        view.sync();
         println!("claims: {}", view.total().claims);
 
         // 44 columns of a 120-column window, 34 rows, at a retina Ghostty's 9×19 px cell.

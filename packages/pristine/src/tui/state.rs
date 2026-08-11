@@ -605,9 +605,13 @@ fn tally(
     marks: &[Marked],
     spared: &HashSet<NodeId>,
     moving: &Moving,
-    counts: &mut Vec<Counts>,
-    selection: &mut Vec<NodeId>,
+    out: &mut Tallied,
 ) {
+    let Tallied {
+        counts,
+        selection,
+        map_stamps: stamps,
+    } = out;
     // Indexed by [`NodeId`] rather than hashed on it, and that is the difference between a
     // fifth of a frame and a whole one: this runs over 32,634 nodes and the ids are dense —
     // the tree only ever pushes a slot and never recycles a detached one. A `HashMap` here
@@ -652,6 +656,11 @@ fn tally(
             Step::Leave(id, depth) => {
                 let node = tree.node(id);
                 let mut here = Counts::default();
+                // The stamps of the children this node's rectangles are divided among, added
+                // rather than chained: [`Tree::sort_by`] moves children about and the map
+                // orders its own rectangles by weight, so a fold that could see sibling order
+                // would redraw a megabyte on `s` to show the same picture.
+                let mut beneath = 0u64;
                 if let Some(hit) = &node.hit {
                     let roll = Roll {
                         bytes: node.reclaimable,
@@ -690,9 +699,19 @@ fn tally(
                 } else {
                     for &child in &node.children {
                         here.absorb(counts[child]);
+                        // Only the children the map can see. A claim the lens hides is not a
+                        // rectangle, so a claim of that kind arriving must not read as the
+                        // picture having changed — which is the whole reason this is folded
+                        // here, on the lens-aware pass, rather than read off the tree.
+                        if !stamps.is_empty() && counts[child].visible.claims > 0 {
+                            beneath = beneath.wrapping_add(stamps[child]);
+                        }
                     }
                 }
                 counts[id] = here;
+                if !stamps.is_empty() {
+                    stamps[id] = stamp_of(id, here, beneath);
+                }
                 if flags[id] & MARKED != 0 {
                     covering.retain(|&(at, _)| at != depth);
                 }
@@ -702,6 +721,55 @@ fn tally(
             }
         }
     }
+}
+
+/// What one pass of [`tally`] writes: three answers to one traversal of the tree.
+///
+/// Carried together because they are read together and because two of them from different
+/// passes would describe two different trees — the same reason [`Counts`] is one struct rather
+/// than three parallel numbers.
+#[derive(Debug, Default)]
+struct Tallied {
+    /// What every node is worth under the current view, and what of that the marks select.
+    counts: Vec<Counts>,
+    /// Every claim the marks select, whichever view each was marked through.
+    selection: Vec<NodeId>,
+    /// See [`View::map_stamp`]. Left empty when nothing is drawing a map, which is how the
+    /// pass is told not to fold one.
+    map_stamps: Vec<u64>,
+}
+
+/// One node's contribution to [`View::map_stamp`]: everything [`super::treemap`] reads about
+/// it, and the stamps of the children it divides its rectangle among.
+///
+/// Exactly what the map reads and nothing else. [`Counts::visible`] is what `roll` answers, so
+/// it is every rectangle's area and every label; [`Counts::chosen`] is what `mark_of` compares,
+/// so it is the colour. [`Counts::all`] is deliberately absent — it is the batch, which the map
+/// never draws, and folding it in would redraw the picture when a claim the lens hides was
+/// selected under a mark.
+///
+/// The `id` goes in because a rollup can be identical across a change that swapped which
+/// directory it came from: a claim arriving as another is deleted puts bytes, claims and
+/// unpriced back exactly where they were, and the map is then of two different directories.
+fn stamp_of(id: NodeId, counts: Counts, beneath: u64) -> u64 {
+    // FNV-1a, which is two instructions a value against `DefaultHasher`'s SipHash — this runs
+    // once per node per frame over 32,634 of them, so the hash has to cost less than the
+    // redraw it exists to avoid. What it buys over a plain sum is diffusion: `beneath` adds
+    // its children commutatively, and a sum of poorly spread values collides easily.
+    const SEED: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut stamp = SEED;
+    for value in [
+        id as u64,
+        counts.visible.bytes,
+        counts.visible.claims as u64,
+        counts.visible.unpriced as u64,
+        counts.chosen.claims as u64,
+        beneath,
+    ] {
+        stamp = (stamp ^ value).wrapping_mul(PRIME);
+    }
+    stamp
 }
 
 /// What the event loop has to do about a keystroke, once the view has done its part.
@@ -814,6 +882,9 @@ pub struct View {
     /// The marked subtrees: a directory each, and the view each was marked through. See
     /// [`Marked`].
     marks: Vec<Marked>,
+    /// How many times the selection — the marks or the exclusions — has changed. See
+    /// [`View::mark_stamp`].
+    mark_stamp: u64,
     /// Directories the reader unmarked individually out of a marked subtree.
     ///
     /// The other half of the model, and the reason a push-down is not needed: "mark the lot,
@@ -828,6 +899,9 @@ pub struct View {
     /// Every claim the marks select, whether or not the current view shows it. The batch, and
     /// the set the counter describes — one list, so the two can never disagree.
     selection: Vec<NodeId>,
+    /// What the map under each node is drawn from, as one number. See [`View::map_stamp`];
+    /// empty when nothing is drawing a map.
+    map_stamps: Vec<u64>,
     rows: Vec<Row>,
     cursor: Option<usize>,
     /// Whether the cursor was deselected by something vanishing under it.
@@ -936,9 +1010,11 @@ impl View {
             tree,
             sort: Sort::default(),
             marks: Vec::new(),
+            mark_stamp: 0,
             spared: HashSet::new(),
             counts: Vec::new(),
             selection: Vec::new(),
+            map_stamps: Vec::new(),
             rows: Vec::new(),
             cursor: None,
             deselected: false,
@@ -1301,9 +1377,13 @@ impl View {
         // directory that is no longer on the disk, and a mark on one would put it in the next
         // batch.
         let (tree, moving) = (&self.tree, &self.moving);
+        let held = (self.marks.len(), self.spared.len());
         self.marks
             .retain(|mark| tree.is_attached(mark.root) && !moving.is_leaving(mark.root));
         self.spared.retain(|&id| tree.is_attached(id));
+        if (self.marks.len(), self.spared.len()) != held {
+            self.mark_stamp += 1;
+        }
         self.expanded.retain(|&id| self.tree.is_attached(id));
         self.kept.retain(|&id, _| self.tree.is_attached(id));
         // A claim the reader deleted while a pricing thread was inside it never gets its
@@ -1437,6 +1517,11 @@ impl View {
     /// Whether this terminal can draw a map at all. Told once, at start-up.
     pub fn allow_maps(&mut self, possible: bool) {
         self.map.possible = possible;
+        // Stale because the answer decides whether [`View::map_stamp`] has a table behind it,
+        // and this is told to the view *after* it opened: without it the first frames of a run
+        // would answer the map's "has anything changed" from the tree's lens-blind stamp, and
+        // then swap to the folded one mid-scan for a picture that had not moved.
+        self.stale = true;
     }
 
     /// Whether the map pane is on the screen.
@@ -1610,6 +1695,52 @@ impl View {
         } else {
             Mark::Partial
         }
+    }
+
+    /// What the map of `id` is drawn from, as one number.
+    ///
+    /// Everything [`super::treemap`] reads under `id` and nothing else, so it changes when the
+    /// picture would and does not when it would not. The distinction that matters is against
+    /// [`Tree::stamp`](crate::tree::Tree::stamp), which the tree keeps for free but which is
+    /// **lens-blind**: a run opens on `default`, which hides the gitignored tier, so a tier-two
+    /// claim arriving under the mapped directory moves the tree's stamp while changing no
+    /// rectangle at all. Answering that with a redraw is a megabyte down the pty to show the
+    /// picture that was already there.
+    ///
+    /// So it is folded on the one pass that is already lens-aware — [`tally`], which computes
+    /// what every row is worth *under the current view* — rather than maintained beside it. An
+    /// incremental version would have to be right about every arrival, every price and every
+    /// deletion, which is the same argument this file already makes about the counts
+    /// themselves.
+    ///
+    /// **Falls back to the tree's stamp when there is no map**, which over-reports rather than
+    /// under-reports: [`tally`] does not fold what nobody is going to ask for, and a view that
+    /// was never told a map is possible is a view with no pane to spend the redraw on.
+    #[must_use]
+    pub fn map_stamp(&self, id: NodeId) -> u64 {
+        self.map_stamps
+            .get(id)
+            .copied()
+            .unwrap_or_else(|| self.tree.stamp(id))
+    }
+
+    /// How many times the selection has changed since the view opened — the marks or the
+    /// exclusions, either way round.
+    ///
+    /// For a reader of the view that has to answer "is this the same picture as last frame"
+    /// without rebuilding the picture — [`super::treemap`], whose rectangles change colour on
+    /// a mark. Nothing else says so: a mark moves no bytes and no claims, so the tree's own
+    /// [`Tree::stamp`](crate::tree::Tree::stamp) is silent about it.
+    ///
+    /// A count and not a hash of what is marked, because the two states such a hash would
+    /// most easily call equal — unmarking one directory and marking its equally sized
+    /// neighbour — are the ones a reader is most likely to produce. It counts keystrokes
+    /// rather than differences, so it can say a selection changed when it did not: that costs
+    /// one redraw on a key the reader pressed, where the other way round is a picture that
+    /// disagrees with the tree beside it.
+    #[must_use]
+    pub fn mark_stamp(&self) -> u64 {
+        self.mark_stamp
     }
 
     /// What share of this row's subtree is marked, between 0.0 and 1.0.
@@ -1977,6 +2108,8 @@ impl View {
             return;
         }
         self.map.on = !self.map.on;
+        // As in [`View::allow_maps`]: the pane coming back has to find its stamps built.
+        self.stale = true;
     }
 
     /// `q`: leave — unless something irreversible is in flight, in which case wait for it.
@@ -2712,6 +2845,7 @@ impl View {
     /// the outer one does not. A mark inside it through a *different* lens survives, since it
     /// may well cover claims this one does not.
     fn mark(&mut self, id: NodeId) {
+        self.mark_stamp += 1;
         let lens = self.lens.clone();
         let inside: Vec<NodeId> = self
             .spared
@@ -2745,6 +2879,7 @@ impl View {
     /// that instant, so a claim arriving next to a spared row a minute later was silently
     /// unmarked too.
     fn unmark(&mut self, id: NodeId) {
+        self.mark_stamp += 1;
         self.marks.retain(|mark| mark.root != id);
         // **Re-derived before the next question rather than after this one.** The counts on
         // hand describe the state before the line above, so asking them whether anything is
@@ -2778,10 +2913,14 @@ impl View {
     }
 
     fn clear_marks(&mut self) {
+        if !self.marks.is_empty() || !self.spared.is_empty() {
+            self.mark_stamp += 1;
+        }
         self.marks.clear();
         self.spared.clear();
         self.counts.clear();
         self.selection.clear();
+        self.map_stamps.clear();
         self.stale = true;
     }
 
@@ -2798,22 +2937,33 @@ impl View {
     fn recount(&mut self) {
         self.counts.clear();
         self.selection.clear();
+        self.map_stamps.clear();
         if !self.is_sifted() && self.marks.is_empty() {
             return;
         }
-        let mut counts = std::mem::take(&mut self.counts);
-        let mut selection = std::mem::take(&mut self.selection);
+        let mut out = Tallied {
+            counts: std::mem::take(&mut self.counts),
+            selection: std::mem::take(&mut self.selection),
+            map_stamps: std::mem::take(&mut self.map_stamps),
+        };
+        // The stamps are sized only when there is a map to draw, because the map is the only
+        // thing that asks and most terminals never have one. Left empty is how [`tally`] is
+        // told not to fold them — see [`View::map_stamp`] for what a run without one falls
+        // back to.
+        if self.maps() {
+            out.map_stamps.resize(self.tree.minted(), 0);
+        }
         tally(
             &self.tree,
             &self.lens,
             &self.marks,
             &self.spared,
             &self.moving,
-            &mut counts,
-            &mut selection,
+            &mut out,
         );
-        self.counts = counts;
-        self.selection = selection;
+        self.counts = out.counts;
+        self.selection = out.selection;
+        self.map_stamps = out.map_stamps;
     }
 
     /// Whether the lens is hiding anything at all.
@@ -3853,7 +4003,9 @@ mod tests {
             &[],
         );
 
-        let pending = view.pending().expect("no confirmation over a standing report");
+        let pending = view
+            .pending()
+            .expect("no confirmation over a standing report");
         assert_eq!(pending.entries().len(), 5);
         assert_eq!(pending.hidden(), 4);
         // Both on the screen at once, saying different things about different moments.
@@ -5310,8 +5462,9 @@ mod scale {
     //! | the same, on the narrowed view a run opens on | **1.7 ms** |
     //! | the same, everything marked | **1.9 ms** |
     //! | the same, one row spared out of it | **2.4 ms** |
+    //! | the same, with a treemap on the screen | **+67 µs** |
     //!
-    //! Five things worth reading off that. The interpolation itself is the first row — one
+    //! Six things worth reading off that. The interpolation itself is the first row — one
     //! microsecond, because it is one entry per row the *pane* drew and the pane is fifty rows
     //! whatever the tree holds. The second is #602's own number: the sort and the re-flatten of
     //! everything, which neither the animation nor the marks touched.
@@ -5338,6 +5491,14 @@ mod scale {
     //! replaced the push-down with a single exclusion, so it is now **1 mark and 1 exclusion** —
     //! which was a correctness change first (a push-down silently spares whatever streams in
     //! beside the spared row) and a performance one by accident.
+    //!
+    //! The last row is what #631 added, and it is the cheapest thing in the table for what it
+    //! buys. [`View::map_stamp`] folds one FNV per node onto this same walk, which lets the
+    //! treemap answer "has anything I draw changed" without laying the map out — 467 µs a
+    //! frame, forever, replaced by 50 ns. It is folded here rather than kept beside the tree
+    //! because the tree's own stamp is **lens-blind**, and a run opens on a view that hides a
+    //! whole tier: those arrivals must not buy a megabyte of redraw. It is skipped entirely
+    //! when there is no pane, which on most terminals is always.
     //!
     //! And a frame only pays any of this when something moved. `sync` runs the pass behind the
     //! same `stale` flag as the sort, so a reader sitting looking at a still tree pays the first
@@ -5487,6 +5648,19 @@ mod scale {
             view.animate(epoch + super::super::moving::COUNT_UP * tick);
         }
         println!("frame, marked and narrowed: {:?}", started.elapsed() / 100);
+
+        // And the same again with a treemap on the screen, which is what [`View::map_stamp`]
+        // adds: one FNV fold per node, on the pass that is already walking every one of them.
+        // It buys the map the right to ask "has anything I draw changed" for nothing, on a
+        // frame where the answer is usually no — see [`super::super::treemap`]. Off by default
+        // and computed only when there is a pane, because most terminals never draw one.
+        view.allow_maps(true);
+        let started = Instant::now();
+        for tick in 601..=700u32 {
+            view.found(priced(&format!("/home/repos/map{tick}/node_modules"), 1));
+            view.animate(epoch + super::super::moving::COUNT_UP * tick);
+        }
+        println!("…the same, with a map up:   {:?}", started.elapsed() / 100);
     }
 
     /// Presses `f` until the view is the one named.
