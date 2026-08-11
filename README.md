@@ -40,9 +40,9 @@ every ancestor** — pruned to the paths that lead somewhere reclaimable, collap
 drilled into on demand.
 
 ```
- /Users/agentender/repos  165.9 GiB reclaimable in 10599 directories
+ /Users/agentender/repos  151.9 GiB reclaimable in 10524 directories · 75 out of view (default)
 directory                                            size ↓        age  what it is
-[▁] ▾ /Users/agentender/repos                     165.9 GiB         0h
+[▁] ▾ /Users/agentender/repos                     151.9 GiB         0h
 [▇]   ▾ definitely-typed                           22.2 GiB        3mo
 [x]     ▸ types                                    21.8 GiB        3mo
 [x]       node_modules                            320.3 MiB        3mo  Node Dependencies
@@ -51,7 +51,7 @@ directory                                            size ↓        age  what i
 [ ]   ▸ brain                                      14.3 GiB         0h
 [ ]   ▸ nx                                       > 14.0 GiB         4h
 [ ]   ▸ oss-secrets-requestor                      10.8 GiB        10d
- marked 21.9 GiB in 9092 directories · space mark · x delete · / filter · s sort (size) · ? help
+ marked 21.9 GiB in 9092 directories · space mark · x delete · f view (default) · / filter · s sort (size) · ? help
 ```
 
 A row's number is not "how big is this directory" — that is `du`'s question — but **"how much do I
@@ -75,17 +75,37 @@ one.
   and true the whole time it is up. Marking a directory marks whatever arrives under it
   afterwards, because a mark is a statement about a subtree rather than about the rows that
   happened to exist when you pressed the key.
-- `x` deletes what is marked, after a confirmation that opens on **cancel**. A row does not blink
-  out: it **empties** as the bytes actually leave the disk — the deleter reports its progress and
-  the row's number is what is left of it — then dims once it reaches zero, then collapses away.
-  The freed total in the footer climbs on the same reports the reclaimable total falls on, so the
-  two are one number read from each end. The cursor follows the *directory* it was on rather than
-  the row number, and a target that could not be finished keeps its row, worth what survived and
-  labelled with why it was left alone — calmly rather than as an error, because the safety model
-  refusing a nested checkout is the tool working.
+- `f` walks four views: **default** (what a rule could put a name to), **dependencies**,
+  **all-ignored** (dependencies *plus* the gitignore fallback) and **all**. Underneath they are two
+  independent axes — which *tier*, and which *kind* — and each step of the cycle moves exactly one
+  of them, carrying the other forward. Each axis also has a key of its own: `t` moves the tier
+  axis, and `d`, `b` and `c` toggle dependencies, build output and caches. So a combination nobody
+  anticipated is still one a reader can ask for: "every cache a rule named" is `d` then `b` from
+  the default view, and no preset has to exist for it.
+
+  `default` narrows — it leaves out the gitignored tier — so the header says how many claims that
+  is, beside the number it qualifies. A filter that is on without saying what it dropped is the
+  same failure as one that silently keeps something back.
+- **Changing the view never changes what is selected**, by any of those keys. Hiding a row is not
+  unselecting it, and a mark keeps meaning the view it was made through: mark a directory under
+  `dependencies`, widen to `all`, and the build artefacts beside them are still unmarked.
+  The box on a partly-marked ancestor is filled against *the view you are looking through*, so what
+  it says is a statement about this screen rather than a global fact contradicting the rows
+  underneath it.
+- `x` deletes what is marked, after a confirmation that **lists the whole batch** — grouped by what
+  each thing is, marked plainly where the current view is hiding one, with the safety model's
+  refusals said here rather than in the report afterwards, and `space` on any line to take it out.
+  Deleting acts on everything selected and never only the visible part, which is why the box shows
+  you the rest. It opens on **cancel**. A row does not blink out: it **empties** as the bytes
+  actually leave the disk — the deleter reports its progress and the row's number is what is left
+  of it — then dims once it reaches zero, then collapses away. The freed total in the footer climbs
+  on the same reports the reclaimable total falls on, so the two are one number read from each end.
+  The cursor follows the *directory* it was on rather than the row number, and a target that could
+  not be finished keeps its row, worth what survived and labelled with why it was left alone —
+  calmly rather than as an error, because the safety model refusing a nested checkout is the tool
+  working.
 - Sorting is per level, because children have to stay under their parent. `/` filters on a regex
-  over the whole path, and a filtered row's number counts only what the filter shows, so a mark
-  can never delete what you cannot see.
+  over the whole path, and a filtered row's number counts only what the filter shows.
 - `?` lists every key and every mouse gesture, generated from the tables that dispatch them
   rather than maintained beside them.
 - **The mouse works**, and it is a pointer rather than a link: click a row's box to mark it, its

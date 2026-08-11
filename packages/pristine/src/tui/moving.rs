@@ -377,6 +377,16 @@ impl Moving {
         self.spent.contains_key(&id)
     }
 
+    /// Whether the deleter has touched this row at all — either phase.
+    ///
+    /// The one predicate the batch, the marks and `space` all read, so "a directory the
+    /// deleter is part way through is not a directory to delete again" is stated once rather
+    /// than in the three places that could drift.
+    #[must_use]
+    pub fn is_leaving(&self, id: NodeId) -> bool {
+        self.is_freeing(id) || self.is_spent(id)
+    }
+
     /// Every row the running removal is still on screen for, with the bytes it has given
     /// back so far.
     ///
@@ -385,6 +395,12 @@ impl Moving {
     /// gone and the rows above them have to say so.
     pub fn leaving(&self) -> impl Iterator<Item = (NodeId, u64)> + '_ {
         self.freeing.iter().map(|(&id, &bytes)| (id, bytes))
+    }
+
+    /// What the deleter has given back from this row so far.
+    #[must_use]
+    pub fn freed_from(&self, id: NodeId) -> u64 {
+        self.freeing.get(&id).copied().unwrap_or(0)
     }
 
     /// What the running batch has given back in total, rows still on screen and rows already

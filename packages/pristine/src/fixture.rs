@@ -10,9 +10,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use crate::rules::Ruleset;
+use crate::rules::{Anchor, Kind, MarkersRequired, Rule, Ruleset};
 use crate::size::Size;
-use crate::walk::{Claim, Hit, RuleClaim};
+use crate::walk::{Claim, Hit, IgnoredClaim, RuleClaim};
 
 /// A tier-one claim at `path`, with a size and an mtime `seconds` after an arbitrary epoch.
 ///
@@ -38,4 +38,35 @@ pub(crate) fn hit(path: &str, size: Size, seconds: u64) -> Hit {
 /// A claim with a number on it.
 pub(crate) fn priced(path: &str, bytes: u64) -> Hit {
     hit(path, Size::Measured(bytes), 0)
+}
+
+/// A tier-one claim of a named `kind`, for the tests about what a view shows.
+///
+/// The rule is made up rather than looked up, so a test that says "a cache" is not also
+/// asserting that the shipped ruleset still happens to contain one.
+pub(crate) fn of_kind(path: &str, kind: Kind) -> Hit {
+    let mut made = hit(path, Size::Measured(1), 0);
+    made.claim = Claim::Rule(RuleClaim {
+        project_root: PathBuf::from("/scan"),
+        rule: Arc::new(Rule {
+            id: format!("test-{kind}"),
+            ecosystem: "Test".to_owned(),
+            kind,
+            markers: vec!["marker".to_owned()],
+            markers_required: MarkersRequired::Any,
+            targets: vec!["target".to_owned()],
+            anchor: Anchor::Parent,
+            note: None,
+        }),
+    });
+    made
+}
+
+/// A tier-two claim: one only the gitignore fallback found, so nothing knows what it is.
+pub(crate) fn gitignored(path: &str) -> Hit {
+    let mut made = hit(path, Size::Measured(1), 0);
+    made.claim = Claim::Ignored(IgnoredClaim {
+        work_tree: PathBuf::from("/scan"),
+    });
+    made
 }

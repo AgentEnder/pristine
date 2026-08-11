@@ -217,7 +217,9 @@ impl<W: Write> Screen<W> {
             // the same one.
             view.row().map(|row| row.id),
             view.mark_stamp(),
-            view.filter(),
+            // The whole lens and not just its `/` pattern: the tier and kind axes decide what
+            // [`View::roll`] counts, so a rectangle's area is as much theirs as the pattern's.
+            view.lens(),
             pane.cells,
             pane.cell,
         ));
@@ -440,6 +442,7 @@ mod tests {
             std::path::Path::new("/scan/pua/target"),
             Size::Measured(4096),
         );
+        view.sync();
         screen
             .show(&view, pane(), now + Duration::from_millis(30))
             .unwrap();
@@ -564,6 +567,28 @@ mod tests {
         assert!(
             screen.sink().len() > before,
             "the map went on showing what the filter took away"
+        );
+    }
+
+    #[test]
+    fn narrowing_the_view_by_kind_redraws_the_map_it_narrows() {
+        // The lens is more than its `/` pattern: what [`View::roll`] counts is the tier and
+        // kind axes as well, so a rectangle's area is theirs too. A fingerprint that watched
+        // only the pattern would leave `b` on a map of dependencies.
+        let mut tree = Tree::new("/scan");
+        tree.insert(priced("/scan/a/node_modules", 8 * 1024 * 1024));
+        tree.insert(priced("/scan/b/target", 2 * 1024 * 1024));
+        let mut view = View::new(tree);
+        let mut screen = screen();
+        let now = Instant::now();
+        screen.show(&view, pane(), now).unwrap();
+        let before = screen.sink().len();
+
+        view.apply(Action::ToggleKind(crate::rules::Kind::Build));
+        screen.show(&view, pane(), now).unwrap();
+        assert!(
+            screen.sink().len() > before,
+            "the map went on drawing what the view stopped showing"
         );
     }
 

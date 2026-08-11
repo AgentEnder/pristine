@@ -36,6 +36,8 @@
 //!
 //! [`TestBackend`]: ratatui::backend::TestBackend
 
+use std::path::Path;
+
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -43,7 +45,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row as TableRow, Table, Wrap};
 
 use super::keymap::help;
-use super::state::{Answer, Mark, Roll, View, plural};
+use super::state::{Answer, Mark, Pending, Roll, View, plural};
 use super::treemap;
 use super::treemap::tiles;
 use crate::size::human;
@@ -71,6 +73,19 @@ const SHIMMER: usize = 5;
 /// Never empty and never full: an empty box is [`Mark::None`] and a full one is [`Mark::All`],
 /// so a partial row is always somewhere strictly in between and the glyph says where.
 const BLOCKS: [&str; 7] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇"];
+
+/// How wide the confirmation is. Wider than the question it used to hold, because it now
+/// holds the batch: a path cut in half is a directory a reader cannot recognise, and
+/// recognising them is the whole job of the screen.
+const LISTING: u16 = 92;
+/// The cursor marker on a line of that listing.
+const MARK: usize = 2;
+/// Cells for the kind, which is named on the first line of each group.
+const KIND: usize = 18;
+/// Cells for the word that says the current view is hiding this entry.
+const FLAG: usize = 8;
+/// Cells for the size, or for the start of a refusal.
+const TAIL: usize = 11;
 
 /// The cells `[x]` occupies — the mark box, and the whole of what a press can aim at.
 const BOX: usize = 3;
@@ -212,19 +227,26 @@ fn prompting(frame: &mut Frame, view: &View, footer: Rect) -> Rect {
     footer
 }
 
-/// The question, and where its two answers went.
-fn confirming(frame: &mut Frame, view: &View) -> (Rect, [Rect; 2]) {
+/// The question, the batch behind it, and where its two answers went.
+///
+/// # It lists what it is holding
+///
+/// The listing is the safety half of a selection that is independent of what is on screen. A
+/// reader marks broadly under one view, narrows, forgets, and would otherwise be confirming a
+/// deletion whose contents they cannot see — so the box shows every directory, grouped by what
+/// kind of artefact it is, says plainly which of them the current view is hiding, and lets any
+/// of them be taken out from here. It is drawn whether or not anything is hidden: a
+/// confirmation that can state its batch and instead states a number is a confirmation that
+/// has to be trusted rather than read.
+fn confirming(frame: &mut Frame, view: &mut View) -> (Rect, [Rect; 2]) {
     let Some(pending) = view.pending() else {
         return (Rect::default(), [Rect::default(); 2]);
     };
-    let mut lines = vec![
-        Line::from(format!(
-            "Delete {}, giving back {}?",
-            plural(pending.targets.len(), "directory", "directories"),
-            human(pending.bytes)
-        )),
-        Line::raw(""),
-    ];
+    let mut lines = vec![Line::from(format!(
+        "Delete {}, giving back {}?",
+        plural(pending.targets.len(), "directory", "directories"),
+        human(pending.bytes)
+    ))];
     if pending.unpriced > 0 {
         lines.push(Line::styled(
             format!(
@@ -234,26 +256,42 @@ fn confirming(frame: &mut Frame, view: &View) -> (Rect, [Rect; 2]) {
             Style::default().fg(Color::DarkGray),
         ));
     }
-    for kept in pending.kept.iter().take(4) {
+    let hidden = pending.hidden();
+    if hidden > 0 {
+        // The warning the whole screen exists for, and the reason it names the view: a reader
+        // who cannot see a row has no way to tell "hidden" from "never found" unless something
+        // says which.
         lines.push(Line::styled(
-            format!("left alone — {kept}"),
-            Style::default().fg(Color::Yellow),
+            format!(
+                "{} out of sight under {} — deleting takes {} anyway.",
+                plural(hidden, "directory is", "directories are"),
+                pending.view,
+                if hidden == 1 { "it" } else { "them" }
+            ),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
     }
-    if pending.kept.len() > 4 {
+    if pending.kept() > 0 {
         lines.push(Line::styled(
-            format!("…and {} more left alone", pending.kept.len() - 4),
-            Style::default().fg(Color::Yellow),
+            format!(
+                "{} will be left alone by the safety model, marked below.",
+                pending.kept()
+            ),
+            Style::default().fg(Color::Cyan),
         ));
     }
-    lines.push(Line::raw(""));
-    // The answers get a line of the box rather than a line of the paragraph, and that is a
-    // correctness change rather than a tidying one: the lines above them **wrap**, so one
-    // long refusal would push a button a row down from where a press was told it is.
+
+    // The box is as tall as it needs to be and no taller than the frame, with the listing
+    // taking whatever the fixed lines leave: a batch of four should not be drawn in a box
+    // sized for eight thousand.
+    let said = u16::try_from(lines.len()).unwrap_or(4);
+    let wanted = u16::try_from(pending.entries().len()).unwrap_or(u16::MAX);
     let area = centred(
         frame.area(),
-        66,
-        u16::try_from(lines.len()).unwrap_or(8) + 3,
+        LISTING,
+        said.saturating_add(wanted).saturating_add(5),
     );
     let block = Block::default()
         .borders(Borders::ALL)
@@ -262,9 +300,117 @@ fn confirming(frame: &mut Frame, view: &View) -> (Rect, [Rect; 2]) {
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
-    let [said, asked] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), said);
+    // The answers get a line of the box rather than a line of the paragraph, and that is a
+    // correctness change rather than a tidying one: the lines above them **wrap**, so one
+    // long warning would push a button a row down from where a press was told it is.
+    let [top, batch, hint, asked] = Layout::vertical([
+        Constraint::Length(said.min(inner.height)),
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), top);
+    view.listing(batch.height as usize);
+    let Some(pending) = view.pending() else {
+        return (area, [Rect::default(); 2]);
+    };
+    frame.render_widget(Paragraph::new(entries(pending, batch.width)), batch);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "↑↓ move · space take one out · ←→ choose · Enter answer",
+            Style::default().fg(Color::DarkGray),
+        )),
+        hint,
+    );
     (area, buttons(frame, asked, pending.answer))
+}
+
+/// The batch, one line per directory, from the scroll offset down.
+///
+/// Grouped by kind by being **sorted** by kind and naming the kind on the first line of each
+/// run, which is the one arrangement where a group heading cannot disagree with the cursor:
+/// one entry is one line, so the index the keys move is the line a reader is looking at.
+fn entries(pending: &Pending, width: u16) -> Vec<Line<'static>> {
+    let tail = usize::from(width).saturating_sub(MARK + KIND + FLAG + TAIL);
+    let mut drawn = Vec::new();
+    let mut group = None;
+    for (at, entry) in pending.entries().iter().enumerate() {
+        let heads = group != Some(entry.kind);
+        group = Some(entry.kind);
+        if at < pending.scroll() {
+            continue;
+        }
+        // Bounded by the box rather than by the batch, which is the difference between
+        // drawing a screen and building one: a home directory's worth of marks is 8,660
+        // entries, and every line not drawn is a `Vec` of styled spans not allocated.
+        if drawn.len() >= pending.page() {
+            break;
+        }
+        let here = at == pending.at();
+        let kind = if heads {
+            entry.kind.map_or_else(
+                || crate::walk::UNLABELLED.to_owned(),
+                |kind| kind.to_string(),
+            )
+        } else {
+            String::new()
+        };
+        let mut line = vec![
+            Span::styled(
+                if here { "› " } else { "  " },
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(
+                format!("{:<tail$}", shorten(&entry.path, tail)),
+                if here {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                },
+            ),
+        ];
+        match &entry.kept {
+            // A refusal takes the whole of the right-hand side rather than the size column,
+            // for the reason it wins the last column on a row of the tree: it is the newer and
+            // the stranger fact, and a reason cut off half way through is a reason a reader
+            // cannot act on.
+            Some(reason) => line.push(Span::styled(
+                format!("kept — {reason}"),
+                Style::default().fg(Color::Cyan),
+            )),
+            None => line.extend([
+                Span::styled(
+                    format!("{kind:<KIND$}"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!("{:<FLAG$}", if entry.hidden { "hidden" } else { "" }),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{:>TAIL$}", entry.size.label()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+        }
+        drawn.push(Line::from(line));
+    }
+    drawn
+}
+
+/// A path cut to `width` from the **left**, because the end of a path is the part that says
+/// which directory this is.
+fn shorten(path: &Path, width: usize) -> String {
+    let said = path.display().to_string();
+    let held = said.chars().count();
+    if held <= width || width <= 1 {
+        return said;
+    }
+    let cut = held + 1 - width;
+    format!("…{}", said.chars().skip(cut).collect::<String>())
 }
 
 /// The generated key reference, and how far down it the reader is.
@@ -351,6 +497,17 @@ fn headline(view: &View, errors: &[WalkError]) -> Paragraph<'static> {
         spans.push(Span::styled(
             "· scanning ",
             Style::default().fg(Color::Cyan),
+        ));
+    }
+    // What the view is leaving out, beside the number it qualifies. A run opens on `default`,
+    // which hides the gitignored tier, so the headline is a narrowed answer to "how much do I
+    // get back" from the first frame — and a narrowed number that does not say so is the
+    // failure `--older-than` being off by default already avoids, wearing a different hat.
+    let out_of_view = view.out_of_view();
+    if out_of_view > 0 {
+        spans.push(Span::styled(
+            format!("· {out_of_view} out of view ({}) ", view.view_label()),
+            Style::default().fg(Color::Yellow),
         ));
     }
     if let Some(pattern) = view.filter() {
@@ -779,6 +936,19 @@ fn status(view: &View) -> Paragraph<'static> {
                 .add_modifier(Modifier::BOLD)
         },
     )];
+    // The hazard orthogonal selection creates, on the line a reader is already reading. The
+    // counter above states the whole selection because that is what `x` acts on, and a reader
+    // who cannot see part of it has to be told so *here* rather than only in the box that
+    // comes after they have decided.
+    let hidden = view.hidden();
+    if hidden > 0 {
+        spans.push(Span::styled(
+            format!("· {hidden} out of sight "),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     spans.extend(freed);
     if view.is_deleting() {
         spans.push(Span::styled(
@@ -788,7 +958,11 @@ fn status(view: &View) -> Paragraph<'static> {
     }
     spans.push(Span::styled(
         format!(
-            "· space mark · x delete · / filter · s sort ({}{}) · ? help",
+            "· space mark · x delete · f view ({}) · / filter · s sort ({}{}) · ? help",
+            // Named rather than left implicit, and named as the *reader* left it: a view the
+            // axis keys built has no preset name, and rounding it to the nearest one would say
+            // they are somewhere they are not.
+            view.view_label(),
             view.sort().by.label(),
             if view.sort().reverse { " ↑" } else { "" }
         ),
@@ -1082,11 +1256,12 @@ mod tests {
     use super::{INDENT, MARKER, Placed, Spot, Zone, draw, hit as press_on};
     use crate::delete::{Refusal, Refused};
     use crate::fixture::{hit, priced};
+    use crate::rules::Kind;
     use crate::size::Size;
     use crate::tree::{Order, Tree};
-    use crate::tui::keymap::{Action, Gesture, Motion, pointer};
+    use crate::tui::keymap::{Action, Gesture, Motion, Turn, pointer};
     use crate::tui::moving::COUNT_UP;
-    use crate::tui::state::{Answer, Notice, Pending, View};
+    use crate::tui::state::{Answer, Notice, Planned, View};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Position;
@@ -1296,24 +1471,98 @@ mod tests {
     #[test]
     fn the_confirmation_says_what_it_will_delete_and_what_it_will_not() {
         let mut view = view();
-        view.ask(Pending {
-            targets: vec!["/scan/nx/node_modules".into()],
-            bytes: 2 * 1024 * 1024,
-            unpriced: 1,
-            kept: vec!["/scan/old/target: it holds a git checkout".to_owned()],
-            answer: Answer::Delete,
-        });
+        view.asking(
+            &[
+                Planned::at("/scan/nx/node_modules", Size::Measured(2 * 1024 * 1024)),
+                Planned::at("/scan/old/target", Size::Unmeasured),
+            ],
+            &[Refused {
+                path: "/scan/gone".into(),
+                reason: Refusal::HoldsCheckout,
+            }],
+        );
         let frame = painted(&mut view, 100, 20);
         let box_text = frame.join("\n");
 
         assert!(
-            box_text.contains("Delete 1 directory, giving back 2.0 MiB?"),
+            box_text.contains("Delete 2 directories, giving back 2.0 MiB?"),
             "{box_text}"
         );
         assert!(box_text.contains("carry no price"), "{box_text}");
-        assert!(box_text.contains("holds a git checkout"), "{box_text}");
         assert!(box_text.contains("cancel"), "{box_text}");
         assert!(box_text.contains("delete"), "{box_text}");
+    }
+
+    #[test]
+    fn the_confirmation_lists_the_batch_it_is_holding_grouped_by_what_each_thing_is() {
+        // The safety half of a selection that does not follow the view: a reader who marked
+        // broadly and then narrowed has to be able to *see* what they are confirming, one line
+        // per directory, before the one irreversible thing this tool does.
+        let mut view = view();
+        view.asking(
+            &[
+                Planned::at("/scan/nx/node_modules", Size::Measured(2 * 1024 * 1024)),
+                Planned::at("/scan/old/target", Size::Unmeasured),
+            ],
+            &[Refused {
+                path: "/scan/gone".into(),
+                reason: Refusal::HoldsCheckout,
+            }],
+        );
+        let frame = painted(&mut view, 100, 24);
+        let box_text = frame.join("\n");
+
+        // Every directory is on the screen, with what it is worth beside it…
+        assert!(box_text.contains("/scan/nx/node_modules"), "{box_text}");
+        assert!(box_text.contains("/scan/old/target"), "{box_text}");
+        // …and the refusal is said HERE, before the reader commits, rather than in the report
+        // afterwards — with the whole reason on the line rather than the start of it.
+        assert!(
+            box_text.contains("kept — holds a git checkout"),
+            "{box_text}"
+        );
+        assert!(
+            box_text.contains("will be left alone by the safety model"),
+            "{box_text}"
+        );
+
+        // Grouped by kind, and the group is named on the first line of its run: the shipped
+        // ruleset's first rule is a Dependencies one, which is what the fixture's claims carry.
+        let listed: Vec<&String> = frame
+            .iter()
+            .filter(|line| line.contains("/scan/") && line.contains('│'))
+            .collect();
+        assert_eq!(listed.len(), 3, "{box_text}");
+        assert!(listed[0].contains("Dependencies"), "{box_text}");
+        assert!(!listed[1].contains("Dependencies"), "{box_text}");
+        // The cursor starts on the first line, which is what `space` acts on.
+        assert!(listed[0].contains('›'), "{box_text}");
+    }
+
+    #[test]
+    fn a_marked_directory_the_view_is_hiding_says_so_on_its_own_line() {
+        // The hazard orthogonal selection creates, and the mitigation for it. The count is in
+        // the warning at the top and the *which* is on the line, because a number a reader
+        // cannot resolve to a directory is a number they can only accept.
+        let mut view = view();
+        // One axis key, on its own: the fixture's claims are Dependencies, so turning that
+        // member off is the smallest view that hides them — and it is not a preset, which is
+        // the point of the key existing.
+        view.apply(Action::ToggleKind(Kind::Dependencies));
+        view.asking(
+            &[Planned::at(
+                "/scan/nx/node_modules",
+                Size::Measured(2 * 1024 * 1024),
+            )],
+            &[],
+        );
+        let box_text = painted(&mut view, 100, 24).join("\n");
+
+        assert!(box_text.contains("out of sight under"), "{box_text}");
+        assert!(box_text.contains("deleting takes it anyway"), "{box_text}");
+        let frame = painted(&mut view, 100, 24);
+        let listed = row_with(&frame, "/scan/nx/node_modules");
+        assert!(listed.contains("hidden"), "{listed}");
     }
 
     #[test]
@@ -1340,8 +1589,10 @@ mod tests {
         let mut view = view();
         view.apply(Action::Help);
         // Tall enough for the whole page: the pointer's rows are the last section, so a
-        // frame the size the other help test uses would put them below the fold.
-        let frame = painted(&mut view, 100, 80).join("\n");
+        // frame the size the other help test uses would put them below the fold. The
+        // confirmation's own keys are a section above them, so the page is taller than the
+        // 80 this needed before that screen existed.
+        let frame = painted(&mut view, 100, 110).join("\n");
 
         // Generated from [`POINTER`] rather than written here, which is the guarantee the
         // table exists for: a gesture that acts is a gesture the page lists.
@@ -1515,13 +1766,13 @@ mod tests {
     #[test]
     fn an_overlay_takes_every_press_over_the_screen_it_covers() {
         let mut view = view();
-        view.ask(Pending {
-            targets: vec!["/scan/nx/node_modules".into()],
-            bytes: 2 * 1024 * 1024,
-            unpriced: 0,
-            kept: Vec::new(),
-            answer: Answer::Cancel,
-        });
+        view.asking(
+            &[Planned::at(
+                "/scan/nx/node_modules",
+                Size::Measured(2 * 1024 * 1024),
+            )],
+            &[],
+        );
         let (frame, placed) = frame_of(&mut view, 100, 20);
         let [cancel, delete] = placed.answers.unwrap();
 
@@ -1653,18 +1904,16 @@ mod tests {
     #[test]
     fn the_footer_says_where_the_deleter_is_and_not_only_what_it_has_given_back() {
         let mut view = view();
-        view.ask(Pending {
-            targets: vec![
-                "/scan/nx/node_modules".into(),
-                "/scan/old/target".into(),
-                "/scan/gone".into(),
-                "/scan/also-gone".into(),
+        view.asking(
+            &[
+                Planned::at("/scan/nx/node_modules", Size::Measured(2 * 1024 * 1024)),
+                Planned::at("/scan/old/target", Size::Measured(0)),
+                Planned::at("/scan/gone", Size::Measured(0)),
+                Planned::at("/scan/also-gone", Size::Measured(0)),
             ],
-            bytes: 2 * 1024 * 1024,
-            unpriced: 0,
-            kept: Vec::new(),
-            answer: Answer::Delete,
-        });
+            &[],
+        );
+        view.apply(Action::Highlight(Turn::Next));
         view.apply(Action::Answer);
         view.removed(Path::new("/scan/nx/node_modules"), 1024 * 1024, true);
         view.swept();

@@ -56,6 +56,26 @@ pub enum Kind {
     Cache,
 }
 
+impl Kind {
+    /// The whole vocabulary, in the order a reader meets it: what was fetched, what was
+    /// compiled, what will come back on its own.
+    ///
+    /// Being able to enumerate it is half of what "closed" buys — the front end derives a key
+    /// and a help sentence per kind from this rather than listing them again, so a fourth kind
+    /// would arrive already filterable.
+    pub const ALL: [Self; 3] = [Self::Dependencies, Self::Build, Self::Cache];
+
+    /// One word, for somewhere with no room for the whole label.
+    #[must_use]
+    pub fn short(self) -> &'static str {
+        match self {
+            Self::Dependencies => "dependencies",
+            Self::Build => "build",
+            Self::Cache => "cache",
+        }
+    }
+}
+
 impl fmt::Display for Kind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
