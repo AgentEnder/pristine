@@ -1,8 +1,8 @@
-//! Drawing one frame.
+//! Drawing one frame, and reading back where it put things.
 //!
-//! Everything here reads the [`View`] and writes cells. The one thing it writes *back* is a
-//! measurement — how many rows the tree pane got, and how far the help page can scroll —
-//! because those are facts about the frame that nothing else knows.
+//! Everything here reads the [`View`] and writes cells. The two things it writes *back* are
+//! measurements — how many rows the tree pane got, and how far the help page can scroll —
+//! and a [`Placed`], which is where the frame put everything a pointer can aim at.
 //!
 //! # What a row has to say
 //!
@@ -13,17 +13,26 @@
 //! The size column has a fifth state the other tools never needed: **unpriced**. A claim is
 //! recorded without being measured unless somebody asks, so `0 B` and "nobody has looked" are
 //! different facts about a row, and a dash is what keeps them apart.
+//!
+//! # The layout is stated once and read twice
+//!
+//! [`hit`] resolves a cell to a [`Spot`], and it does that against the rectangles [`draw`]
+//! actually produced rather than against a second description of them. Being one cell out
+//! here is not a cosmetic bug: it is a press that opens, marks or prices a row nobody aimed
+//! at. So the tree's columns come out of one [`columns`] call that both lays the table out
+//! and answers the hit test, and a row's own cells — the mark box, the indent, the expander —
+//! are spelled by the constants [`label`] draws them with.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row as TableRow, Table, Wrap};
 
 use super::keymap::help;
-use super::state::{Mark, Roll, View, plural};
+use super::state::{Answer, Mark, Roll, View, plural};
 use crate::size::human;
-use crate::tree::NodeId;
+use crate::tree::{NodeId, Order, Sort};
 use crate::walk::WalkError;
 
 /// Bytes the size column is given. Enough for `1023.9 GiB`.
@@ -35,9 +44,18 @@ const REGENERATE: u16 = 24;
 /// Below this the regeneration column is dropped: a path a reader cannot read is worse than a
 /// command they have to press `Enter` on the row to see.
 const NARROW: u16 = 90;
+/// The blank cells between two columns.
+const SPACING: u16 = 2;
 
-/// Draws the whole frame.
-pub fn draw(frame: &mut Frame, view: &mut View, errors: &[WalkError]) {
+/// The cells `[x]` occupies — the mark box, and the whole of what a press can aim at.
+const BOX: usize = 3;
+/// The box plus the blank that separates it from the indent.
+const MARKER: usize = BOX + 1;
+/// One level of indent.
+const INDENT: usize = 2;
+
+/// Draws the whole frame, and says where it put what a pointer can aim at.
+pub fn draw(frame: &mut Frame, view: &mut View, errors: &[WalkError]) -> Placed {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -46,104 +64,186 @@ pub fn draw(frame: &mut Frame, view: &mut View, errors: &[WalkError]) {
     .areas(frame.area());
 
     frame.render_widget(headline(view, errors), header);
-    view.viewport(body.height as usize);
-    frame.render_widget(tree(view, body.width, body.height as usize), body);
+    // The heading is a line of the body, so it comes out of the body's height before the
+    // view is told how many rows it has — a page size that counted the heading would scroll
+    // one row further than the pane can draw. A body with no room for both is all rows: a
+    // column name is worth less than the row it would cost.
+    let (head, rows) = if body.height > 1 {
+        let [head, rows] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
+        (Some(head), rows)
+    } else {
+        (None, body)
+    };
+    let columns = columns(rows);
+    view.viewport(rows.height as usize);
+    if let Some(head) = head {
+        heading(frame, head, columns, view.sort());
+    }
+    frame.render_widget(tree(view, columns, rows.height as usize), rows);
     frame.render_widget(status(view), footer);
 
-    if let Some(prompt) = view.prompt() {
-        let line = Line::from(vec![
-            Span::styled("/", Style::default().fg(Color::Yellow)),
-            Span::raw(prompt.text()),
-            match prompt.error() {
-                Some(err) => Span::styled(
-                    format!("   {err}"),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ),
-                None => Span::raw(""),
-            },
-        ]);
-        frame.render_widget(Paragraph::new(line), footer);
-        // The caret is the terminal's own, so a reader's cursor is where they are typing
-        // rather than drawn as a block that their terminal's blink rate disagrees with.
-        frame.set_cursor_position((
-            footer.x + 1 + u16::try_from(prompt.caret()).unwrap_or(u16::MAX),
-            footer.y,
+    let mut placed = Placed {
+        columns: Some(columns),
+        heading: head,
+        rows,
+        scroll: view.scroll(),
+        overlay: None,
+        answers: None,
+    };
+
+    // Where each overlay was drawn, kept rather than assigned as it is drawn: the drawing
+    // order is bottom-up and [`Placed::overlay`] holds the **topmost** one, so the two would
+    // disagree the moment a prompt is opened over a question.
+    let mut prompt_at = None;
+    let mut confirm_at = None;
+    let mut help_at = None;
+
+    if view.prompt().is_some() {
+        prompt_at = Some(prompting(frame, view, footer));
+    }
+    if view.pending().is_some() {
+        confirm_at = Some(confirming(frame, view));
+    }
+    if view.help().is_some() {
+        help_at = Some(helping(frame, view));
+    }
+
+    // The same ranking [`View::overlay`] gives the keyboard, so a click and a keystroke
+    // cannot be told that different surfaces are in front.
+    placed.overlay = prompt_at.or(help_at).or(confirm_at.map(|(area, _)| area));
+    placed.answers = confirm_at.map(|(_, answers)| answers);
+    placed
+}
+
+/// The filter prompt, over the footer it borrows.
+fn prompting(frame: &mut Frame, view: &View, footer: Rect) -> Rect {
+    let Some(prompt) = view.prompt() else {
+        return footer;
+    };
+    let line = Line::from(vec![
+        Span::styled("/", Style::default().fg(Color::Yellow)),
+        Span::raw(prompt.text()),
+        match prompt.error() {
+            Some(err) => Span::styled(
+                format!("   {err}"),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            None => Span::raw(""),
+        },
+    ]);
+    frame.render_widget(Paragraph::new(line), footer);
+    // The caret is the terminal's own, so a reader's cursor is where they are typing rather
+    // than drawn as a block that their terminal's blink rate disagrees with.
+    frame.set_cursor_position((
+        footer.x + 1 + u16::try_from(prompt.caret()).unwrap_or(u16::MAX),
+        footer.y,
+    ));
+    footer
+}
+
+/// The question, and where its two answers went.
+fn confirming(frame: &mut Frame, view: &View) -> (Rect, [Rect; 2]) {
+    let Some(pending) = view.pending() else {
+        return (Rect::default(), [Rect::default(); 2]);
+    };
+    let mut lines = vec![
+        Line::from(format!(
+            "Delete {}, giving back {}?",
+            plural(pending.targets.len(), "directory", "directories"),
+            human(pending.bytes)
+        )),
+        Line::raw(""),
+    ];
+    if pending.unpriced > 0 {
+        lines.push(Line::styled(
+            format!(
+                "{} of them carry no price yet, so the figure is a floor.",
+                pending.unpriced
+            ),
+            Style::default().fg(Color::DarkGray),
         ));
     }
-
-    if let Some(pending) = view.pending() {
-        let mut lines = vec![
-            Line::from(format!(
-                "Delete {}, giving back {}?",
-                plural(pending.targets.len(), "directory", "directories"),
-                human(pending.bytes)
-            )),
-            Line::raw(""),
-        ];
-        if pending.unpriced > 0 {
-            lines.push(Line::styled(
-                format!(
-                    "{} of them carry no price yet, so the figure is a floor.",
-                    pending.unpriced
-                ),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-        for kept in pending.kept.iter().take(4) {
-            lines.push(Line::styled(
-                format!("left alone — {kept}"),
-                Style::default().fg(Color::Yellow),
-            ));
-        }
-        if pending.kept.len() > 4 {
-            lines.push(Line::styled(
-                format!("…and {} more left alone", pending.kept.len() - 4),
-                Style::default().fg(Color::Yellow),
-            ));
-        }
-        lines.push(Line::raw(""));
-        lines.push(Line::from(vec![
-            answer("cancel", pending.answer == super::state::Answer::Cancel),
-            Span::raw("   "),
-            answer("delete", pending.answer == super::state::Answer::Delete),
-        ]));
-        let area = centred(
-            frame.area(),
-            66,
-            u16::try_from(lines.len()).unwrap_or(8) + 2,
-        );
-        frame.render_widget(Clear, area);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" this cannot be undone ")
-                        .border_style(Style::default().fg(Color::Red)),
-                )
-                .wrap(Wrap { trim: true }),
-            area,
-        );
+    for kept in pending.kept.iter().take(4) {
+        lines.push(Line::styled(
+            format!("left alone — {kept}"),
+            Style::default().fg(Color::Yellow),
+        ));
     }
-
-    if let Some(at) = view.help() {
-        let area = centred(frame.area(), 74, frame.area().height.saturating_sub(4));
-        let page = help_page();
-        let height = area.height.saturating_sub(2) as usize;
-        view.clamp_help(page.lines.len().saturating_sub(height));
-        let at = view.help().unwrap_or(at);
-        frame.render_widget(Clear, area);
-        frame.render_widget(
-            Paragraph::new(page)
-                .scroll((u16::try_from(at).unwrap_or(u16::MAX), 0))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" keys — Esc or ? to close "),
-                ),
-            area,
-        );
+    if pending.kept.len() > 4 {
+        lines.push(Line::styled(
+            format!("…and {} more left alone", pending.kept.len() - 4),
+            Style::default().fg(Color::Yellow),
+        ));
     }
+    lines.push(Line::raw(""));
+    // The answers get a line of the box rather than a line of the paragraph, and that is a
+    // correctness change rather than a tidying one: the lines above them **wrap**, so one
+    // long refusal would push a button a row down from where a press was told it is.
+    let area = centred(
+        frame.area(),
+        66,
+        u16::try_from(lines.len()).unwrap_or(8) + 3,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" this cannot be undone ")
+        .border_style(Style::default().fg(Color::Red));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let [said, asked] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), said);
+    (area, buttons(frame, asked, pending.answer))
+}
+
+/// The generated key reference, and how far down it the reader is.
+fn helping(frame: &mut Frame, view: &mut View) -> Rect {
+    let area = centred(frame.area(), 74, frame.area().height.saturating_sub(4));
+    let page = help_page();
+    let height = area.height.saturating_sub(2) as usize;
+    view.clamp_help(page.lines.len().saturating_sub(height));
+    let at = view.help().unwrap_or(0);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(page)
+            .scroll((u16::try_from(at).unwrap_or(u16::MAX), 0))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" keys — Esc or ? to close "),
+            ),
+        area,
+    );
+    area
+}
+
+/// A confirmation's two answers, drawn into a line of their own.
+///
+/// Returns where they went, in [`Answer::ALL`] order, from the same widths they were drawn
+/// with — so "which button is this" is decided once and read by both halves.
+fn buttons(frame: &mut Frame, area: Rect, chosen: Answer) -> [Rect; 2] {
+    /// The blank between the two, which belongs to neither: a press that lands here is a
+    /// press on the box, and the box does nothing.
+    const GAP: u16 = 3;
+
+    let mut at = area.x;
+    Answer::ALL.map(|answer| {
+        let label = format!("  {}  ", answer.label());
+        let width = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
+        let rect = Rect {
+            x: at,
+            y: area.y,
+            width: width.min(area.right().saturating_sub(at)),
+            height: 1,
+        };
+        at = at.saturating_add(width + GAP);
+        frame.render_widget(
+            Paragraph::new(Span::styled(label, answered(answer == chosen))),
+            rect,
+        );
+        rect
+    })
 }
 
 /// The line across the top: where the scan is, what it has found, and whether it is done.
@@ -201,24 +301,121 @@ fn headline(view: &View, errors: &[WalkError]) -> Paragraph<'static> {
     Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Rgb(32, 32, 40)))
 }
 
+/// Where the tree's columns went, laid out once for the table and for the hit test.
+///
+/// `Length` constraints derived from these are what the [`Table`] is given, so the widget's
+/// own split reproduces this one exactly rather than merely agreeing with it — which is the
+/// difference between a heading a click sorts by and a heading a click sorts *near*.
+///
+/// The rectangles cover the tree's **rows**. The heading is a line above them and takes only
+/// the horizontal extent, which is the whole of what a column is: `x` and `width` are the
+/// column, and `y` is whichever band asked for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Columns {
+    /// The mark box, the indent, the expander and the name.
+    pub name: Rect,
+    /// What the subtree is worth.
+    pub size: Rect,
+    /// How long ago it was touched.
+    pub age: Rect,
+    /// What brings a claim back, when the terminal is wide enough to carry the column.
+    pub regenerate: Option<Rect>,
+}
+
+/// Splits the tree pane into its columns.
+fn columns(area: Rect) -> Columns {
+    // A path a reader cannot read is worse than a command they have to press `Enter` on the
+    // row to see.
+    let wide = area.width >= NARROW;
+    let mut widths = vec![
+        Constraint::Min(20),
+        Constraint::Length(SIZE),
+        Constraint::Length(AGE),
+    ];
+    if wide {
+        widths.push(Constraint::Length(REGENERATE));
+    }
+    let split = Layout::horizontal(widths).spacing(SPACING).split(area);
+    Columns {
+        name: split[0],
+        size: split[1],
+        age: split[2],
+        regenerate: split.get(3).copied(),
+    }
+}
+
+/// The line of column names above the rows — and the one thing on the screen a click sorts by.
+fn heading(frame: &mut Frame, area: Rect, at: Columns, sort: Sort) {
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Rgb(24, 24, 30))),
+        area,
+    );
+    let named = |order: Order| {
+        let mut name = order.column().to_owned();
+        if sort.by == order {
+            // The footer's own arrow, so the two places that say which way the tree is
+            // sorted say it the same way.
+            name.push_str(if sort.reverse { " ↑" } else { " ↓" });
+        }
+        let style = if sort.by == order {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        Span::styled(name, style)
+    };
+    for (rect, order, align) in [
+        (at.name, Order::Path, Alignment::Left),
+        (at.size, Order::Size, Alignment::Right),
+        (at.age, Order::Age, Alignment::Right),
+    ] {
+        frame.render_widget(
+            Paragraph::new(Line::from(named(order))).alignment(align),
+            Rect {
+                y: area.y,
+                height: 1,
+                ..rect
+            },
+        );
+    }
+    if let Some(rect) = at.regenerate {
+        // Named but not a button: nothing orders a level by the command that rebuilds it, so
+        // a press here deliberately does nothing rather than reversing a neighbour the
+        // reader did not aim at. See [`heading_at`].
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "how to get it back",
+                Style::default().fg(Color::Rgb(70, 70, 84)),
+            )),
+            Rect {
+                y: area.y,
+                height: 1,
+                ..rect
+            },
+        );
+    }
+}
+
 /// The tree itself: one table row per *visible* row, from the scroll offset down.
 ///
 /// Bounded by the pane rather than by the tree, which is the difference between drawing a screen
 /// and building one. A home directory fully expanded is 32,634 rows; the widget would draw the
 /// first `height` of them either way, but every row handed to it is a `Vec` of styled spans
 /// allocated first and thrown away second.
-fn tree(view: &View, width: u16, height: usize) -> Table<'static> {
-    let wide = width >= NARROW;
+fn tree(view: &View, at: Columns, height: usize) -> Table<'static> {
+    let wide = at.regenerate.is_some();
     let rows: Vec<TableRow> = view
         .rows()
         .iter()
         .enumerate()
         .skip(view.scroll())
         .take(height)
-        .map(|(at, row)| {
+        .map(|(index, row)| {
             let node = view.tree().node(row.id);
             let roll = view.roll(row.id);
-            let selected = view.cursor() == Some(at);
+            let selected = view.cursor() == Some(index);
             let mut cells = vec![
                 Cell::from(Line::from(label(view, row.id, row.depth))),
                 Cell::from(Text::from(roll.label()).alignment(Alignment::Right)),
@@ -241,18 +438,25 @@ fn tree(view: &View, width: u16, height: usize) -> Table<'static> {
         })
         .collect();
 
+    // The widths the split above produced, handed back as fixed lengths: with every
+    // constraint a `Length` the table's own `Layout::horizontal` can only reproduce them,
+    // which is what makes [`Columns`] the geometry rather than a guess about it.
     let mut widths = vec![
-        Constraint::Min(20),
-        Constraint::Length(SIZE),
-        Constraint::Length(AGE),
+        Constraint::Length(at.name.width),
+        Constraint::Length(at.size.width),
+        Constraint::Length(at.age.width),
     ];
-    if wide {
-        widths.push(Constraint::Length(REGENERATE));
+    if let Some(regenerate) = at.regenerate {
+        widths.push(Constraint::Length(regenerate.width));
     }
-    Table::new(rows, widths).column_spacing(2)
+    Table::new(rows, widths).column_spacing(SPACING)
 }
 
 /// A row's marker, indent, expander and name, as one run of spans.
+///
+/// The cell offsets are [`BOX`], [`MARKER`] and [`INDENT`] rather than literals, because
+/// [`zone_at`] resolves a press by them: a mark box drawn one cell wider than the hit test
+/// believes is a click that selects where it meant to mark.
 fn label(view: &View, id: NodeId, depth: usize) -> Vec<Span<'static>> {
     let node = view.tree().node(id);
     let (marker, colour) = match view.mark_of(id) {
@@ -276,7 +480,7 @@ fn label(view: &View, id: NodeId, depth: usize) -> Vec<Span<'static>> {
     };
     vec![
         Span::styled(marker, Style::default().fg(colour)),
-        Span::raw("  ".repeat(depth)),
+        Span::raw(" ".repeat(INDENT * depth)),
         Span::raw(expander),
         Span::styled(
             name,
@@ -376,17 +580,16 @@ fn counter(marked: Roll) -> String {
     said
 }
 
-/// One of a confirmation's two answers, highlighted or not.
-fn answer(name: &'static str, highlighted: bool) -> Span<'static> {
-    let style = if highlighted {
+/// How one of a confirmation's two answers is drawn, highlighted or not.
+fn answered(highlighted: bool) -> Style {
+    if highlighted {
         Style::default()
             .fg(Color::Black)
             .bg(Color::White)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
-    };
-    Span::styled(format!("  {name}  "), style)
+    }
 }
 
 /// The help page, generated from the keymap so it cannot drift from what the keys do.
@@ -424,23 +627,223 @@ fn centred(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+/// Where the last frame put everything a pointer can aim at.
+///
+/// Read back from the layout [`draw`] produced rather than described a second time. A
+/// hard-coded row-to-`y` map would be one line out the first time the header or the heading
+/// changed height, and being one line out here presses a row nobody chose — on a screen whose
+/// keys delete directories.
+///
+/// [`Default`] is a frame that was never drawn, on which every press resolves to
+/// [`Spot::Nowhere`]. That is the honest answer for the first mouse event of a run and for a
+/// test that has not painted: a synthetic geometry would be a second layout, which is the
+/// thing this type exists to avoid.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Placed {
+    /// The tree's columns, or `None` on a frame that drew no tree.
+    pub columns: Option<Columns>,
+    /// The heading line, when the pane was tall enough to spend a row on one.
+    pub heading: Option<Rect>,
+    /// The body rows.
+    pub rows: Rect,
+    /// Which row of the tree the top drawn row held.
+    ///
+    /// Recorded rather than re-read from the view, so a press maps `y` to a row through the
+    /// offset the rows were **drawn** at — a sync between the frame and the press would
+    /// otherwise shift every row by the difference.
+    pub scroll: usize,
+    /// The topmost overlay's box, in the ranking [`super::state::View::overlay`] uses. One
+    /// slot, because a press lands on one thing.
+    pub overlay: Option<Rect>,
+    /// A confirmation's two answers, in [`Answer::ALL`] order, where they were drawn.
+    ///
+    /// Inside [`overlay`](Self::overlay) and checked first. `None` whenever no question was
+    /// on the frame — which is what a press made *before* the box appeared lands on, and is
+    /// the whole of what stops such a press from answering one. See
+    /// [`super::keymap::finish`].
+    pub answers: Option<[Rect; 2]>,
+}
+
+/// Which part of a row the pointer is on.
+///
+/// pristine's rows carry a target pua's do not: the mark box. A box that is drawn and cannot
+/// be pressed is a lie the pointer tells about itself, so it is a zone of its own rather than
+/// part of the name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Zone {
+    /// The `[x]` box — mark this row's subtree, or unmark it.
+    Mark,
+    /// The `▸`/`▾` indicator — open the row, or close it.
+    ///
+    /// A leaf leaves this cell blank, and a blank cell cannot have been aimed at: opening a
+    /// row with nothing under it is a no-op in [`super::state::View`] rather than a case the
+    /// hit test has to know about.
+    Open,
+    /// The indent, the name, and everything past it — put the cursor here.
+    Name,
+}
+
+/// What is under the pointer, on the frame that was drawn.
+///
+/// The routing chain the keymap states for keys — overlay first, then the tree, then the
+/// globals — falls out of resolving this **geometrically** rather than being re-implemented:
+/// an overlay covers the screen it is over, so a press inside one cannot also be a press on
+/// the tree, and one outside is the dismissal. [`super::keymap::pointer`] turns a spot and a
+/// gesture into an action; nothing else has to know the order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Spot {
+    /// A column heading, over the column that orders a level by this key.
+    Heading(Order),
+    /// A tree row, named by the **directory** on it rather than by its position.
+    ///
+    /// The identity rule this whole model turns on. Rows re-sort as prices land and *vanish*
+    /// as removals complete, so a row index resolved at the press and acted on at the release
+    /// names a different directory — and the action on the other end of it deletes one. A
+    /// [`NodeId`] is not that index: [`crate::tree::Tree`] only ever pushes a new slot and
+    /// never recycles a detached one, so an id names one directory for the life of the run,
+    /// and a press on a row that has since been removed resolves to a row that is no longer
+    /// on screen and does nothing at all.
+    Row {
+        /// Which directory.
+        id: NodeId,
+        /// Which part of its row.
+        zone: Zone,
+    },
+    /// The tree pane, past the end of its rows.
+    Tree,
+    /// Inside the help overlay.
+    Help,
+    /// On one of a confirmation's two answers.
+    Answer(Answer),
+    /// Inside a confirmation, and not on either answer.
+    ///
+    /// The question, the consequence and the padding around them are things to read rather
+    /// than things to press, so landing near an answer is a miss and does nothing. What
+    /// guards the irreversible press is the gesture — down and up in the same button — rather
+    /// than the absence of a target; see [`super::keymap::finish`].
+    Confirm,
+    /// Inside the filter prompt.
+    Prompt,
+    /// Outside the overlay that is up — where a press dismisses it.
+    Outside,
+    /// Chrome, or a frame with nothing on it: the header line and the footer.
+    Nowhere,
+}
+
+/// What the pointer is over, resolved against the frame that was drawn.
+///
+/// Takes the view as well as the frame because two of the answers are about content rather
+/// than geometry: which directory a row is, so that a re-sort between the press and the
+/// release cannot select a stranger, and how deep it is, so that the expander's cell is the
+/// one it was drawn in.
+#[must_use]
+pub fn hit(view: &View, placed: &Placed, at: Position) -> Spot {
+    // The overlay first, and by **omission** rather than by a branch: while one is up nothing
+    // below this returns, so there is no arrangement in which a press reaches the tree behind
+    // it.
+    if let Some(over) = placed.overlay {
+        if !over.contains(at) {
+            return Spot::Outside;
+        }
+        // In the ranking the keyboard is routed by, so the surface a press lands on is the
+        // one a keystroke would reach.
+        if view.prompt().is_some() {
+            return Spot::Prompt;
+        }
+        if view.help().is_some() {
+            return Spot::Help;
+        }
+        return answer_at(placed.answers, at).map_or(Spot::Confirm, Spot::Answer);
+    }
+
+    let Some(columns) = placed.columns else {
+        return Spot::Nowhere;
+    };
+    if placed.heading.is_some_and(|head| head.contains(at)) {
+        return heading_at(columns, at.x);
+    }
+    if placed.rows.contains(at) {
+        let index = placed.scroll + usize::from(at.y - placed.rows.y);
+        return match view.rows().get(index) {
+            Some(row) => Spot::Row {
+                id: row.id,
+                zone: zone_at(columns, row.depth, at.x),
+            },
+            None => Spot::Tree,
+        };
+    }
+    Spot::Nowhere
+}
+
+/// Which of a confirmation's answers the pointer is on, if either.
+fn answer_at(answers: Option<[Rect; 2]>, at: Position) -> Option<Answer> {
+    Answer::ALL
+        .into_iter()
+        .zip(answers?)
+        .find(|(_, rect)| rect.contains(at))
+        .map(|(answer, _)| answer)
+}
+
+/// Which ordering the heading holds at cell `x`.
+///
+/// Each gap belongs to the column before it, which is where that heading's trailing blanks
+/// are anyway. The regeneration column is the one part of the line that is *not* a button:
+/// nothing orders a level by the command that rebuilds it, so a press there is a miss rather
+/// than a reversal of the neighbour the reader did not aim at.
+fn heading_at(at: Columns, x: u16) -> Spot {
+    if x < at.size.x {
+        return Spot::Heading(Order::Path);
+    }
+    if x < at.age.x {
+        return Spot::Heading(Order::Size);
+    }
+    match at.regenerate {
+        Some(regenerate) if x >= regenerate.x => Spot::Nowhere,
+        _ => Spot::Heading(Order::Age),
+    }
+}
+
+/// Which part of a row's name column cell `x` is in.
+///
+/// Walked through the same offsets [`label`] draws with, so each target is where its glyph
+/// is rather than where a second description says it should be.
+fn zone_at(at: Columns, depth: usize, x: u16) -> Zone {
+    let offset = usize::from(x.saturating_sub(at.name.x));
+    if offset < BOX {
+        return Zone::Mark;
+    }
+    if offset == MARKER + INDENT * depth {
+        return Zone::Open;
+    }
+    Zone::Name
+}
+
 #[cfg(test)]
 mod tests {
-    use super::draw;
+    use super::{INDENT, MARKER, Placed, Spot, Zone, draw, hit as press_on};
     use crate::fixture::{hit, priced};
     use crate::size::Size;
-    use crate::tree::Tree;
+    use crate::tree::{Order, Tree};
     use crate::tui::keymap::{Action, Motion};
     use crate::tui::state::{Answer, Pending, View};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::layout::Position;
 
     /// Everything the frame drew, one line per row, trailing blanks trimmed.
     fn painted(view: &mut View, width: u16, height: u16) -> Vec<String> {
+        frame_of(view, width, height).0
+    }
+
+    /// The same frame, with the geometry it reported — for the tests about pressing on it.
+    fn frame_of(view: &mut View, width: u16, height: u16) -> (Vec<String>, Placed) {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| draw(frame, view, &[])).unwrap();
+        let mut placed = Placed::default();
+        terminal
+            .draw(|frame| placed = draw(frame, view, &[]))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
-        (0..buffer.area.height)
+        let lines = (0..buffer.area.height)
             .map(|y| {
                 (0..buffer.area.width)
                     .map(|x| buffer[(x, y)].symbol())
@@ -448,7 +851,8 @@ mod tests {
                     .trim_end()
                     .to_owned()
             })
-            .collect()
+            .collect();
+        (lines, placed)
     }
 
     fn view() -> View {
@@ -506,7 +910,10 @@ mod tests {
         view.apply(Action::Mark);
         let frame = painted(&mut view, 100, 8);
 
-        let root = &frame[1];
+        let root = frame
+            .iter()
+            .find(|line| line.starts_with('[') && line.contains("/scan"))
+            .unwrap_or_else(|| panic!("{frame:#?}"));
         assert!(root.contains("[~]"), "{frame:#?}");
     }
 
@@ -558,6 +965,193 @@ mod tests {
         assert!(!row.contains("install"), "{row}");
     }
 
+    // ---- what a press lands on --------------------------------------------------------
+
+    /// Where the cell holding `glyph` on the row named by `path` actually is.
+    ///
+    /// The point of the whole test section: the hit test is asked about the cell the frame
+    /// *drew* the glyph in, found by looking at the painted buffer, rather than about a cell
+    /// a second description of the layout believes it is in.
+    fn cell_of(frame: &[String], placed: &Placed, path: &str, glyph: &str) -> Position {
+        let y = frame
+            .iter()
+            .position(|line| line.contains(path))
+            .unwrap_or_else(|| panic!("{path} is not on the frame: {frame:#?}"));
+        let line = &frame[y];
+        let x = line
+            .char_indices()
+            .position(|(at, _)| line[at..].starts_with(glyph))
+            .unwrap_or_else(|| panic!("no {glyph} on {line:?}"));
+        let at = Position::new(u16::try_from(x).unwrap(), u16::try_from(y).unwrap());
+        assert!(
+            placed.rows.contains(at) || placed.heading.is_some_and(|head| head.contains(at)),
+            "{glyph} on {path} is at {at:?}, which the frame says is neither a row nor the heading"
+        );
+        at
+    }
+
+    #[test]
+    fn a_press_on_a_rows_glyphs_lands_on_the_part_of_it_that_was_drawn_there() {
+        let mut view = view();
+        view.apply(Action::Cursor(Motion::Down));
+        view.apply(Action::Expand);
+        let (frame, placed) = frame_of(&mut view, 100, 10);
+        let nx = view.tree().find(std::path::Path::new("/scan/nx")).unwrap();
+
+        // The three targets a row carries, each asked about at the cell its own glyph was
+        // painted in. Being one cell out here is a press that marks where it meant to open.
+        assert_eq!(
+            press_on(&view, &placed, cell_of(&frame, &placed, "nx", "[")),
+            Spot::Row {
+                id: nx,
+                zone: Zone::Mark
+            }
+        );
+        assert_eq!(
+            press_on(&view, &placed, cell_of(&frame, &placed, "nx", "▾")),
+            Spot::Row {
+                id: nx,
+                zone: Zone::Open
+            }
+        );
+        assert_eq!(
+            press_on(&view, &placed, cell_of(&frame, &placed, "nx", "nx")),
+            Spot::Row {
+                id: nx,
+                zone: Zone::Name
+            }
+        );
+    }
+
+    #[test]
+    fn a_leaf_leaves_the_indicators_cell_blank_and_a_press_there_is_a_press_on_the_row() {
+        let mut view = view();
+        view.apply(Action::Cursor(Motion::Down));
+        view.apply(Action::Expand);
+        let (frame, placed) = frame_of(&mut view, 100, 10);
+        let leaf = view
+            .tree()
+            .find(std::path::Path::new("/scan/nx/node_modules"))
+            .unwrap();
+
+        // The cell the indicator would be in, computed from the row's depth exactly as
+        // `zone_at` does. A leaf draws nothing there, so it resolves to `Open` and the view
+        // makes it a no-op rather than the hit test having to know about leaves.
+        let depth = view
+            .rows()
+            .iter()
+            .find(|row| row.id == leaf)
+            .map(|row| row.depth)
+            .unwrap();
+        let row = u16::try_from(
+            frame
+                .iter()
+                .position(|line| line.contains("node_modules"))
+                .unwrap(),
+        )
+        .unwrap();
+        let x = placed.columns.unwrap().name.x + u16::try_from(MARKER + INDENT * depth).unwrap();
+        assert_eq!(
+            frame[row as usize].chars().nth(usize::from(x)),
+            Some(' '),
+            "a leaf drew something in the indicator's cell: {:?}",
+            frame[row as usize]
+        );
+        assert_eq!(
+            press_on(&view, &placed, Position::new(x, row)),
+            Spot::Row {
+                id: leaf,
+                zone: Zone::Open
+            }
+        );
+    }
+
+    #[test]
+    fn a_press_on_a_column_heading_names_the_order_that_column_is_headed_with() {
+        let mut view = view();
+        let (frame, placed) = frame_of(&mut view, 100, 8);
+        let head = placed.heading.unwrap();
+        assert_eq!(head.y, 1, "{frame:#?}");
+
+        for (name, order) in [
+            ("directory", Order::Path),
+            ("size", Order::Size),
+            ("age", Order::Age),
+        ] {
+            let at = cell_of(&frame, &placed, "directory", name);
+            assert_eq!(
+                press_on(&view, &placed, at),
+                Spot::Heading(order),
+                "{name} at {at:?}: {:?}",
+                frame[1]
+            );
+        }
+        // The one part of the line that is not a button: nothing orders a level by the
+        // command that rebuilds it, so a press there does nothing rather than reversing the
+        // neighbour the reader did not aim at.
+        let regenerate = placed.columns.unwrap().regenerate.unwrap();
+        assert_eq!(
+            press_on(&view, &placed, Position::new(regenerate.x, head.y)),
+            Spot::Nowhere
+        );
+    }
+
+    #[test]
+    fn a_press_past_the_last_row_is_the_pane_and_a_press_on_the_chrome_is_nothing() {
+        let mut view = view();
+        let (_, placed) = frame_of(&mut view, 100, 12);
+        // Three rows in a pane with room for nine.
+        assert_eq!(view.rows().len(), 3);
+        assert_eq!(
+            press_on(&view, &placed, Position::new(4, placed.rows.y + 5)),
+            Spot::Tree
+        );
+        assert_eq!(press_on(&view, &placed, Position::new(4, 0)), Spot::Nowhere);
+        assert_eq!(
+            press_on(&view, &placed, Position::new(4, 11)),
+            Spot::Nowhere
+        );
+    }
+
+    #[test]
+    fn an_overlay_takes_every_press_over_the_screen_it_covers() {
+        let mut view = view();
+        view.ask(Pending {
+            targets: vec!["/scan/nx/node_modules".into()],
+            bytes: 2 * 1024 * 1024,
+            unpriced: 0,
+            kept: Vec::new(),
+            answer: Answer::Cancel,
+        });
+        let (frame, placed) = frame_of(&mut view, 100, 20);
+        let [cancel, delete] = placed.answers.unwrap();
+
+        // The buttons, where they were drawn — the rectangles come out of the same widths
+        // the spans were rendered with, so a press cannot land near a word instead of on it.
+        assert!(frame[delete.y as usize].contains("delete"), "{frame:#?}");
+        assert_eq!(
+            press_on(&view, &placed, Position::new(cancel.x + 2, cancel.y)),
+            Spot::Answer(Answer::Cancel)
+        );
+        assert_eq!(
+            press_on(&view, &placed, Position::new(delete.x + 2, delete.y)),
+            Spot::Answer(Answer::Delete)
+        );
+        // The blank between them belongs to neither, and the box's own text is something to
+        // read rather than something to press.
+        assert_eq!(
+            press_on(&view, &placed, Position::new(cancel.right(), cancel.y)),
+            Spot::Confirm
+        );
+        assert_eq!(
+            press_on(&view, &placed, Position::new(delete.x, delete.y - 2)),
+            Spot::Confirm
+        );
+        // …and there is no arrangement in which a press reaches the tree behind it. This is
+        // the row `nx` is on, and it is not a row while the question is up.
+        assert_eq!(press_on(&view, &placed, Position::new(1, 3)), Spot::Outside);
+    }
+
     #[test]
     fn a_scan_that_could_not_read_everything_says_so_beside_its_own_numbers() {
         let mut view = view();
@@ -567,7 +1161,9 @@ mod tests {
             message: "Permission denied".to_owned(),
         }];
         terminal
-            .draw(|frame| draw(frame, &mut view, &errors))
+            .draw(|frame| {
+                draw(frame, &mut view, &errors);
+            })
             .unwrap();
         let header: String = (0..120)
             .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
