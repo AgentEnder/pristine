@@ -207,7 +207,7 @@ impl<W: Write> Screen<W> {
         // the same question, on a pane showing what it showed last frame.
         //
         // The inputs are: which directory is mapped, where the cursor is, what is marked,
-        // what the filter shows, how big the pane is, and whether anything under the mapped
+        // what the lens shows, how big the pane is, and whether anything under the mapped
         // directory has moved. Nothing else reaches [`tiles::plan`] — the order the tree
         // holds its children in does not, because the map sorts its own rectangles by weight.
         let steering = fingerprint(&(
