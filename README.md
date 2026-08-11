@@ -60,6 +60,12 @@ why the flag has to exist.
 still unpriced. The same tree scoped to a single repository takes 3.5 s — a default scan, plus
 that repository. It is how you ask "how much is in *here*" without paying for everywhere else.
 
+Pricing does not hold the scan up. Claims are published as they are found and a pool of threads
+prices them behind, so on that same tree the last row is known at 7.5 s while the numbers keep
+landing for another minute. Measured on the walker thread instead, the last row does not exist
+until 60.1 s — nothing to show, for the whole run. This command line still waits, because it
+sorts by size and paints once; the point of the split is the TUI, which will not.
+
 A scan that could not read everything it was pointed at says `scan incomplete` and exits
 non-zero, so a listing that is a lower bound never looks — to a script — like the whole truth.
 
