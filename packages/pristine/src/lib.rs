@@ -56,6 +56,8 @@
 pub mod delete;
 mod detect;
 pub mod fallback;
+#[cfg(test)]
+mod fixture;
 pub mod git;
 pub mod repo;
 pub mod rules;
@@ -71,7 +73,7 @@ pub use git::{GitError, WorkTree};
 pub use repo::{Class, Enumeration, Repo, RepoError, Reset, Selected, Selection};
 pub use rules::{Anchor, MarkersRequired, RegenerateWhen, Rule, RuleError, Ruleset};
 pub use size::{Measurement, Measurer, Size, SizeMode, Survey};
-pub use tree::{Node, NodeId, Tree};
+pub use tree::{Node, NodeId, Order, Sort, Tree};
 pub use walk::{
     Claim, Found, Hit, IgnoredClaim, Priced, RuleClaim, WalkError, WalkOutcome, Walker,
 };
