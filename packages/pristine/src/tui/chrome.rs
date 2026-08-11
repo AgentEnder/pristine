@@ -17,19 +17,30 @@
 //!   `~/repos` is 55.8 s, which is long enough that the reader has gone somewhere else, and
 //!   the percentage is one the pool already knows: claims priced over claims found.
 //! - **OSC 0 title** makes a backgrounded run readable from the tab bar. It is restored on the
-//!   way out, including the error path — see [`Chrome::restore`].
+//!   way out, including the error path — see [`Chrome::restore`] — and it is only ever set on a
+//!   terminal that can restore it. See [`Title`].
 //! - **One notification**, and only when the run was long enough to be worth interrupting
 //!   somebody for *and* they are demonstrably looking elsewhere. A notification for a 200 ms
 //!   scan is spam.
 //!
-//! # Why there is an allowlist for two of them and not the other two
+//! # Why three of the four are allowlisted, and one is not
 //!
-//! Because OSC 9 collides with itself. `OSC 9 ; <text>` is a desktop notification in iTerm2,
-//! `WezTerm` and Ghostty; `OSC 9 ; 4 ; <state> ; <percent>` is `ConEmu`'s progress bar, read by
-//! `WezTerm`, Ghostty, `ConEmu` and Windows Terminal. A terminal that knows only the first reads a
-//! progress report as a notification saying `4;1;41`, which is worse than no bar at all. The
-//! two that collide are therefore sent only where they are known to be understood, and the two
-//! that cannot collide — a private mode and a title — go everywhere.
+//! **Only the synchronized update goes everywhere**, because it is the only one that leaves
+//! nothing behind: an unknown private mode is dropped by every parser that understands `CSI`,
+//! and there is no state to give back afterwards. The other three all fail by *persisting*.
+//!
+//! Two of them fail by being misread, and OSC 9 colliding with itself is why.
+//! `OSC 9 ; <text>` is a desktop notification in iTerm2, `WezTerm` and Ghostty;
+//! `OSC 9 ; 4 ; <state> ; <percent>` is `ConEmu`'s progress bar, read by `WezTerm`, Ghostty,
+//! `ConEmu` and Windows Terminal. A terminal that knows only the first reads a progress report
+//! as a notification saying `4;1;41`, which is worse than no bar at all.
+//!
+//! The third fails by being *unreturnable*, which is subtler and worse. Setting a title is easy
+//! everywhere; putting the old one back needs a title stack that not every terminal keeps, and
+//! a terminal without one is simply left holding `pristine — freed 41.2 GiB` forever. So the
+//! title is not a flag — it is the push/pop pair itself ([`Title`]), present only for terminals
+//! documented to keep the stack, which makes "set a title nothing can clear" unrepresentable
+//! rather than merely avoided.
 
 use std::io::{self, IsTerminal, Write};
 use std::time::Duration;
@@ -48,17 +59,32 @@ use crate::size::human;
 /// shortest run somebody walks away from, and the run this feature is for takes a minute.
 const NOTIFY_AFTER: Duration = Duration::from_secs(5);
 
-/// Pushes the window title onto the terminal's title stack, so the way out can pop it.
+/// How a terminal's window title is taken, and given back.
 ///
-/// `xterm`'s, and there is no other way: no terminal will tell an application what its title
-/// currently is, so restoring one means having asked the terminal to remember it. Terminals
-/// without a title stack ignore both halves and keep whatever this run last set — the honest
-/// limit of the feature, and the reason the title is set to something meaningful rather than
-/// something transient.
-const PUSH_TITLE: &str = "\x1b[22;2t";
+/// **One value carrying both halves, which is the entire point of the type.** A title is a
+/// piece of the reader's terminal that this run borrows, and the rule for everything borrowed
+/// here is that it has to be returnable. No terminal will tell an application what its title
+/// currently is — there is no query to ask — so the only way to put one back is to have asked
+/// the terminal to remember it first, which is what `xterm`'s title stack is for.
+///
+/// A terminal with no stack ignores the push, ignores the pop, and keeps whatever this run last
+/// set: `pristine — freed 41.2 GiB` in a tab bar for the rest of that terminal's life. That is
+/// not a decoration degrading to nothing, it is a decoration that never leaves. So the two
+/// sequences are held together as one capability, and a terminal that is not known to have it
+/// is never sent a title at all — the setting cannot be switched on without the putting back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Title {
+    /// Saves the title this run is about to replace.
+    push: &'static str,
+    /// Puts it back.
+    pop: &'static str,
+}
 
-/// Pops it back.
-const POP_TITLE: &str = "\x1b[23;2t";
+/// `xterm`'s title stack, which is the only one there is.
+pub const XTERM_STACK: Title = Title {
+    push: "\x1b[22;2t",
+    pop: "\x1b[23;2t",
+};
 
 /// Which decorations a terminal is known to read.
 ///
@@ -69,8 +95,8 @@ const POP_TITLE: &str = "\x1b[23;2t";
 pub struct Decor {
     /// Wrap frames in DEC 2026.
     pub sync: bool,
-    /// Set and restore the window title.
-    pub title: bool,
+    /// How to set the window title and put it back, if this terminal can do both.
+    pub title: Option<Title>,
     /// Report progress as OSC 9;4.
     pub progress: bool,
     /// How to raise a desktop notification, if this terminal can.
@@ -86,18 +112,89 @@ pub enum Notify {
     Osc777,
 }
 
-/// What each terminal is known to read, keyed by `TERM_PROGRAM`.
+/// One terminal, and everything it is known to read.
+struct Known {
+    /// What it calls itself in `TERM_PROGRAM`, or `""` for one that sets no such variable.
+    program: &'static str,
+    /// A `TERM` that names this terminal and nothing else, or `""`. `xterm-256color` is not
+    /// such a name — half the terminals here can be found wearing it — which is why this is a
+    /// second key rather than the first one.
+    term: &'static str,
+    /// What it reads.
+    decor: Decor,
+}
+
+impl Known {
+    /// Whether this row is the terminal the environment describes.
+    fn names(&self, program: &str, term: &str) -> bool {
+        (!self.program.is_empty() && self.program == program)
+            || (!self.term.is_empty() && self.term == term)
+    }
+}
+
+/// The table. **Absence from it is a refusal to guess, not a claim about a terminal**, and
+/// every column is a claim that the terminal *documents* the sequence in question.
 ///
-/// Absence from this table is not a claim that a terminal lacks the feature; it is a refusal
-/// to guess. The cost of guessing wrong is a notification full of punctuation, and the cost of
-/// not guessing is a missing progress bar.
-const KNOWN: &[(&str, bool, Option<Notify>)] = &[
-    ("ghostty", true, Some(Notify::Osc9)),
-    ("WezTerm", true, Some(Notify::Osc9)),
-    // No progress: iTerm2 reads `OSC 9 ; …` as a notification, so a progress report reaches
-    // the reader as a pop-up saying `4;1;41`.
-    ("iTerm.app", false, Some(Notify::Osc9)),
-    ("Apple_Terminal", false, None),
+/// The asymmetry in the cost of being wrong is what sets the default. A decoration wrongly
+/// withheld is a feature somebody does not get; a decoration wrongly sent is a pop-up full of
+/// punctuation, or a window title nobody can clear. So a row is added when a terminal's own
+/// documentation says it reads the sequence, and never because it probably does.
+const KNOWN: &[Known] = &[
+    Known {
+        program: "ghostty",
+        term: "xterm-ghostty",
+        decor: Decor {
+            sync: true,
+            title: Some(XTERM_STACK),
+            progress: true,
+            notify: Some(Notify::Osc9),
+        },
+    },
+    Known {
+        program: "WezTerm",
+        term: "wezterm",
+        decor: Decor {
+            sync: true,
+            title: Some(XTERM_STACK),
+            progress: true,
+            notify: Some(Notify::Osc9),
+        },
+    },
+    Known {
+        program: "iTerm.app",
+        term: "",
+        decor: Decor {
+            sync: true,
+            title: Some(XTERM_STACK),
+            // iTerm2 reads `OSC 9 ; …` as a notification, so a progress report would reach the
+            // reader as a pop-up saying `4;1;41`.
+            progress: false,
+            notify: Some(Notify::Osc9),
+        },
+    },
+    Known {
+        program: "",
+        term: "xterm-kitty",
+        decor: Decor {
+            sync: true,
+            title: Some(XTERM_STACK),
+            progress: false,
+            // kitty's notification is OSC 99, which nothing here speaks.
+            notify: None,
+        },
+    },
+    Known {
+        program: "Apple_Terminal",
+        term: "",
+        // Looked at, and the answer is no to everything but the private mode. Kept as a row
+        // rather than left to the default so the next person does not have to look again.
+        decor: Decor {
+            sync: true,
+            title: None,
+            progress: false,
+            notify: None,
+        },
+    },
 ];
 
 impl Decor {
@@ -121,29 +218,38 @@ impl Decor {
     fn read(env: &dyn Fn(&str) -> Option<String>) -> Self {
         // A `TERM` that is absent or `dumb` is the one thing in the environment that is a
         // statement about escape sequences rather than about a product, and it says no.
-        match env("TERM").as_deref() {
-            None | Some("" | "dumb") => return Self::default(),
-            Some(_) => {}
+        let term = env("TERM").unwrap_or_default();
+        if term.is_empty() || term == "dumb" {
+            return Self::silent();
+        }
+        // What an unidentified terminal gets: the one decoration that changes nothing it could
+        // be left holding. An unknown private mode is dropped by every parser that understands
+        // `CSI` at all, and there is no state to give back afterwards.
+        let anonymous = Self {
+            sync: true,
+            ..Self::silent()
+        };
+        // Inside a multiplexer, `TERM_PROGRAM` names whatever started the *server* — which is
+        // not necessarily what is parsing these bytes, and may not still be running. tmux drops
+        // the OSC sequences it does not implement, so most of this would go nowhere; the title
+        // is the exception, because tmux does set a pane title from OSC 0 and would then be
+        // left holding it.
+        if term.starts_with("screen") || term.starts_with("tmux") {
+            return anonymous;
         }
         let program = env("TERM_PROGRAM").unwrap_or_default();
-        let (progress, notify) = KNOWN
-            .iter()
-            .find(|(name, _, _)| *name == program)
-            .map_or_else(
-                || {
-                    // Neither of these sets `TERM_PROGRAM`, and both read ConEmu's bar because
-                    // one of them is ConEmu.
-                    let bar = env("WT_SESSION").is_some() || env("ConEmuANSI").is_some();
-                    (bar, None)
-                },
-                |(_, progress, notify)| (*progress, *notify),
-            );
-        Self {
-            sync: true,
-            title: true,
-            progress,
-            notify,
+        if let Some(known) = KNOWN.iter().find(|known| known.names(&program, &term)) {
+            return known.decor;
         }
+        // Neither of these sets `TERM_PROGRAM`, and both read ConEmu's bar because one of them
+        // is ConEmu. Neither is known to keep a title stack.
+        if env("WT_SESSION").is_some() || env("ConEmuANSI").is_some() {
+            return Self {
+                progress: true,
+                ..anonymous
+            };
+        }
+        anonymous
     }
 }
 
@@ -323,8 +429,8 @@ impl<W: Write> Chrome<W> {
     /// Anything the terminal refuses.
     pub fn enter(&mut self) -> io::Result<()> {
         self.entered = true;
-        if self.decor.title {
-            self.put(PUSH_TITLE)?;
+        if let Some(title) = self.decor.title {
+            self.put(title.push)?;
         }
         if self.decor.notify.is_some() {
             execute!(self.out, EnableFocusChange)?;
@@ -363,7 +469,9 @@ impl<W: Write> Chrome<W> {
     ///
     /// Anything the terminal refuses.
     pub fn show(&mut self, status: Status) -> io::Result<()> {
-        if self.decor.title {
+        // Gated on the *stack*, not on a separate "may I set a title" flag: the terminals that
+        // cannot give one back are exactly the terminals that are never given one to hold.
+        if self.decor.title.is_some() {
             let title = status.title();
             if self.title.as_ref() != Some(&title) {
                 execute!(self.out, SetTitle(text(&title)))?;
@@ -437,8 +545,8 @@ impl<W: Write> Chrome<W> {
         if self.decor.notify.is_some() {
             first = first.and(execute!(self.out, DisableFocusChange));
         }
-        if self.decor.title {
-            first = first.and(self.put(POP_TITLE));
+        if let Some(title) = self.decor.title {
+            first = first.and(self.put(title.pop));
         }
         first
     }
@@ -469,7 +577,7 @@ fn text(said: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Chrome, Decor, Notify, Status, text};
+    use super::{Chrome, Decor, Notify, Status, XTERM_STACK, text};
     use crate::fixture::{hit, priced};
     use crate::size::Size;
     use crate::tree::Tree;
@@ -481,7 +589,7 @@ mod tests {
     fn everything() -> Decor {
         Decor {
             sync: true,
-            title: true,
+            title: Some(XTERM_STACK),
             progress: true,
             notify: Some(Notify::Osc9),
         }
@@ -617,10 +725,8 @@ mod tests {
         // iTerm2's shape: it would read `OSC 9 ; 4 ; …` as a notification and pop up a box
         // saying `4;1;41`.
         let mut chrome = chrome(Decor {
-            sync: true,
-            title: true,
             progress: false,
-            notify: Some(Notify::Osc9),
+            ..everything()
         });
         chrome.enter().unwrap();
         chrome.show(Status::Pricing(41)).unwrap();
@@ -629,6 +735,29 @@ mod tests {
         let said = written(&chrome);
         assert!(!said.contains("\x1b]9;4"), "{said:?}");
         assert!(said.contains("pristine — pricing 41%"));
+    }
+
+    #[test]
+    fn a_terminal_that_cannot_hand_a_title_back_is_never_given_one() {
+        // The one decoration that fails by *persisting* rather than by being ignored. A title
+        // set on a terminal with no stack is `pristine — freed 41.2 GiB` in somebody's tab bar
+        // for the rest of that terminal's life, which is the opposite of degrading to nothing.
+        let mut chrome = chrome(Decor {
+            title: None,
+            ..everything()
+        });
+        chrome.enter().unwrap();
+        chrome.show(Status::Freed(2048)).unwrap();
+        chrome.restore().unwrap();
+
+        let said = written(&chrome);
+        assert!(!said.contains("\x1b]0;"), "a title was set: {said:?}");
+        assert!(
+            !said.contains("22;2t") && !said.contains("23;2t"),
+            "{said:?}"
+        );
+        // The rest still works: this is a narrowing of one decoration, not of the module.
+        assert!(said.contains("\x1b]9;4;0;0\x07"));
     }
 
     #[test]
@@ -743,21 +872,55 @@ mod tests {
     }
 
     #[test]
-    fn a_dumb_terminal_gets_nothing_and_an_unknown_one_gets_what_cannot_collide() {
+    fn a_dumb_terminal_gets_nothing_and_an_unknown_one_gets_only_what_leaves_nothing_behind() {
         assert_eq!(Decor::read(&env(&[("TERM", "dumb")])), Decor::silent());
         assert_eq!(Decor::read(&env(&[])), Decor::silent());
 
-        // Neither a private mode nor a title can be misread as something else, so an
-        // unrecognised terminal still gets both.
+        // A private mode is the only one of the four an unidentified terminal can be sent
+        // safely: anything that parses `CSI` drops it, and it leaves no state behind. A title
+        // would be left standing, and the two OSCs can be misread as each other.
         assert_eq!(
             Decor::read(&env(&[("TERM", "xterm-256color")])),
             Decor {
                 sync: true,
-                title: true,
+                title: None,
                 progress: false,
                 notify: None,
             }
         );
+    }
+
+    #[test]
+    fn a_multiplexer_is_not_the_terminal_named_in_the_environment() {
+        // Inside tmux, `TERM_PROGRAM` names whatever started the server — possibly something
+        // that is no longer running, and certainly not what is parsing these bytes. Taking it
+        // at its word sets a title tmux is then left holding.
+        for term in ["screen-256color", "tmux-256color"] {
+            assert_eq!(
+                Decor::read(&env(&[("TERM", term), ("TERM_PROGRAM", "ghostty")])),
+                Decor {
+                    sync: true,
+                    ..Decor::silent()
+                },
+                "{term} was taken for the terminal that started it"
+            );
+        }
+    }
+
+    #[test]
+    fn every_terminal_offered_a_title_is_offered_the_way_to_put_it_back() {
+        // Over the shipped table rather than a fixture. The type is what makes this hold — a
+        // title is the push/pop pair, so "sets a title" cannot be spelled without the restore
+        // — and this is the assertion that the table cannot quietly acquire a half of one.
+        for known in super::KNOWN {
+            if let Some(title) = known.decor.title {
+                assert!(
+                    !title.push.is_empty() && !title.pop.is_empty(),
+                    "{} sets a title it cannot put back",
+                    known.program
+                );
+            }
+        }
     }
 
     #[test]
@@ -767,6 +930,13 @@ mod tests {
             ("TERM_PROGRAM", "ghostty"),
         ]));
         assert!(ghostty.progress && ghostty.notify == Some(Notify::Osc9));
+        assert_eq!(ghostty.title, Some(XTERM_STACK));
+
+        // A terminal that sets no `TERM_PROGRAM` is found by the `TERM` that names it and
+        // nothing else — which `xterm-256color` is not, and is why that is the second key.
+        let kitty = Decor::read(&env(&[("TERM", "xterm-kitty")]));
+        assert_eq!(kitty.title, Some(XTERM_STACK));
+        assert!(!kitty.progress);
 
         let iterm = Decor::read(&env(&[
             ("TERM", "xterm-256color"),
@@ -778,10 +948,12 @@ mod tests {
         );
         assert_eq!(iterm.notify, Some(Notify::Osc9));
 
-        // Windows Terminal names itself in a variable of its own rather than in TERM_PROGRAM.
+        // Windows Terminal names itself in a variable of its own rather than in TERM_PROGRAM,
+        // and is not known to keep a title stack.
         let wt = Decor::read(&env(&[("TERM", "xterm-256color"), ("WT_SESSION", "…")]));
         assert!(wt.progress);
         assert_eq!(wt.notify, None);
+        assert_eq!(wt.title, None);
 
         let apple = Decor::read(&env(&[
             ("TERM", "xterm-256color"),
@@ -789,6 +961,7 @@ mod tests {
         ]));
         assert!(!apple.progress);
         assert_eq!(apple.notify, None);
+        assert_eq!(apple.title, None);
     }
 
     #[test]

@@ -76,10 +76,12 @@ one.
 - `?` lists every key, generated from the keymap rather than maintained beside it.
 - A long sweep stays readable from outside the terminal: the window title carries the live figure
   (`pristine — pricing 41%`, `pristine — freed 41.2 GiB`), the dock or taskbar carries a real
-  progress bar where the terminal reads one, and a run that took long enough raises one
-  notification if you have looked away. Frames go out as one synchronized update, so a redraw does
-  not tear over ssh. All of it is restored on the way out, including the error path, and all of it
-  is silent on a terminal that does not advertise reading it — and in a pipe.
+  progress bar, and a run that took long enough raises one notification if you have looked away.
+  Frames go out as one synchronized update, so a redraw does not tear over ssh. All of it is put
+  back on the way out, including the error path. Each part is sent only to a terminal known to
+  read it — the title only where the old one can be handed back, since a title nobody can clear is
+  worse than none — so an unrecognised terminal gets the tear-free redraw and nothing else, and a
+  pipe gets not one escape byte.
 
 The keys are deliberately close to [pua](https://github.com/AgentEnder/pua)'s, which is the same
 shape of tool pointed at processes.

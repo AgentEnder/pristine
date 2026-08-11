@@ -554,6 +554,7 @@ mod tests {
     use crate::delete::{Failure, Refusal, Refused, Removal, Removed};
     use crate::fixture::priced;
     use crate::tree::Tree;
+    use crate::tui::chrome::XTERM_STACK;
     use crate::tui::state::View;
     use crate::walk::{Found, WalkError, WalkOutcome};
     use std::sync::mpsc::channel;
@@ -747,7 +748,7 @@ mod tests {
             Vec::new(),
             Decor {
                 sync: true,
-                title: true,
+                title: Some(XTERM_STACK),
                 progress: true,
                 notify: None,
             },
@@ -783,6 +784,7 @@ mod loop_tests {
     use super::{Chrome, Decor, Events, Options, drive};
     use crate::Ruleset;
     use crate::size::SizeMode;
+    use crate::tui::chrome::XTERM_STACK;
     use ratatui::Terminal;
     use ratatui::backend::{Backend, TestBackend, WindowSize};
     use ratatui::buffer::Cell;
@@ -1008,7 +1010,7 @@ mod loop_tests {
             Vec::new(),
             Decor {
                 sync: true,
-                title: true,
+                title: Some(XTERM_STACK),
                 progress: true,
                 notify: None,
             },
