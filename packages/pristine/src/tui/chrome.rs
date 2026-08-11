@@ -923,7 +923,7 @@ mod tests {
         assert_eq!(Status::of(&view, 0).bar().code(), (1, 75));
 
         // And the batch reporting takes the bar down.
-        view.deleted("freed 1.5 KiB".to_owned(), 1536);
+        view.deleted(crate::tui::state::Notice::standing("freed 1.5 KiB"), 1536);
         assert_eq!(Status::of(&view, 1536), Status::Freed(1536));
         assert_eq!(Status::of(&view, 1536).bar().code(), (0, 0));
     }

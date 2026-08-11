@@ -176,6 +176,14 @@ pub enum Action {
     Help,
     /// `Esc` — step back one rung, and never quit.
     Back,
+    /// A click on what the footer is saying — take it away, and **nothing else**.
+    ///
+    /// The rung [`Back`](Self::Back) takes first, reached on its own rather than through the
+    /// ladder. That distinction is the whole reason this is not just `Back`: a press is
+    /// resolved against the frame the reader aimed at and acted on at the release, so a report
+    /// that goes in between would leave a `Back` to fall through onto the rung below — and the
+    /// rung below is the reader's filter. A dismissal with nothing to dismiss does nothing.
+    Dismiss,
     /// `←` `→` on a confirmation — move the highlight between the two answers.
     ///
     /// Arrows and **not `Tab`**: a modal quietly redefining a key is worst in the one place a
@@ -360,6 +368,10 @@ fn globals() -> Vec<Binding> {
             "filter by a regex over the whole path",
             Action::OpenFilter,
         ),
+        // A report in the footer is one of the levels, and the only one a reader cannot see a
+        // border around — so the footer says so itself, on the frames that have one to take
+        // away, rather than this sentence growing a list the overlay would clip. The order is
+        // in [`super::state::View::step_back`].
         bind(
             Global,
             &[Chord::plain(KeyCode::Esc)],
@@ -840,13 +852,15 @@ pub enum Target {
     Prompt,
     /// Outside whichever overlay is up.
     Away,
+    /// The footer, while it is saying what just happened.
+    Notice,
     /// Chrome, or a frame with nothing on it.
     Elsewhere,
 }
 
 impl Target {
     /// Every target there is, for the assertions over the table.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Heading,
         Self::Box,
         Self::Indicator,
@@ -858,6 +872,7 @@ impl Target {
         Self::Question,
         Self::Prompt,
         Self::Away,
+        Self::Notice,
         Self::Elsewhere,
     ];
 
@@ -882,6 +897,7 @@ impl Target {
             Spot::Confirm => Self::Question,
             Spot::Prompt => Self::Prompt,
             Spot::Outside => Self::Away,
+            Spot::Notice => Self::Notice,
             Spot::Nowhere => Self::Elsewhere,
         }
     }
@@ -995,6 +1011,16 @@ static POINTER: LazyLock<Vec<Pointing>> = LazyLock::new(|| {
             "outside an overlay",
             "close it, exactly as Esc does",
             dismiss,
+        ),
+        // The same rung `Esc` takes first, reached by hand: a reader who is already pointing
+        // should not have to go back to the keyboard to be rid of a line they have finished
+        // reading. Why it is not simply `Back` is in [`Action::Dismiss`].
+        point(
+            Gesture::Click,
+            &[Target::Notice],
+            "what the footer is saying",
+            "dismiss what it says",
+            take_away,
         ),
         point(
             Gesture::Wheel(Motion::Down),
@@ -1112,6 +1138,10 @@ fn dismiss(_: Gesture, _: Spot) -> Action {
     Action::Back
 }
 
+fn take_away(_: Gesture, _: Spot) -> Action {
+    Action::Dismiss
+}
+
 fn scroll_rows(gesture: Gesture, _: Spot) -> Action {
     gesture.motion().map_or(Action::Ignore, Action::ScrollRows)
 }
@@ -1202,6 +1232,7 @@ mod tests {
             Target::Question => Spot::Confirm,
             Target::Prompt => Spot::Prompt,
             Target::Away => Spot::Outside,
+            Target::Notice => Spot::Notice,
             Target::Elsewhere => Spot::Nowhere,
         }
     }

@@ -93,7 +93,7 @@ use crate::{Ruleset, WalkError};
 use chrome::{Chrome, Decor, Status};
 use keymap::{Action, Gesture, Motion, action_for, finish};
 use render::{Placed, Spot};
-use state::{Effect, Pending, View, plural};
+use state::{Effect, Notice, Pending, View, plural};
 use treemap::{Pane, Screen};
 
 /// How long the loop waits on the terminal before repainting anyway.
@@ -642,7 +642,7 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
                     // most of the tree in and exits zero on.
                     view.repriced(
                         &returned.0,
-                        "the pricing ended without reporting what it did".to_owned(),
+                        Notice::standing("the pricing ended without reporting what it did"),
                     );
                     pricer = None;
                 }
@@ -715,8 +715,10 @@ fn reap(
         outcome.failures += 1;
         // The freed total is left where it stands: a removal that said nothing is a removal
         // that gave no figure, and inventing one is the opposite of what this branch is for.
+        // Standing, for the same reason: a thread that died mid-batch is counted as a failure
+        // on the line above, and this sentence is where a reader learns of it.
         view.deleted(
-            "the removal ended without reporting what it did".to_owned(),
+            Notice::standing("the removal ended without reporting what it did"),
             outcome.freed,
         );
     }
@@ -752,11 +754,13 @@ fn drain(view: &mut View, inbox: &Receiver<Message>, outcome: &mut Outcome) {
                 // The walk's rule, kept: a pass that could not read everything makes every
                 // total it fed a lower bound, and the header says so beside the numbers.
                 outcome.errors.extend(errors);
-                let said = format!(
-                    "priced {}",
-                    plural(claims.len(), "directory", "directories")
+                view.repriced(
+                    &claims,
+                    Notice::passing(format!(
+                        "priced {}",
+                        plural(claims.len(), "directory", "directories")
+                    )),
                 );
-                view.repriced(&claims, said);
             }
             Ok(Message::Deleted(removal)) => {
                 outcome.failures += removal.failures.len();
@@ -898,7 +902,14 @@ fn scanned(view: &View) -> String {
 ///
 /// Failures and refusals are named as counts rather than swallowed: a batch where half the
 /// targets were left standing has to say so, and the rows are still there to be looked at.
-fn summarise(removal: &Removal) -> String {
+///
+/// Naming one is also what decides how long the sentence lasts. A clean removal is a
+/// [`Notice::passing`] — the reader's next keystroke has seen it off, and the tree it describes
+/// is the tree in front of them. A removal that left something behind is a
+/// [`Notice::standing`]: those counts are what the run exits non-zero on, so this line is the
+/// only place a reader who is not reading the exit status learns of them, and an arrow key
+/// pressed while reading must not be what takes it away.
+fn summarise(removal: &Removal) -> Notice {
     let mut said = vec![format!(
         "removed {} from {}",
         human(removal.bytes_freed()),
@@ -916,7 +927,12 @@ fn summarise(removal: &Removal) -> String {
             plural(removal.failures.len(), "directory", "directories")
         ));
     }
-    said.join(", ")
+    let said = said.join(", ");
+    if removal.kept.is_empty() && removal.failures.is_empty() {
+        Notice::passing(said)
+    } else {
+        Notice::standing(said)
+    }
 }
 
 /// The size mode a live view runs under.
@@ -1232,10 +1248,26 @@ mod tests {
                 message: "busy".to_owned(),
             }],
         };
-        let said = summarise(&removal);
+        let notice = summarise(&removal);
+        let said = notice.said();
         assert!(said.contains("removed 1.0 KiB from 1 directory"), "{said}");
         assert!(said.contains("1 directory left alone"), "{said}");
         assert!(said.contains("1 directory failed"), "{said}");
+        // Naming either of them is what makes the sentence wait to be dismissed: these counts
+        // are what the run exits non-zero on, so an arrow key must not be what clears them.
+        assert!(notice.stands(), "{said}");
+    }
+
+    #[test]
+    fn a_removal_that_left_nothing_behind_does_not_have_to_be_dismissed() {
+        let notice = summarise(&Removal {
+            removed: vec![removed("/scan/a/target")],
+            ..Removal::default()
+        });
+        assert_eq!(notice.said(), "removed 1.0 KiB from 1 directory");
+        // Nothing was refused and nothing failed, so there is nothing here a reader has to be
+        // given the chance to have seen: the next thing they do takes it away.
+        assert!(!notice.stands());
     }
 
     // ---- the pointer's gestures -------------------------------------------------------
