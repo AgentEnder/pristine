@@ -605,8 +605,8 @@ mod tests {
     use crate::fixture::{hit, priced};
     use crate::size::Size;
     use crate::tree::Tree;
-    use crate::tui::keymap::Action;
-    use crate::tui::state::{Answer, Pending, View};
+    use crate::tui::keymap::{Action, Turn};
+    use crate::tui::state::{Planned, View};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -862,6 +862,9 @@ mod tests {
 
         view.found(hit("/scan/a/node_modules", Size::Unmeasured, 0));
         view.found(priced("/scan/b/target", 2048));
+        // Synced first, exactly as the loop does before it asks: the rolled-up numbers are
+        // recomputed once per frame, so reading them without one is reading last frame's.
+        view.sync();
         // One of two priced, while the walk is still running.
         assert_eq!(Status::of(&view, 0), Status::Pricing(50));
 
@@ -869,6 +872,7 @@ mod tests {
             std::path::Path::new("/scan/a/node_modules"),
             Size::Measured(1024),
         );
+        view.sync();
         assert_eq!(Status::of(&view, 0), Status::Scanning(3072));
 
         view.scanned();
@@ -891,16 +895,19 @@ mod tests {
         view.found(priced("/scan/c/node_modules", 1024));
         view.found(priced("/scan/d/node_modules", 1024));
         view.scanned();
-        view.ask(Pending {
-            targets: ["a", "b", "c", "d"]
+        view.asking(
+            &["a", "b", "c", "d"]
                 .iter()
-                .map(|name| PathBuf::from(format!("/scan/{name}/node_modules")))
-                .collect(),
-            bytes: 4096,
-            unpriced: 0,
-            kept: Vec::new(),
-            answer: Answer::Delete,
-        });
+                .map(|name| {
+                    Planned::at(
+                        PathBuf::from(format!("/scan/{name}/node_modules")),
+                        Size::Measured(1024),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            &[],
+        );
+        view.apply(Action::Highlight(Turn::Next));
         view.apply(Action::Answer);
 
         // A bar rather than the indeterminate throbber the walk gets: the denominator was
@@ -940,6 +947,7 @@ mod tests {
                 0,
             ));
         }
+        view.sync();
         assert_eq!(Status::of(&view, 0), Status::Pricing(0));
         view.scanned();
         assert_eq!(Status::of(&view, 0), Status::Idle(0));

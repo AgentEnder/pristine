@@ -44,6 +44,7 @@ use std::sync::LazyLock;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use super::render::{Spot, Zone};
+use crate::rules::Kind;
 use crate::tree::Order;
 
 /// Where a motion key wants the cursor.
@@ -156,6 +157,26 @@ pub enum Action {
     ScrollRows(Motion),
     /// `/` — open the filter prompt.
     OpenFilter,
+    /// `f` `F` — the next named view, or the one before.
+    ///
+    /// A view is the two axes of [`super::lens`] together, and this key walks the presets over
+    /// them. Deliberately **not** a key that changes the selection: what is marked is
+    /// independent of what is visible, and the whole point of the pair is that a reader can
+    /// narrow the screen without narrowing what they are about to delete.
+    CyclePreset(Turn),
+    /// `t` — move the **tier** axis on its own: named, named + gitignored, gitignored.
+    ///
+    /// The presets are shortcuts through four points; this and [`ToggleKind`](Self::ToggleKind)
+    /// are what make every *other* point reachable. Without them "show me every cache a rule
+    /// named" is a combination the model can hold and no reader can ask for, which is not what
+    /// "stays expressible" can mean.
+    CycleTiers,
+    /// `d` `b` `c` — turn one **kind** on or off, leaving the other two and the tier axis
+    /// exactly as they were.
+    ///
+    /// One key per member rather than a cycle, because a set of three has eight states and a
+    /// cycle through eight is a key nobody can aim.
+    ToggleKind(Kind),
     /// A printable character, while the prompt has it.
     ///
     /// **Not in [`KEYMAP`]**, and it could not be: it stands for every character a terminal
@@ -197,6 +218,17 @@ pub enum Action {
     Answer,
     /// `↑` `↓` inside the help overlay.
     Scroll(Motion),
+    /// `↑` `↓` on a confirmation — move down the batch it is listing.
+    ///
+    /// Distinct from [`Scroll`](Self::Scroll), which moves a document with no cursor in it:
+    /// here the line under the cursor is a directory, and [`Spare`](Self::Spare) acts on it.
+    Listing(Motion),
+    /// `space` on a confirmation — take the highlighted directory out of the batch.
+    ///
+    /// The tree's own mark key, on the one screen where a reader can see everything they
+    /// marked at once. It is what makes the listing an answer to a surprise rather than a
+    /// notification of one.
+    Spare,
     /// A key with no meaning here, or a resize. Any event redraws, so this is genuinely
     /// nothing — the resize included, which needs only the frame.
     Ignore,
@@ -385,6 +417,21 @@ fn globals() -> Vec<Binding> {
 fn tree_keys() -> Vec<Binding> {
     let mut map = tree_motion();
     map.extend(tree_verbs());
+    // One key per kind, derived rather than listed, so a fourth kind in #623's vocabulary
+    // arrives already filterable, already documented and already dispatched. The `match` is
+    // what makes that true rather than hopeful: adding a kind stops this compiling.
+    for kind in Kind::ALL {
+        map.push(bind(
+            Surface::Tree,
+            &[key(kind_key(kind))],
+            match kind {
+                Kind::Dependencies => "show or hide installed dependencies",
+                Kind::Build => "show or hide compiled output",
+                Kind::Cache => "show or hide caches",
+            },
+            Action::ToggleKind(kind),
+        ));
+    }
     // One digit per order, derived rather than listed, so the key, the help row and the
     // dispatch for a fourth ordering all arrive together.
     for (nth, order) in Order::ALL.iter().enumerate() {
@@ -505,6 +552,24 @@ fn tree_verbs() -> Vec<Binding> {
             &[key('m')],
             "show or hide the map beside the tree",
             Action::ToggleMap,
+        ),
+        bind(
+            Tree,
+            &[key('f')],
+            "the next view: default, dependencies, all-ignored, all",
+            Action::CyclePreset(Turn::Next),
+        ),
+        bind(
+            Tree,
+            &[key('F')],
+            "the view before it",
+            Action::CyclePreset(Turn::Prev),
+        ),
+        bind(
+            Tree,
+            &[key('t')],
+            "which tiers are shown, on its own: named, both, gitignored",
+            Action::CycleTiers,
         ),
         bind(Tree, &[key('s')], "the next sort key", Action::CycleSort),
         bind(
@@ -672,7 +737,66 @@ fn confirm_keys() -> Vec<Binding> {
             "answer with the highlighted one",
             Action::Answer,
         ),
+        // ---- and the batch it is listing -----------------------------
+        //
+        // `↑`/`↓` rather than `←`/`→`, which are the answers: the two are a list and a pair of
+        // buttons, and a modal that made one key mean both would be worst in the one place a
+        // reader is being asked to be careful.
+        bind(
+            Confirm,
+            &[Chord::plain(KeyCode::Up), key('k')],
+            "up the batch it is listing",
+            Action::Listing(Motion::Up),
+        ),
+        bind(
+            Confirm,
+            &[Chord::plain(KeyCode::Down), key('j')],
+            "down the batch",
+            Action::Listing(Motion::Down),
+        ),
+        bind(
+            Confirm,
+            &[Chord::plain(KeyCode::PageUp)],
+            "up a page of it",
+            Action::Listing(Motion::PageUp),
+        ),
+        bind(
+            Confirm,
+            &[Chord::plain(KeyCode::PageDown)],
+            "down a page",
+            Action::Listing(Motion::PageDown),
+        ),
+        bind(
+            Confirm,
+            &[Chord::plain(KeyCode::Home), key('g')],
+            "to the first entry",
+            Action::Listing(Motion::Top),
+        ),
+        bind(
+            Confirm,
+            &[Chord::plain(KeyCode::End), key('G')],
+            "to the last",
+            Action::Listing(Motion::Bottom),
+        ),
+        bind(
+            Confirm,
+            &[key(' ')],
+            "take the highlighted directory out of the batch",
+            Action::Spare,
+        ),
     ]
+}
+
+/// Which letter toggles this kind.
+///
+/// The initial of the word the help page prints for it, which is the only mnemonic worth having
+/// — and a `match` rather than a table, so a fourth kind cannot arrive without one.
+const fn kind_key(kind: Kind) -> char {
+    match kind {
+        Kind::Dependencies => 'd',
+        Kind::Build => 'b',
+        Kind::Cache => 'c',
+    }
 }
 
 /// The digit key for the `nth` member of a positional group, counting from 1.
@@ -1036,6 +1160,17 @@ static POINTER: LazyLock<Vec<Pointing>> = LazyLock::new(|| {
             "scroll the page",
             scroll_page,
         ),
+        // A confirmation used to be eight static lines, and a wheel over it was rightly
+        // nothing: it is not a way past something that swallowed the keyboard. It now lists
+        // the whole batch, which is a document with a cursor in it, and a list nothing can
+        // scroll while everything beside it scrolls is a list a reader will believe is short.
+        point(
+            Gesture::Wheel(Motion::Down),
+            &[Target::Question, Target::Answer],
+            "a confirmation",
+            "move down the batch it is listing",
+            walk_listing,
+        ),
     ]
 });
 
@@ -1150,6 +1285,10 @@ fn scroll_page(gesture: Gesture, _: Spot) -> Action {
     gesture.motion().map_or(Action::Ignore, Action::Scroll)
 }
 
+fn walk_listing(gesture: Gesture, _: Spot) -> Action {
+    gesture.motion().map_or(Action::Ignore, Action::Listing)
+}
+
 /// The help page, as headed groups of `(keys, sentence)`.
 ///
 /// Generated from the tables rather than written, which is what keeps it honest: a binding
@@ -1190,6 +1329,7 @@ mod tests {
         Action, Chord, Gesture, Motion, Overlay, Spot, Surface, Target, Turn, Zone, action_for,
         bindings, finish, help, lookup, pointer, pointing,
     };
+    use crate::rules::Kind;
     use crate::tree::{NodeId, Order};
     use crate::tui::state::Answer;
     use ratatui::crossterm::event::{
@@ -1355,7 +1495,12 @@ mod tests {
             ),
             Action::Cursor(Motion::PageDown)
         );
-        assert_eq!(action_for(&letter('d'), None), Action::Ignore);
+        // …and the bare letter is its own binding, which is exactly why the modifier has to
+        // be checked first: `d` toggles a kind and `Ctrl-d` moves half a page.
+        assert_eq!(
+            action_for(&letter('d'), None),
+            Action::ToggleKind(Kind::Dependencies)
+        );
     }
 
     #[test]
@@ -1527,13 +1672,21 @@ mod tests {
             pointer(Gesture::Wheel(Motion::Down), Spot::Help),
             Action::Scroll(Motion::Down)
         );
-        for spot in [Spot::Confirm, Spot::Answer(Answer::Delete), Spot::Nowhere] {
+        // Over a confirmation it moves down the batch the box is listing. That is not a way
+        // past something that swallowed the keyboard — the answers are untouched — it is the
+        // one verb a list of eight thousand directories has, and a list nothing can scroll
+        // while everything beside it scrolls is a list a reader will believe is short.
+        for spot in [Spot::Confirm, Spot::Answer(Answer::Delete)] {
             assert_eq!(
                 pointer(Gesture::Wheel(Motion::Down), spot),
-                Action::Ignore,
+                Action::Listing(Motion::Down),
                 "{spot:?}"
             );
         }
+        assert_eq!(
+            pointer(Gesture::Wheel(Motion::Down), Spot::Nowhere),
+            Action::Ignore
+        );
     }
 
     #[test]

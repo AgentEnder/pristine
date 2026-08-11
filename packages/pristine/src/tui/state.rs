@@ -69,8 +69,10 @@ use std::time::Instant;
 use regex::Regex;
 
 use super::keymap::{Action, Motion, Overlay, Turn};
+use super::lens::{Lens, Preset};
 use super::moving::Moving;
 use crate::delete::{Plan, Refused, Target};
+use crate::rules::Kind;
 use crate::size::{Size, human};
 use crate::tree::{NodeId, Order, Sort, Tree};
 use crate::walk::Hit;
@@ -217,47 +219,206 @@ pub(super) fn percent(part: usize, whole: usize) -> u8 {
     u8::try_from(scaled.min(100)).unwrap_or(100)
 }
 
+/// One directory a resolved plan is going to remove, as the confirmation needs it.
+///
+/// The half of a [`crate::delete::PlanTarget`] this screen reads, restated so the screen can
+/// be driven without a filesystem: both spellings of the path, and what the scan priced it at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Planned {
+    /// The path as the scan spelled it, which is what the tree holds.
+    pub requested: PathBuf,
+    /// The path the deleter will unlink.
+    pub resolved: PathBuf,
+    /// What the scan knew about its size.
+    pub size: Size,
+}
+
+impl Planned {
+    /// A target whose two spellings are the same, which is every target outside a symlinked
+    /// ancestor.
+    #[must_use]
+    pub fn at(path: impl Into<PathBuf>, size: Size) -> Self {
+        let path = path.into();
+        Self {
+            requested: path.clone(),
+            resolved: path,
+            size,
+        }
+    }
+}
+
+/// One line of the batch a confirmation lists.
+///
+/// Everything a reader needs in order to recognise a directory they marked several views ago:
+/// where it is, what it is, what it is worth, whether they can currently *see* it, and whether
+/// the safety model is going to refuse it anyway.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entry {
+    /// Which directory, by identity. What `space` on this line acts on, for the reason every
+    /// other action in this file names a [`NodeId`]: the tree moves while a dialog is up.
+    ///
+    /// `None` for a path the tree no longer holds, which is a line that can be read and not
+    /// unmarked — the honest state rather than a line that quietly does nothing.
+    pub id: Option<NodeId>,
+    /// Where it is, spelled as the scan spelled it — which is what the tree holds and what a
+    /// reader recognises.
+    pub path: PathBuf,
+    /// The **resolved** path the deleter would unlink, when this line is going to be removed
+    /// at all. `None` on a line the safety model refused.
+    ///
+    /// Two paths rather than one because the planner resolves `..` and symlinked ancestors,
+    /// and on macOS that is not exotic: a scan of `/var/…` plans against `/private/var/…`.
+    /// Taking a line out of the batch has to name the same path the deed does, or the deed
+    /// would keep a directory the listing had stopped showing.
+    pub target: Option<PathBuf>,
+    /// What it is, which is also what the listing groups by. `None` is the tier-two claim's
+    /// own content rather than a gap: nothing named it.
+    pub kind: Option<Kind>,
+    /// The ecosystem and the kind, as a row of the tree would say it.
+    pub label: String,
+    /// What the scan priced it at, which on a default scan is nothing.
+    pub size: Size,
+    /// Whether the **current** view is hiding it. The point of the screen: a reader marks
+    /// broadly under one view, narrows, forgets, and is about to confirm a deletion whose
+    /// contents they cannot see.
+    pub hidden: bool,
+    /// Why the safety model is going to leave it standing, if it is.
+    ///
+    /// Said *here*, before the reader commits, rather than in the post-run report — which is
+    /// the same refusal reporting, moved to the moment it can still change a decision.
+    pub kept: Option<String>,
+}
+
 /// The question the delete key asks, and everything it is holding while it asks.
 ///
 /// It carries the **targets the plan resolved**, not "whatever is marked when the answer is
 /// taken". The tree moves while a dialog is up — claims arrive, prices land, an earlier
 /// deletion finishes — and a deed that re-read the marks at the moment of the answer would
 /// remove a different set from the one the box described.
+///
+/// # It lists the batch, and that is the safety half of orthogonal selection
+///
+/// A selection that is independent of what is visible creates a hazard that did not exist when
+/// the two were the same thing, and the mitigation is that the box **shows what it is holding**
+/// — grouped by kind, with the hidden entries named as hidden and every one of them
+/// unmarkable from here. The answer to a surprise has to be better than "cancel and start
+/// again".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pending {
     /// Exactly what will be removed.
     pub targets: Vec<PathBuf>,
+    /// Every directory the batch touched, refused ones included — what the listing draws.
+    pub entries: Vec<Entry>,
     /// What the plan says that is worth, which is only the part anybody has priced.
     pub bytes: u64,
     /// How many of the targets carry no price.
     pub unpriced: usize,
-    /// Directories the plan refused, with the reason, so the box can say what it is *not*
-    /// going to do. The safety model working is not an error, but it is news.
-    pub kept: Vec<String>,
+    /// How the view that is hiding some of this spells itself, so the warning can name it.
+    pub view: String,
+    /// Which line the reader is on.
+    at: usize,
+    /// The first line drawn. Held here rather than derived, so a listing does not jump under
+    /// a reader moving back up it.
+    scroll: usize,
+    /// How many lines the box has room for. The renderer owns the number and tells the view,
+    /// exactly as it does for the tree's own viewport.
+    page: usize,
     /// Which answer is highlighted. Starts on cancel — the key a reader presses to get rid of
     /// what is in front of them has to be the safe one.
     pub answer: Answer,
 }
 
 impl Pending {
-    /// The question a resolved [`Plan`] asks.
+    /// The lines, in the order they are drawn: grouped by kind, and by path inside a group.
     #[must_use]
-    pub fn of(plan: &Plan) -> Self {
-        Self {
-            targets: plan
-                .targets()
-                .iter()
-                .map(|target| target.path.clone())
-                .collect(),
-            bytes: plan.measured_bytes(),
-            unpriced: plan.unpriced(),
-            kept: plan
-                .kept()
-                .iter()
-                .map(|refused| format!("{}: {}", refused.path.display(), refused.reason))
-                .collect(),
-            answer: Answer::Cancel,
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    /// Which line the cursor is on.
+    #[must_use]
+    pub fn at(&self) -> usize {
+        self.at
+    }
+
+    /// The first line drawn.
+    #[must_use]
+    pub fn scroll(&self) -> usize {
+        self.scroll
+    }
+
+    /// How many lines the box has room for.
+    #[must_use]
+    pub fn page(&self) -> usize {
+        self.page
+    }
+
+    /// How many of the entries the current view is hiding.
+    #[must_use]
+    pub fn hidden(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.hidden).count()
+    }
+
+    /// How many the safety model will leave standing.
+    #[must_use]
+    pub fn kept(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.kept.is_some())
+            .count()
+    }
+
+    /// The line under the cursor.
+    fn current(&self) -> Option<&Entry> {
+        self.entries.get(self.at)
+    }
+
+    /// Moves the cursor, and the listing under it.
+    fn walk(&mut self, motion: Motion) {
+        let Some(last) = self.entries.len().checked_sub(1) else {
+            return;
+        };
+        let page = self.page.max(1);
+        self.at = match motion {
+            Motion::Up => self.at.saturating_sub(1),
+            Motion::Down => (self.at + 1).min(last),
+            Motion::PageUp => self.at.saturating_sub(page),
+            Motion::PageDown => (self.at + page).min(last),
+            Motion::Top => 0,
+            Motion::Bottom => last,
+        };
+        self.follow();
+    }
+
+    /// Keeps the drawn window over the cursor, and inside the entries either way.
+    fn follow(&mut self) {
+        let page = self.page.max(1);
+        if self.at < self.scroll {
+            self.scroll = self.at;
+        } else if self.at >= self.scroll + page {
+            self.scroll = self.at + 1 - page;
         }
+        self.scroll = self.scroll.min(self.entries.len().saturating_sub(1));
+    }
+
+    /// Takes one line out of the batch: the deed shrinks with the listing, because a dialog
+    /// that showed one thing and removed another would be the failure this type exists to
+    /// prevent.
+    fn drop_at(&mut self, at: usize) -> Option<Entry> {
+        if at >= self.entries.len() {
+            return None;
+        }
+        let entry = self.entries.remove(at);
+        if let Some(target) = &entry.target {
+            self.targets.retain(|path| path != target);
+        }
+        self.bytes = self.bytes.saturating_sub(entry.size.bytes().unwrap_or(0));
+        if entry.kept.is_none() && entry.size.bytes().is_none() {
+            self.unpriced = self.unpriced.saturating_sub(1);
+        }
+        self.at = self.at.min(self.entries.len().saturating_sub(1));
+        self.follow();
+        Some(entry)
     }
 }
 
@@ -344,74 +505,199 @@ impl Prompt {
     }
 }
 
-/// An applied filter, and what it makes each surviving node worth.
+/// One mark: a directory, and the view the reader was looking through when they made it.
 ///
-/// The rolled-up numbers are recomputed rather than read off the tree, and that is a **safety**
-/// property before it is a cosmetic one. A row showing 312 GiB while the filter hides all but
-/// 2 GiB of it is a row whose mark would delete 310 GiB the reader cannot see. Under a filter,
-/// a row's number, its selection counter and its batch all describe the same thing: the claims
-/// that match.
-#[derive(Debug)]
-struct Filter {
-    pattern: String,
-    regex: Regex,
-    /// Only the nodes with at least one matching claim beneath them. Absent means hidden.
-    rolls: HashMap<NodeId, Roll>,
+/// **A mark cannot be stored as "the subtree under N", and that is the load-bearing
+/// constraint.** Toggling what is visible must never change what is selected, so if a mark
+/// were only a node, re-deriving what it covers under a different view would silently change
+/// the batch — which is precisely the behaviour being ruled out. Baking the lens into the mark
+/// is what makes switching views *inert*.
+///
+/// It is a pair resolved on demand rather than a frozen list of ids for a reason specific to
+/// this tool: **results stream in**. A subtree marked at seven seconds would otherwise never
+/// include the claims that arrive at forty, and "mark this directory" plainly means the
+/// directory rather than the eleven things anybody had found under it so far.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Marked {
+    /// Which directory. A [`NodeId`], never a row index — rows re-sort as prices land and
+    /// vanish as removals complete, so an index taken now and acted on later names a
+    /// different directory.
+    root: NodeId,
+    /// What "everything under it" meant when the reader said it.
+    lens: Lens,
 }
 
-impl Filter {
-    fn new(pattern: &str) -> Result<Self, regex::Error> {
-        Ok(Self {
-            pattern: pattern.to_owned(),
-            regex: Regex::new(pattern)?,
-            rolls: HashMap::new(),
-        })
-    }
+/// What one node is worth, three ways.
+///
+/// Carried together because they are three answers to one traversal and because two of them
+/// disagreeing is the arithmetic a reader would catch first. The pair that has to be allowed
+/// to differ is [`visible`](Self::visible) against [`all`](Self::all): a selection made
+/// through one view and read under another is exactly the hazard the confirmation exists to
+/// mitigate, and hiding it by making the batch filter-relative would contradict "retained".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Counts {
+    /// Claims under this node that survive the current lens — what its row draws.
+    visible: Roll,
+    /// Of those, the ones the marks select. What the mark glyph is computed from, so the
+    /// glyph describes **what the reader can see** rather than a global fact that would
+    /// contradict it.
+    chosen: Roll,
+    /// Everything the marks select under this node, visible or not: the batch, and the number
+    /// the footer states.
+    all: Roll,
+}
 
-    /// Re-asks the whole tree what matches.
-    ///
-    /// Whole, on every change, rather than incrementally: the scan streams claims into
-    /// arbitrary places in the tree, so an incremental update would have to be right about
-    /// every arrival, every price and every deletion — three chances to leave a stale number
-    /// on a row that a mark then acts on. One post-order pass over 22,765 nodes is a fraction
-    /// of a frame.
-    fn recompute(&mut self, tree: &Tree) {
-        self.rolls.clear();
-        // An explicit stack rather than recursion: the depth here is the filesystem's, and
-        // nothing stops a checkout from being nested far deeper than the ten levels a real
-        // home directory reaches.
-        let mut stack = vec![(tree.root(), false)];
-        while let Some((id, folding)) = stack.pop() {
-            let node = tree.node(id);
-            if let Some(hit) = &node.hit {
-                if self.regex.is_match(&hit.path.to_string_lossy()) {
-                    self.rolls.insert(
-                        id,
-                        Roll {
-                            bytes: node.reclaimable,
-                            claims: 1,
-                            unpriced: node.unmeasured,
-                        },
+impl Counts {
+    /// Folds a child in.
+    fn absorb(&mut self, child: Self) {
+        add(&mut self.visible, child.visible);
+        add(&mut self.chosen, child.chosen);
+        add(&mut self.all, child.all);
+    }
+}
+
+/// Adds one roll into another.
+fn add(into: &mut Roll, roll: Roll) {
+    into.bytes += roll.bytes;
+    into.claims += roll.claims;
+    into.unpriced += roll.unpriced;
+}
+
+/// A node [`tally`] is holding a mark for.
+const MARKED: u8 = 1;
+/// A node the reader has individually spared.
+const SPARED: u8 = 2;
+
+/// A step of the one traversal that answers everything the marks and the lens decide.
+enum Step {
+    /// On the way down, carrying how deep this node is.
+    Enter(NodeId, usize),
+    /// On the way back up, where the children's numbers are already in.
+    Leave(NodeId, usize),
+}
+
+/// Walks the whole tree once, saying what each node is worth and which claims are selected.
+///
+/// # Why one pass rather than three
+///
+/// The rolled-up numbers are recomputed rather than read off the tree, and that is a **safety**
+/// property before it is a cosmetic one: a row showing 312 GiB while the view hides all but 2
+/// GiB of it is a row whose glyph would claim to describe something it does not. Whole, on
+/// every change, rather than incrementally — the scan streams claims into arbitrary places in
+/// the tree, so an incremental update would have to be right about every arrival, every price
+/// and every deletion, which is three chances to leave a stale number on a row that a mark then
+/// acts on.
+///
+/// The selection is folded into the same pass rather than derived afterwards, because the
+/// counter and the batch **must** be the same set. Two traversals that could disagree is the
+/// bug this file already refuses everywhere else.
+///
+/// # Which marks cover a claim, and which spare it
+///
+/// Both are carried down the path rather than looked up per claim, so this stays O(the tree)
+/// with a handful of live entries rather than O(claims × marks × depth). They are kept with
+/// their **depths** because the two interleave: a reader can mark `~/repos`, spare
+/// `~/repos/a`, and then mark `~/repos/a/b` again — and the deepest thing on the path is the
+/// one that speaks. A shallower mark cannot reach back through a spare below it.
+fn tally(
+    tree: &Tree,
+    lens: &Lens,
+    marks: &[Marked],
+    spared: &HashSet<NodeId>,
+    moving: &Moving,
+    counts: &mut Vec<Counts>,
+    selection: &mut Vec<NodeId>,
+) {
+    // Indexed by [`NodeId`] rather than hashed on it, and that is the difference between a
+    // fifth of a frame and a whole one: this runs over 32,634 nodes and the ids are dense —
+    // the tree only ever pushes a slot and never recycles a detached one. A `HashMap` here
+    // costs four `SipHash`es per node for what an index answers for nothing.
+    counts.clear();
+    counts.resize(tree.minted(), Counts::default());
+    selection.clear();
+    // One byte per node saying whether anything at all happens here, so the O(marks) scan that
+    // finds *which* mark only runs on the handful of nodes that carry one.
+    let mut flags = vec![0u8; tree.minted()];
+    for mark in marks {
+        flags[mark.root] |= MARKED;
+    }
+    for &id in spared {
+        flags[id] |= SPARED;
+    }
+    let mut covering: Vec<(usize, &Lens)> = Vec::new();
+    let mut sparing: Vec<usize> = Vec::new();
+    // An explicit stack rather than recursion: the depth here is the filesystem's, and nothing
+    // stops a checkout from being nested far deeper than the ten levels a real home directory
+    // reaches.
+    let mut stack = vec![Step::Enter(tree.root(), 0)];
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Enter(id, depth) => {
+                if flags[id] & MARKED != 0 {
+                    covering.extend(
+                        marks
+                            .iter()
+                            .filter(|mark| mark.root == id)
+                            .map(|mark| (depth, &mark.lens)),
                     );
                 }
-            } else if folding {
-                let roll = node
-                    .children
-                    .iter()
-                    .fold(Roll::default(), |mut roll, child| {
-                        let child = self.rolls.get(child).copied().unwrap_or_default();
-                        roll.bytes += child.bytes;
-                        roll.claims += child.claims;
-                        roll.unpriced += child.unpriced;
-                        roll
-                    });
-                if roll.claims > 0 {
-                    self.rolls.insert(id, roll);
+                if flags[id] & SPARED != 0 {
+                    sparing.push(depth);
                 }
-            } else {
-                stack.push((id, true));
-                for &child in &node.children {
-                    stack.push((child, false));
+                stack.push(Step::Leave(id, depth));
+                for &child in &tree.node(id).children {
+                    stack.push(Step::Enter(child, depth + 1));
+                }
+            }
+            Step::Leave(id, depth) => {
+                let node = tree.node(id);
+                let mut here = Counts::default();
+                if let Some(hit) = &node.hit {
+                    let roll = Roll {
+                        bytes: node.reclaimable,
+                        claims: 1,
+                        unpriced: node.unmeasured,
+                    };
+                    let seen = lens.matches(hit);
+                    if seen {
+                        here.visible = roll;
+                    }
+                    let deepest = sparing.last().copied();
+                    let chosen = covering.iter().any(|&(at, mark)| {
+                        deepest.is_none_or(|spared| at > spared) && mark.matches(hit)
+                    });
+                    // The deleter's two phases come off the selection at different moments,
+                    // and both timings are load-bearing. A target part way through is a
+                    // directory that **still exists**: its bytes have gone, so the counter
+                    // says so, but "how many directories" must not drop until the sweep says
+                    // it has finished — otherwise the footer reports a directory deleted
+                    // while it is being deleted. It is out of the *batch* from the first byte,
+                    // though: offering a directory that is already going to a second removal
+                    // would report a failure for the one thing that worked.
+                    if chosen && !moving.is_spent(id) {
+                        let counted = Roll {
+                            bytes: roll.bytes.saturating_sub(moving.freed_from(id)),
+                            ..roll
+                        };
+                        here.all = counted;
+                        if seen {
+                            here.chosen = counted;
+                        }
+                        if !moving.is_leaving(id) {
+                            selection.push(id);
+                        }
+                    }
+                } else {
+                    for &child in &node.children {
+                        here.absorb(counts[child]);
+                    }
+                }
+                counts[id] = here;
+                if flags[id] & MARKED != 0 {
+                    covering.retain(|&(at, _)| at != depth);
+                }
+                if flags[id] & SPARED != 0 {
+                    sparing.pop();
                 }
             }
         }
@@ -525,19 +811,23 @@ pub struct View {
     /// whole premise: a machine's worth of reclaimable directories, shown as a handful of
     /// rows you drill into.
     expanded: HashSet<NodeId>,
-    /// The roots of the marked subtrees. See the module docs.
-    marks: HashSet<NodeId>,
-    /// What is marked strictly below each node — what makes a partial state O(1) to ask about
-    /// instead of a subtree walk per row per frame.
+    /// The marked subtrees: a directory each, and the view each was marked through. See
+    /// [`Marked`].
+    marks: Vec<Marked>,
+    /// Directories the reader unmarked individually out of a marked subtree.
     ///
-    /// A [`Roll`] rather than a count, because a partial ancestor now says *how* partial it
-    /// is: the glyph is a block filled in proportion to the marked share of that subtree's
-    /// bytes, which is a real number put in one character. Recomputed whole from the marks
-    /// rather than adjusted as they change, for the reason the filter states about its own
-    /// rolls — bytes move under a mark as prices land and rows are deleted, and an
-    /// incremental count would have to be right about all of that. It costs one walk up the
-    /// ancestors per mark, and a reader has a handful of marks.
-    below: HashMap<NodeId, Roll>,
+    /// The other half of the model, and the reason a push-down is not needed: "mark the lot,
+    /// then keep this one" used to mean marking every sibling along the path, which left a
+    /// mark per sibling on a level 8,660 wide. An exclusion says the same thing in one entry
+    /// and — unlike the push-down — keeps saying it as claims stream in underneath.
+    spared: HashSet<NodeId>,
+    /// What each node is worth, what of it is selected, and what of that can be seen, by
+    /// [`NodeId`]. Rebuilt whole once per sync by [`tally`]; empty when there is nothing to
+    /// compute, which is the view a run opens on.
+    counts: Vec<Counts>,
+    /// Every claim the marks select, whether or not the current view shows it. The batch, and
+    /// the set the counter describes — one list, so the two can never disagree.
+    selection: Vec<NodeId>,
     rows: Vec<Row>,
     cursor: Option<usize>,
     /// Whether the cursor was deselected by something vanishing under it.
@@ -549,7 +839,12 @@ pub struct View {
     scroll: usize,
     /// How many rows the tree pane can draw. The renderer owns the number and tells the view.
     page: usize,
-    filter: Option<Filter>,
+    /// What is on screen: the two visibility axes and the `/` pattern, together.
+    ///
+    /// One value rather than a filter beside a mode, because a mark stores the whole of it —
+    /// a mark made under `named · dependencies · /nx` has to keep meaning that when any part
+    /// of it changes.
+    lens: Lens,
     prompt: Option<Prompt>,
     help: Option<usize>,
     pending: Option<Pending>,
@@ -640,14 +935,16 @@ impl View {
             seen: tree.minted(),
             tree,
             sort: Sort::default(),
-            marks: HashSet::new(),
-            below: HashMap::new(),
+            marks: Vec::new(),
+            spared: HashSet::new(),
+            counts: Vec::new(),
+            selection: Vec::new(),
             rows: Vec::new(),
             cursor: None,
             deselected: false,
             scroll: 0,
             page: 20,
-            filter: None,
+            lens: Lens::default(),
             prompt: None,
             help: None,
             pending: None,
@@ -840,24 +1137,138 @@ impl View {
 
     /// Opens the confirmation on a resolved plan.
     ///
+    /// The listing is built here rather than by the planner, because half of what a line says
+    /// is a fact about the *view* — what kind of artefact this is, and whether the reader can
+    /// currently see it — and the planner knows only paths and the safety model's answers.
+    /// The two halves meet exactly once, here.
+    ///
     /// An empty plan is not a question. It happens for a real reason — every marked directory
     /// was refused by the safety model — so it says so rather than putting up a box with
     /// nothing in it.
-    pub fn ask(&mut self, pending: Pending) {
-        if pending.targets.is_empty() {
-            let kept = pending.kept.len();
+    pub fn ask(&mut self, plan: &Plan) {
+        let targets: Vec<Planned> = plan
+            .targets()
+            .iter()
+            .map(|target| Planned {
+                requested: target.requested.clone(),
+                resolved: target.path.clone(),
+                size: target.size,
+            })
+            .collect();
+        self.asking(&targets, plan.kept());
+    }
+
+    /// The same question from the two lists a [`Plan`] *is*.
+    ///
+    /// Taken apart because a plan can only be built against a real filesystem, and the rule
+    /// this screen has to keep — that the batch is stated whole, hidden entries and refusals
+    /// included — is a rule about the view rather than about the disk.
+    pub fn asking(&mut self, targets: &[Planned], kept: &[Refused]) {
+        if targets.is_empty() {
             // A refusal, so it waits to be dismissed: this sentence is the *only* place a
-            // reader learns that the safety model took their whole batch away.
-            if kept == 0 {
+            // reader learns that the safety model took their whole batch away. It is also the
+            // one path on which the confirmation does not appear, so there is nothing else
+            // left saying anything about the batch at all.
+            if kept.is_empty() {
                 self.says("nothing to delete");
             } else {
                 self.warns(format!(
-                    "nothing to delete: {kept} left alone by the safety model"
+                    "nothing to delete: {} left alone by the safety model",
+                    kept.len()
                 ));
             }
             return;
         }
-        self.pending = Some(pending);
+        let mut entries: Vec<Entry> = targets
+            .iter()
+            .map(|target| {
+                self.entry(
+                    &target.requested,
+                    Some(target.resolved.clone()),
+                    target.size,
+                    None,
+                )
+            })
+            .chain(kept.iter().map(|refused| {
+                self.entry(
+                    &refused.path,
+                    None,
+                    Size::Unmeasured,
+                    Some(refused.reason.to_string()),
+                )
+            }))
+            .collect();
+        // By kind and then by path, which is what "groups by kind" means once the lines are
+        // one list: the renderer names the kind wherever it changes rather than keeping a
+        // second structure that could disagree about the order.
+        entries.sort_by(|a, b| {
+            kind_order(a.kind)
+                .cmp(&kind_order(b.kind))
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        // Added up over the **entries** rather than over the plan, so the headline and the
+        // lines under it are one arithmetic. They can differ: a target the scan priced and the
+        // plan did not is a dash in the plan and a number on the row, and a box saying "giving
+        // back 0 B" over a line saying 2.0 MiB is the disagreement a reader catches first.
+        let priced = |entry: &&Entry| entry.kept.is_none();
+        let bytes = entries
+            .iter()
+            .filter(priced)
+            .filter_map(|entry| entry.size.bytes())
+            .sum();
+        let unpriced = entries
+            .iter()
+            .filter(priced)
+            .filter(|entry| entry.size.bytes().is_none())
+            .count();
+        self.pending = Some(Pending {
+            targets: targets
+                .iter()
+                .map(|target| target.resolved.clone())
+                .collect(),
+            bytes,
+            unpriced,
+            entries,
+            view: self.lens.describe(),
+            at: 0,
+            scroll: 0,
+            page: 8,
+            answer: Answer::Cancel,
+        });
+    }
+
+    /// One line of the listing, with everything only the tree and the lens can say.
+    fn entry(
+        &self,
+        path: &Path,
+        target: Option<PathBuf>,
+        size: Size,
+        kept: Option<String>,
+    ) -> Entry {
+        let id = self.tree.find(path);
+        let hit = id.and_then(|id| self.tree.node(id).hit.as_ref());
+        Entry {
+            id,
+            path: path.to_path_buf(),
+            target,
+            kind: hit.and_then(Hit::kind),
+            label: hit.map_or_else(
+                || crate::walk::UNLABELLED.to_owned(),
+                |hit| hit.label().into_owned(),
+            ),
+            // The plan's own figure where it has one, and the tree's otherwise: a refusal
+            // carries no size, and a line saying nothing about what it is worth is a line a
+            // reader cannot weigh.
+            size: match size.bytes() {
+                Some(_) => size,
+                None => hit.map_or(Size::Unmeasured, |hit| hit.size),
+            },
+            // "Hidden" is a claim about the **view**, so a path the tree does not hold is not
+            // one: a view that hides nothing must never be able to report that it is hiding
+            // something, or the warning at the top of the box stops meaning anything.
+            hidden: hit.is_some_and(|hit| !self.lens.matches(hit)),
+            kept,
+        }
     }
 
     // ---- what the renderer asks -------------------------------------------------------
@@ -891,7 +1302,8 @@ impl View {
         // batch.
         let (tree, moving) = (&self.tree, &self.moving);
         self.marks
-            .retain(|&id| tree.is_attached(id) && !(moving.is_freeing(id) || moving.is_spent(id)));
+            .retain(|mark| tree.is_attached(mark.root) && !moving.is_leaving(mark.root));
+        self.spared.retain(|&id| tree.is_attached(id));
         self.expanded.retain(|&id| self.tree.is_attached(id));
         self.kept.retain(|&id, _| self.tree.is_attached(id));
         // A claim the reader deleted while a pricing thread was inside it never gets its
@@ -907,10 +1319,7 @@ impl View {
         {
             self.moving.cools(id);
         }
-        self.recount_marks();
-        if let Some(filter) = &mut self.filter {
-            filter.recompute(&self.tree);
-        }
+        self.recount();
         self.reflatten();
         self.settle(&anchor);
         self.follow_cursor();
@@ -1072,11 +1481,15 @@ impl View {
         self.expanded.contains(&id)
     }
 
-    /// What this row's subtree is worth — under the filter, when there is one.
+    /// What this row's subtree is worth — under the current view, which is the only number a
+    /// row is allowed to state.
     #[must_use]
     pub fn roll(&self, id: NodeId) -> Roll {
-        if let Some(filter) = &self.filter {
-            return filter.rolls.get(&id).copied().unwrap_or_default();
+        if self.is_sifted() {
+            return self
+                .counts
+                .get(id)
+                .map_or_else(Roll::default, |counts| counts.visible);
         }
         let node = self.tree.node(id);
         Roll {
@@ -1174,15 +1587,28 @@ impl View {
         self.kept.get(&id).map(String::as_str)
     }
 
-    /// How much of this row's subtree is marked.
+    /// How much of this row's subtree is marked, **as the current view shows it**.
+    ///
+    /// Filter-relative, and that is a correctness property rather than a nicety. A directory
+    /// can be entirely marked under `dependencies` and only partly marked under `all`, so a
+    /// glyph computed against the whole tree would contradict the rows the reader can see
+    /// directly underneath it. What the box says is a statement about this screen.
+    ///
+    /// A row with nothing visible under it is [`Mark::None`] rather than [`Mark::All`]: an
+    /// empty set is not something to draw as fully marked, and the row is not on screen
+    /// anyway.
     #[must_use]
     pub fn mark_of(&self, id: NodeId) -> Mark {
-        if self.covered(id) {
-            Mark::All
-        } else if self.below.get(&id).is_some_and(|roll| roll.claims > 0) {
-            Mark::Partial
-        } else {
+        let Some(counts) = self.counts.get(id) else {
+            return Mark::None;
+        };
+        let whole = self.roll(id).claims;
+        if counts.chosen.claims == 0 || whole == 0 {
             Mark::None
+        } else if counts.chosen.claims >= whole {
+            Mark::All
+        } else {
+            Mark::Partial
         }
     }
 
@@ -1194,11 +1620,14 @@ impl View {
     /// yet, where bytes cannot answer and the count is the only thing that is true.
     #[must_use]
     pub fn share(&self, id: NodeId) -> f64 {
-        if self.covered(id) {
+        if self.mark_of(id) == Mark::All {
             return 1.0;
         }
         let whole = self.roll(id);
-        let marked = self.below.get(&id).copied().unwrap_or_default();
+        let marked = self
+            .counts
+            .get(id)
+            .map_or_else(Roll::default, |counts| counts.chosen);
         #[expect(
             clippy::cast_precision_loss,
             reason = "a ratio bound for one of seven block glyphs has no precision to lose"
@@ -1218,31 +1647,90 @@ impl View {
 
     /// What is marked, all together — the selection counter.
     ///
+    /// **The whole selection, not the visible part of it.** Deleting acts on everything that
+    /// is marked, so a counter stating only what is on screen would be the one number a reader
+    /// checks disagreeing with the one thing the tool then does. What the view being narrowed
+    /// changes is [`View::hidden`] beside it, which says how much of this the reader cannot
+    /// currently see.
+    ///
     /// Net of the rows the deleter has already finished with, which are in the tree for
     /// another third of a second while they empty. They are out of [`View::batch`], so they
-    /// have to be out of the number that describes it: a counter and a batch that disagree is
-    /// exactly the arithmetic a reader would catch first.
+    /// have to be out of the number that describes it.
     #[must_use]
     pub fn marked(&self) -> Roll {
-        self.marks.iter().fold(Roll::default(), |mut total, &id| {
-            let roll = self.live(id);
-            total.bytes += roll.bytes;
-            total.claims += roll.claims;
-            total.unpriced += roll.unpriced;
-            total
-        })
+        self.counts
+            .get(self.tree.root())
+            .map_or_else(Roll::default, |counts| counts.all)
     }
 
-    /// The whole scan, as the header states it.
+    /// How many marked directories the current view is hiding.
+    ///
+    /// Zero on a view that hides nothing, which is where a run starts. Above zero it is the
+    /// hazard orthogonal selection creates, stated on the footer before the reader ever
+    /// reaches the confirmation that spells it out.
+    #[must_use]
+    pub fn hidden(&self) -> usize {
+        self.counts
+            .get(self.tree.root())
+            .map_or(0, |counts| counts.all.claims - counts.chosen.claims)
+    }
+
+    /// The whole scan, as the header states it — under the current view.
     #[must_use]
     pub fn total(&self) -> Roll {
         self.roll(self.tree.root())
     }
 
+    /// How many claims the scan found that the current view is not showing.
+    ///
+    /// **The header says this, and that is what keeps a narrowed view honest.** The run opens
+    /// on `default`, which hides the gitignored tier — a real tier worth real bytes that no
+    /// other tool finds at all — so the headline count is not the whole answer to "how much do
+    /// I get back". A number that is narrowed without saying so is the "silently keeps" failure
+    /// the age floor was resolved against; saying so, on the line the number is on, is the
+    /// difference between a filter and a lie.
+    #[must_use]
+    pub fn out_of_view(&self) -> usize {
+        self.tree
+            .node(self.tree.root())
+            .claims
+            .saturating_sub(self.total().claims)
+    }
+
     /// The applied filter's pattern, if there is one.
     #[must_use]
     pub fn filter(&self) -> Option<&str> {
-        self.filter.as_ref().map(|filter| filter.pattern.as_str())
+        self.lens.pattern()
+    }
+
+    /// Which named view the view is on, or `None` once the axis keys have taken it off all
+    /// four.
+    ///
+    /// Derived from the axes rather than remembered, which the four presets occupying four
+    /// distinct points is what buys: a reader who toggles their way onto `dependencies` is on
+    /// `dependencies`, and nothing has to keep a record of how they got there.
+    #[must_use]
+    pub fn preset(&self) -> Option<Preset> {
+        self.lens.preset()
+    }
+
+    /// What the footer calls the view: a preset's name, or the two axes spelled out.
+    ///
+    /// A lens the axis keys built has no name, and inventing one — or rounding it to the
+    /// nearest preset — would tell the reader they are somewhere they are not.
+    #[must_use]
+    pub fn view_label(&self) -> String {
+        self.preset().map_or_else(
+            || self.lens.axes_label(),
+            |preset| preset.label().to_owned(),
+        )
+    }
+
+    /// The whole of what decides visibility, for anything that has to say what is hiding
+    /// something.
+    #[must_use]
+    pub fn lens(&self) -> &Lens {
+        &self.lens
     }
 
     /// The prompt, while it is up.
@@ -1272,6 +1760,18 @@ impl View {
     #[must_use]
     pub fn pending(&self) -> Option<&Pending> {
         self.pending.as_ref()
+    }
+
+    /// How many lines of the batch the confirmation has room for.
+    ///
+    /// The renderer's to say, exactly as [`View::viewport`] is, and for the same reason: the
+    /// box's height depends on the frame, and a page size the view guessed would scroll the
+    /// listing past its own border.
+    pub fn listing(&mut self, page: usize) {
+        if let Some(pending) = &mut self.pending {
+            pending.page = page.max(1);
+            pending.follow();
+        }
     }
 
     /// Whether the walk is still running.
@@ -1425,6 +1925,15 @@ impl View {
                 }
             }
             Action::Answer => return self.answer(),
+            Action::Listing(motion) => {
+                if let Some(pending) = &mut self.pending {
+                    pending.walk(motion);
+                }
+            }
+            Action::Spare => self.spare_entry(),
+            Action::CyclePreset(turn) => self.cycle_preset(turn),
+            Action::CycleTiers => self.cycle_tiers(),
+            Action::ToggleKind(kind) => self.toggle_kind(kind),
             Action::Cursor(motion) => self.move_cursor(motion),
             Action::ScrollRows(motion) => self.scroll_rows(motion),
             Action::Expand => self.expand(),
@@ -1496,11 +2005,11 @@ impl View {
     /// bottom rung is doing nothing at all; `q` is the way out and it is on every help page.
     ///
     /// The rungs are in front-to-back order, and the notice sits where it does for two reasons.
-    /// It is *behind* the overlays because they are literally drawn over it — and the prompt
-    /// borrows the footer, so while one is up there is no notice on the screen to dismiss. It is
-    /// *in front of* the filter and the marks because it is the cheapest rung to take by
-    /// mistake: an `Esc` that dropped forty marks when the reader meant to get rid of a sentence
-    /// is the one outcome this ladder exists to prevent.
+    /// It is *behind* the overlays — the confirmation included — because they are literally
+    /// drawn over it, and the prompt borrows the footer, so while one is up there is no notice
+    /// on the screen to dismiss. It is *in front of* the narrowings and the marks because it is
+    /// the cheapest rung to take by mistake: an `Esc` that dropped forty marks when the reader
+    /// meant to get rid of a sentence is the one outcome this ladder exists to prevent.
     fn step_back(&mut self) {
         if self.prompt.take().is_some() {
             return;
@@ -1514,7 +2023,16 @@ impl View {
         if self.notice.take().is_some() {
             return;
         }
-        if self.filter.take().is_some() {
+        // The narrowings come off in the order they were put on: the pattern first, then the
+        // preset. Two rungs rather than one, because they are two independent things and a
+        // reader who typed a pattern over `dependencies` means to lose the pattern.
+        if self.lens.pattern().is_some() {
+            self.lens = self.lens.clone().matching(None);
+            self.stale = true;
+            return;
+        }
+        if self.lens != Lens::default() {
+            self.lens = Lens::default();
             self.stale = true;
             return;
         }
@@ -1542,13 +2060,13 @@ impl View {
         let pattern = prompt.text();
         if pattern.is_empty() {
             self.prompt = None;
-            self.filter = None;
+            self.lens = self.lens.clone().matching(None);
             self.stale = true;
             return;
         }
-        match Filter::new(&pattern) {
-            Ok(filter) => {
-                self.filter = Some(filter);
+        match Regex::new(&pattern) {
+            Ok(regex) => {
+                self.lens = self.lens.clone().matching(Some(regex));
                 self.prompt = None;
                 self.stale = true;
             }
@@ -1557,6 +2075,91 @@ impl View {
                 prompt.error = Some(reason.lines().last().unwrap_or("not a regex").to_owned());
             }
         }
+    }
+
+    /// `f` and `F`: the next named view, or the one before.
+    ///
+    /// A preset changes what is on screen and — deliberately — nothing about what is
+    /// selected. That is the rule the whole model turns on, and it is why the notice says what
+    /// the new view *hides* rather than what it shows: a claim that has gone from the screen
+    /// is still in the batch, and the reader has to be able to tell that from a claim that was
+    /// never found.
+    fn cycle_preset(&mut self, turn: Turn) {
+        // A reader who has moved an axis by hand is not on a preset at all, so the key puts
+        // them back on the first one rather than stepping from a place they never were.
+        let next = match self.preset() {
+            Some(at) => match turn {
+                Turn::Next => at.next(),
+                Turn::Prev => at.prev(),
+            },
+            None => Preset::default(),
+        };
+        // The axes move and the `/` pattern does not. It narrows whatever the axes leave, so it
+        // is orthogonal to both of them — and a preset that quietly dropped it would be using
+        // an unrelated piece of state to mean something about the view.
+        self.lens = Lens::showing(next).matching(self.held_pattern());
+        self.narrowed(format!("showing {}", next.what()));
+    }
+
+    /// `t`: the tier axis, on its own.
+    fn cycle_tiers(&mut self) {
+        let tiers = self.lens.tiers().next();
+        self.lens = self.lens.clone().with_tiers(tiers);
+        self.off_the_presets();
+    }
+
+    /// `d` `b` `c`: one member of the kind axis, on its own.
+    fn toggle_kind(&mut self, kind: Kind) {
+        let kinds = self.lens.kinds().toggling(kind);
+        self.lens = self.lens.clone().with_kinds(kinds);
+        self.off_the_presets();
+    }
+
+    /// Applies an axis edit: the view is now whatever the two axes say, and not a preset.
+    ///
+    /// It says what the *axes* are rather than what the step was called, because there is no
+    /// name to give — that is the whole point of the two keys, and rounding to the nearest
+    /// preset would report a view the reader is not on.
+    fn off_the_presets(&mut self) {
+        // Nothing to record: [`View::preset`] reads the axes, so a hand-edited lens that lands
+        // on a preset's point *is* that preset and one that does not has no name. What it says
+        // is the axes, because that is the only description a nameless view has.
+        let said = self.lens.axes_label();
+        self.narrowed(format!("showing {said}"));
+    }
+
+    /// The `/` pattern as a fresh engine, for a lens being rebuilt around it.
+    fn held_pattern(&self) -> Option<Regex> {
+        self.lens.pattern().and_then(|held| Regex::new(held).ok())
+    }
+
+    /// Re-derives after a change of view and says what it left out.
+    ///
+    /// **The sentence names what is now missing**, which is the whole of what keeps a narrowed
+    /// view from being the "silently keeps" failure: a claim that has gone from the screen is
+    /// still in the batch, and a reader has no way to tell that from a claim that was never
+    /// found unless something says so.
+    ///
+    /// [`Notice::passing`] rather than standing, and the count is what makes that safe rather
+    /// than a hole. This sentence names nothing refused and nothing failed — it answers the
+    /// keystroke that narrowed the view, so the reader's next one has seen it. What must not
+    /// perish is the *fact* it carries, and that does not live here: the footer states how much
+    /// of the selection is out of sight on every frame, notice or no notice, and the
+    /// confirmation states it again on the one screen where it can still change a decision.
+    /// A standing notice would instead park one keystroke's echo over the keys until it was
+    /// dismissed, which is the report outliving what it reports on.
+    fn narrowed(&mut self, said: String) {
+        self.stale = true;
+        self.sync();
+        let hidden = self.hidden();
+        self.says(if hidden == 0 {
+            said
+        } else {
+            format!(
+                "{said} · {} still marked and out of sight",
+                plural(hidden, "directory", "directories")
+            )
+        });
     }
 
     fn scroll_help(&mut self, motion: Motion) {
@@ -1603,6 +2206,48 @@ impl View {
         }
     }
 
+    /// `space` on a line of the confirmation: take that directory out of the batch.
+    ///
+    /// **The answer to a surprise has to be better than "cancel and start again".** A reader
+    /// who reaches this screen and finds something they did not mean to have marked is
+    /// looking at the one moment where they can still act on it, and a screen that could only
+    /// be read would send them back to a tree where the offending row may not even be visible.
+    ///
+    /// It changes the marks as well as the listing, because the two have to keep saying the
+    /// same thing: the deed shrinks with the line, and the tree behind the box agrees when
+    /// the box goes.
+    fn spare_entry(&mut self) {
+        let Some(pending) = &self.pending else {
+            return;
+        };
+        let at = pending.at;
+        let Some(entry) = pending.current().cloned() else {
+            return;
+        };
+        if let Some(pending) = &mut self.pending {
+            pending.drop_at(at);
+        }
+        if let Some(id) = entry.id {
+            self.unmark(id);
+        }
+        self.stale = true;
+        self.sync();
+        let left = self
+            .pending
+            .as_ref()
+            .map_or(0, |pending| pending.entries.len());
+        if left == 0 {
+            // Nothing left to ask about. Closing is the honest answer rather than a box
+            // offering to delete an empty set.
+            self.pending = None;
+            // Passing, both of these: the reader emptied the batch a line at a time, so this
+            // reports what they just did rather than something that was refused or failed.
+            self.says("nothing left in the batch");
+            return;
+        }
+        self.says(format!("{} unmarked", entry.path.display()));
+    }
+
     /// `x`: hand the marked batch out to be planned.
     fn commit(&mut self) -> Effect {
         if self.is_deleting() {
@@ -1617,30 +2262,26 @@ impl View {
         Effect::Plan(batch)
     }
 
-    /// Every claim under a mark, which is what a batch is.
+    /// Every claim the marks select, which is what a batch is.
     ///
-    /// Filtered, and that is the safety rule the filter's own rolled-up numbers exist to make
-    /// visible: what a mark deletes is what its row says it is worth. A claim the filter is
-    /// hiding is not in the batch, however marked its ancestor.
+    /// **The whole selection, and never only the visible part.** A mark resolves through the
+    /// lens it was *made* through, so narrowing the view afterwards takes nothing out of the
+    /// batch — anything else would contradict the one promise the model makes, that toggling
+    /// what is visible never changes what is selected. What the narrowing does instead is put
+    /// entries on the confirmation marked as hidden, which is where a reader can act on the
+    /// surprise.
     ///
-    /// A row that is draining away is out too. It is on screen for another third of a second
+    /// A row that is draining away is out. It is on screen for another third of a second
     /// saying what happened to it, and offering a directory that is already gone to a second
-    /// removal would report a failure for a target the first removal succeeded on.
+    /// removal would report a failure for a target the first removal succeeded on. That is
+    /// decided in [`tally`], with the counter, so the two cannot part company.
     #[must_use]
     pub fn batch(&self) -> Vec<Target> {
-        let mut batch = Vec::new();
-        let mut stack: Vec<NodeId> = self.marks.iter().copied().collect();
-        while let Some(id) = stack.pop() {
-            if !self.shown(id) || self.is_leaving(id) {
-                continue;
-            }
-            let node = self.tree.node(id);
-            if let Some(hit) = &node.hit {
-                batch.push(Target::from(hit));
-            } else {
-                stack.extend(node.children.iter().copied());
-            }
-        }
+        let mut batch: Vec<Target> = self
+            .selection
+            .iter()
+            .filter_map(|&id| self.tree.node(id).hit.as_ref().map(Target::from))
+            .collect();
         batch.sort_by(|a, b| a.path.cmp(&b.path));
         batch
     }
@@ -1981,12 +2622,22 @@ impl View {
         }
     }
 
-    /// Whether a node survives the filter. Everything survives when there is not one.
+    /// Whether a node survives the current view. Everything survives when it hides nothing.
+    ///
+    /// The one exception is the scan root of a tree with nothing in it yet, and it earns its
+    /// place now that the view a run opens on **narrows**: the root is the directory the reader
+    /// typed rather than a claim, so a view has nothing to say about it, and hiding it would
+    /// blank the pane for the first moments of every run and for the whole of a scan that finds
+    /// only the tier `default` leaves out. A filter that matches nothing still empties the pane
+    /// — that is a narrowing the reader asked for, and #602's deselection depends on it.
     fn shown(&self, id: NodeId) -> bool {
-        match &self.filter {
-            Some(filter) => filter.rolls.contains_key(&id),
-            None => true,
+        if !self.is_sifted() {
+            return true;
         }
+        if id == self.tree.root() && self.tree.node(id).claims == 0 {
+            return true;
+        }
+        self.roll(id).claims > 0
     }
 
     // ---- marking ----------------------------------------------------------------------
@@ -2016,7 +2667,10 @@ impl View {
         if self.is_leaving(id) {
             return;
         }
-        if self.covered(id) {
+        // What the *reader* can see is what the key toggles, which is why this asks the
+        // filter-relative glyph rather than a global "is it covered": a row drawn full is a
+        // row `space` empties, and a row drawn part-full is one it fills.
+        if self.mark_of(id) == Mark::All {
             self.unmark(id);
         } else {
             let chain = self.ancestry(id);
@@ -2045,124 +2699,161 @@ impl View {
         }
     }
 
-    /// Whether this node is inside a marked subtree.
-    fn covered(&self, id: NodeId) -> bool {
-        let mut at = Some(id);
-        while let Some(current) = at {
-            if self.marks.contains(&current) {
-                return true;
-            }
-            at = self.tree.node(current).parent;
-        }
-        false
-    }
-
-    /// Marks a subtree, absorbing any marks already inside it.
+    /// Marks a subtree, as the current view defines it.
+    ///
+    /// The lens is copied into the mark rather than referred to, which is what makes a later
+    /// change of view inert: `~/repos` marked under `dependencies` keeps meaning the
+    /// dependencies under `~/repos` when the reader widens to `all`, and the build artefacts
+    /// beside them stay unmarked.
+    ///
+    /// Two tidyings, and neither of them ever loses a selection. Any exclusion at or under
+    /// the new mark goes, because the reader has just said to take the lot; and a mark
+    /// already inside it **through the same lens** is absorbed, because it now says nothing
+    /// the outer one does not. A mark inside it through a *different* lens survives, since it
+    /// may well cover claims this one does not.
     fn mark(&mut self, id: NodeId) {
+        let lens = self.lens.clone();
         let inside: Vec<NodeId> = self
-            .marks
+            .spared
             .iter()
             .copied()
-            .filter(|&mark| mark != id && self.descends_from(mark, id))
+            .filter(|&spared| self.descends_from(spared, id))
             .collect();
-        for mark in inside {
-            self.drop_mark(mark);
+        for spared in inside {
+            self.spared.remove(&spared);
         }
-        self.add_mark(id);
+        let tree = &self.tree;
+        self.marks.retain(|mark| {
+            !(mark.lens == lens && mark.root != id && descends_from(tree, mark.root, id))
+        });
+        if !self
+            .marks
+            .iter()
+            .any(|mark| mark.root == id && mark.lens == lens)
+        {
+            self.marks.push(Marked { root: id, lens });
+        }
+        self.stale = true;
     }
 
-    /// Unmarks a subtree, pushing an ancestor's mark down around it if that is what is
-    /// covering it.
+    /// Unmarks a subtree, whichever mark was covering it.
     ///
-    /// The push-down is the whole reason marks are subtree roots rather than a flat set, and
-    /// it is what makes "mark the lot, then spare this one" a two-keystroke operation. Every
-    /// sibling along the way inherits the mark, so what was covered stays covered except for
-    /// the one subtree being spared.
+    /// A mark rooted here goes outright; anything else is an ancestor's mark reaching down,
+    /// and what spares this subtree from it is an **exclusion** rather than a mark on every
+    /// sibling along the path. The push-down that used to do this cost a mark per sibling on
+    /// a level 8,660 wide, and — worse — it was a statement about the claims that existed at
+    /// that instant, so a claim arriving next to a spared row a minute later was silently
+    /// unmarked too.
     fn unmark(&mut self, id: NodeId) {
-        if self.marks.contains(&id) {
-            self.drop_mark(id);
+        self.marks.retain(|mark| mark.root != id);
+        // **Re-derived before the next question rather than after this one.** The counts on
+        // hand describe the state before the line above, so asking them whether anything is
+        // still covering this row would answer about the mark that has just gone — and the
+        // answer decides whether an exclusion is left behind. A stray exclusion is invisible
+        // and outlives the keystroke that produced it: the next mark on an ancestor would
+        // quietly spare a subtree nobody spared.
+        self.stale = true;
+        self.sync();
+        if self.mark_of(id) == Mark::None && !self.selects_anything_under(id) {
             return;
         }
-        let mut path = vec![id];
-        let mut at = self.tree.node(id).parent;
-        while let Some(current) = at {
-            path.push(current);
-            if self.marks.contains(&current) {
-                break;
-            }
-            at = self.tree.node(current).parent;
-        }
-        let Some(&holder) = path.last().filter(|&&top| self.marks.contains(&top)) else {
-            return;
-        };
-        self.drop_mark(holder);
-        // From the holder downwards, marking everything beside the path.
-        for step in (1..path.len()).rev() {
-            let above = path[step];
-            let spared = path[step - 1];
-            for child in self.tree.children(above).to_vec() {
-                if child != spared {
-                    self.add_mark(child);
-                }
-            }
-        }
+        // Still covered from above, so it is spared rather than unmarked — and every mark
+        // that lived inside it goes with it, since nothing under an exclusion is selected.
+        let tree = &self.tree;
+        self.marks
+            .retain(|mark| !descends_from(tree, mark.root, id));
+        self.spared.insert(id);
+        self.stale = true;
+    }
+
+    /// Whether anything at all under this node is selected, visible or not.
+    ///
+    /// The glyph cannot answer this on its own: a subtree whose every selected claim is
+    /// hidden draws as unmarked, and it still has to be sparable — that is the whole hazard
+    /// the confirmation screen exists for, reached from the tree instead.
+    fn selects_anything_under(&self, id: NodeId) -> bool {
+        self.counts
+            .get(id)
+            .is_some_and(|counts| counts.all.claims > 0)
     }
 
     fn clear_marks(&mut self) {
         self.marks.clear();
-        self.below.clear();
+        self.spared.clear();
+        self.counts.clear();
+        self.selection.clear();
         self.stale = true;
     }
 
-    fn add_mark(&mut self, id: NodeId) {
-        self.stale = self.marks.insert(id) || self.stale;
-    }
-
-    fn drop_mark(&mut self, id: NodeId) {
-        self.stale = self.marks.remove(&id) || self.stale;
-    }
-
-    /// Rebuilds what is marked below each node, from the marks that are left.
+    /// Rebuilds everything the lens and the marks decide, in one pass. See [`tally`].
     ///
-    /// From scratch on every sync rather than adjusted as marks come and go, and the reason is
-    /// the filter's own: this carries **bytes** now, and bytes under a mark move without the
-    /// marks moving at all — a price lands, a deletion finishes, a claim streams in under a
-    /// directory that was marked while it was still empty. An incremental total would have to
-    /// be right about every one of those, and being wrong leaves a partial glyph reporting a
-    /// share of a subtree that is no longer that shape.
-    ///
-    /// One walk up the ancestors per mark, so it is bounded by marks × depth rather than by
-    /// the tree: a reader's handful of marks against ten levels. The one case that is not a
-    /// handful is a push-down (see [`View::unmark`]), which can leave a mark per sibling on a
-    /// wide level — and that is what the `scale` module measures rather than assumes.
-    fn recount_marks(&mut self) {
-        self.below.clear();
-        for id in self.marks.clone() {
-            let roll = self.roll(id);
-            let mut at = self.tree.node(id).parent;
-            while let Some(current) = at {
-                let below = self.below.entry(current).or_default();
-                below.bytes += roll.bytes;
-                below.claims += roll.claims;
-                below.unpriced += roll.unpriced;
-                at = self.tree.node(current).parent;
-            }
+    /// Skipped entirely on the view a run opens with — nothing marked and nothing hidden —
+    /// so a reader watching a scan of a home directory pays for none of it. From the first
+    /// mark on it is one traversal per frame, which is the price of a glyph that is
+    /// **filter-relative**: an ancestor can be fully marked under `dependencies` and partly
+    /// marked under `all`, and a glyph computed globally would contradict what the reader can
+    /// see. The alternative — a subtree walk per row per frame — is what the cache the old
+    /// `below` map existed for was already avoiding, and this keeps that shape rather than
+    /// giving it up.
+    fn recount(&mut self) {
+        self.counts.clear();
+        self.selection.clear();
+        if !self.is_sifted() && self.marks.is_empty() {
+            return;
         }
+        let mut counts = std::mem::take(&mut self.counts);
+        let mut selection = std::mem::take(&mut self.selection);
+        tally(
+            &self.tree,
+            &self.lens,
+            &self.marks,
+            &self.spared,
+            &self.moving,
+            &mut counts,
+            &mut selection,
+        );
+        self.counts = counts;
+        self.selection = selection;
+    }
+
+    /// Whether the lens is hiding anything at all.
+    fn is_sifted(&self) -> bool {
+        !self.lens.is_everything()
     }
 
     /// Whether `id` is at or under `root`.
-    ///
-    /// Walked upwards from the node rather than downwards from the root, because a chain is a
-    /// handful of steps and a subtree can be most of the tree.
     fn descends_from(&self, id: NodeId, root: NodeId) -> bool {
-        let mut at = Some(id);
-        while let Some(current) = at {
-            if current == root {
-                return true;
-            }
-            at = self.tree.node(current).parent;
+        descends_from(&self.tree, id, root)
+    }
+}
+
+/// Whether `id` is at or under `root`.
+///
+/// Walked upwards from the node rather than downwards from the root, because a chain is a
+/// handful of steps and a subtree can be most of the tree. A free function so that it can be
+/// asked while a `retain` holds the field it would otherwise be a method on.
+fn descends_from(tree: &Tree, id: NodeId, root: NodeId) -> bool {
+    let mut at = Some(id);
+    while let Some(current) = at {
+        if current == root {
+            return true;
         }
-        false
+        at = tree.node(current).parent;
+    }
+    false
+}
+
+/// Where a kind sorts in the listing, with the unnamed tier last.
+///
+/// Last rather than first deliberately: the groups a reader recognises come before the group
+/// that says only that git knows about it, which is the one they will want to read most
+/// carefully and so the one that should not be scrolled past on the way in.
+fn kind_order(kind: Option<Kind>) -> usize {
+    match kind {
+        Some(Kind::Dependencies) => 0,
+        Some(Kind::Build) => 1,
+        Some(Kind::Cache) => 2,
+        None => 3,
     }
 }
 
@@ -2174,9 +2865,12 @@ pub fn plural(count: usize, one: &str, many: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, Answer, Effect, Mark, Motion, Notice, Overlay, Pending, Turn, View};
+    use super::{
+        Action, Answer, Effect, Mark, Motion, Notice, Overlay, Planned, Preset, Turn, View,
+    };
     use crate::delete::{Refusal, Refused};
-    use crate::fixture::hit;
+    use crate::fixture::{gitignored, hit, of_kind};
+    use crate::rules::Kind;
     use crate::size::Size;
     use crate::tree::{Order, Sort, Tree};
     use crate::tui::moving::{ARRIVAL, COUNT_UP, DIM, FLASH, RUNG};
@@ -2614,6 +3308,679 @@ mod tests {
         assert_eq!(view.mark_of(view.tree().root()), Mark::None);
     }
 
+    // ---- what is visible, and what that has to do with what is selected -----------------
+
+    /// A view over a tree with one of each kind, plus a claim only git knows about:
+    ///
+    /// ```text
+    /// /scan
+    ///   nx
+    ///     node_modules   200   Dependencies
+    ///     dist           100   Build
+    ///     .nx/cache       10   Cache
+    ///     out              1   gitignored, kind unknown
+    ///   old
+    ///     target          20   Build
+    /// ```
+    fn mixed() -> View {
+        let mut tree = Tree::new("/scan");
+        tree.insert(sized(
+            of_kind("/scan/nx/node_modules", Kind::Dependencies),
+            200,
+        ));
+        tree.insert(sized(of_kind("/scan/nx/dist", Kind::Build), 100));
+        tree.insert(sized(of_kind("/scan/nx/.nx/cache", Kind::Cache), 10));
+        tree.insert(sized(gitignored("/scan/nx/out"), 1));
+        tree.insert(sized(of_kind("/scan/old/target", Kind::Build), 20));
+        let mut view = View::new(tree);
+        view.viewport(40);
+        view
+    }
+
+    /// A made-up claim with a price on it.
+    fn sized(mut made: crate::walk::Hit, bytes: u64) -> crate::walk::Hit {
+        made.size = Size::Measured(bytes);
+        made
+    }
+
+    /// Every claim the current view shows, by path.
+    fn shown_claims(view: &View) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = (0..view.tree().minted())
+            .filter(|&id| view.tree().is_attached(id))
+            .filter(|&id| view.tree().node(id).hit.is_some() && view.roll(id).claims > 0)
+            .map(|id| view.tree().node(id).path.clone())
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// Presses `f` until the view is the one named.
+    ///
+    /// One press more than there are presets, because from a view the axis keys built the first
+    /// press lands on `default` rather than stepping from a place the reader never was.
+    fn showing(view: &mut View, preset: Preset) {
+        for _ in 0..=Preset::ALL.len() {
+            if view.preset() == Some(preset) {
+                return;
+            }
+            view.apply(Action::CyclePreset(Turn::Next));
+        }
+        panic!("{preset} is not on the cycle");
+    }
+
+    #[test]
+    fn a_run_opens_on_default_and_the_header_says_what_default_leaves_out() {
+        // `default` narrows: it shows what rules named and hides the gitignore fallback. That
+        // is a filter that is on without having been asked for, which is the shape the age
+        // floor was resolved against — so what makes it honest rather than *silent* is that
+        // the count it hides is on the header from the first frame, beside the number it
+        // qualifies. A narrowed headline that does not say it is narrowed is the failure.
+        let view = mixed();
+        assert_eq!(view.preset(), Some(Preset::Default));
+        assert_eq!(view.total().claims, 4);
+        assert_eq!(view.out_of_view(), 1);
+        assert_eq!(view.view_label(), "default");
+    }
+
+    #[test]
+    fn one_key_walks_the_four_views_that_were_asked_for_in_that_order() {
+        let mut view = mixed();
+        let seen = |view: &View| view.total().claims;
+
+        // default: everything a rule put a name to, and not the gitignored one.
+        assert_eq!(view.preset(), Some(Preset::Default));
+        assert_eq!(seen(&view), 4);
+
+        view.apply(Action::CyclePreset(Turn::Next));
+        // dependencies: one axis narrowed, the other left exactly as default had it.
+        assert_eq!(view.preset(), Some(Preset::Dependencies));
+        assert_eq!(seen(&view), 1);
+
+        view.apply(Action::CyclePreset(Turn::Next));
+        // all-ignored: the TIER axis widens and the kind narrowing is RETAINED, so this is the
+        // step before it plus the gitignored tier — two claims, not five.
+        assert_eq!(view.preset(), Some(Preset::AllIgnored));
+        assert_eq!(seen(&view), 2);
+
+        view.apply(Action::CyclePreset(Turn::Next));
+        // all: the kind axis widens too, which is everything.
+        assert_eq!(view.preset(), Some(Preset::All));
+        assert_eq!(seen(&view), 5);
+        assert_eq!(view.out_of_view(), 0);
+
+        view.apply(Action::CyclePreset(Turn::Next));
+        assert_eq!(view.preset(), Some(Preset::Default));
+
+        // …and backwards, because a reader who overshoots by one keystroke should not have to
+        // go all the way round.
+        view.apply(Action::CyclePreset(Turn::Prev));
+        assert_eq!(view.preset(), Some(Preset::All));
+    }
+
+    #[test]
+    fn each_step_of_the_cycle_moves_one_axis_and_carries_the_other() {
+        // What makes the asked-for order a path rather than four unrelated points, seen through
+        // the keys: `dependencies` narrows the kind, `all-ignored` widens the tier and KEEPS
+        // that narrowing, and `all` widens the kind back. Four presses, four different screens.
+        let mut view = mixed();
+        let seen = |view: &View| shown_claims(view);
+
+        assert_eq!(view.view_label(), "default");
+        view.apply(Action::CyclePreset(Turn::Next));
+        assert_eq!(seen(&view), [PathBuf::from("/scan/nx/node_modules")]);
+
+        view.apply(Action::CyclePreset(Turn::Next));
+        assert_eq!(
+            seen(&view),
+            [
+                PathBuf::from("/scan/nx/node_modules"),
+                PathBuf::from("/scan/nx/out"),
+            ],
+            "all-ignored dropped the kind narrowing instead of carrying it"
+        );
+
+        view.apply(Action::CyclePreset(Turn::Next));
+        assert_eq!(view.total().claims, 5);
+    }
+
+    #[test]
+    fn no_preset_touches_the_pattern() {
+        // The pattern narrows whatever the axes leave, so it is orthogonal to both — and a
+        // preset that quietly dropped it would be using an unrelated piece of state to mean
+        // something about the view. An earlier pass did exactly that to tell two presets apart.
+        let mut view = mixed();
+        filter(&mut view, "nx");
+        for _ in 0..=Preset::ALL.len() {
+            view.apply(Action::CyclePreset(Turn::Next));
+            assert_eq!(view.filter(), Some("nx"), "{:?}", view.preset());
+        }
+    }
+
+    #[test]
+    fn the_two_axes_compose_rather_than_replacing_each_other() {
+        // The whole reason the filter is two axes rather than four modes: a pattern narrows
+        // whatever the axes left, and neither has to know the other exists.
+        let mut view = mixed();
+        showing(&mut view, Preset::Default);
+        filter(&mut view, "nx");
+        assert_eq!(
+            view.total().claims,
+            3,
+            "the gitignored one is out either way"
+        );
+        assert_eq!(
+            view.lens().describe(),
+            "named · dependencies + build + cache · /nx"
+        );
+    }
+
+    #[test]
+    fn each_axis_has_a_key_of_its_own_so_a_non_preset_view_is_reachable() {
+        // **Expressible has to mean expressible by a reader.** "Every cache a rule named" is
+        // not one of the four presets and never will be, and a model that can hold it while no
+        // keystroke can ask for it is a model with a claim it cannot cash. `d` and `b` take the
+        // other two kinds off `default`, and what is left is exactly that view.
+        let mut view = mixed();
+        view.apply(Action::ToggleKind(Kind::Dependencies));
+        view.apply(Action::ToggleKind(Kind::Build));
+
+        assert_eq!(view.preset(), None, "a hand-built view is not a preset");
+        assert_eq!(view.view_label(), "named · cache");
+        assert_eq!(shown_claims(&view), [PathBuf::from("/scan/nx/.nx/cache")]);
+
+        // …and the tier axis moves on its own, leaving the kind axis exactly where it was.
+        view.apply(Action::CycleTiers);
+        assert_eq!(view.view_label(), "named + gitignored · cache");
+        assert_eq!(
+            shown_claims(&view),
+            [
+                PathBuf::from("/scan/nx/.nx/cache"),
+                PathBuf::from("/scan/nx/out"),
+            ]
+        );
+
+        // Once more and the named tier goes, which is the third state of that axis and the one
+        // no preset names either.
+        view.apply(Action::CycleTiers);
+        assert_eq!(view.view_label(), "gitignored · cache");
+        assert_eq!(shown_claims(&view), [PathBuf::from("/scan/nx/out")]);
+    }
+
+    #[test]
+    fn moving_either_axis_by_hand_leaves_the_selection_exactly_where_it_was() {
+        // The orthogonality rule does not get to be true only for the presets. An axis key is a
+        // change to what is *visible*, so it must be as inert on the marks as `f` is.
+        let mut view = mixed();
+        showing(&mut view, Preset::All);
+        point_at(&mut view, "/scan");
+        view.apply(Action::Mark);
+        let whole = batched(&view);
+        assert_eq!(whole.len(), 5);
+
+        for action in [
+            Action::ToggleKind(Kind::Dependencies),
+            Action::CycleTiers,
+            Action::ToggleKind(Kind::Cache),
+            Action::CycleTiers,
+            Action::ToggleKind(Kind::Build),
+        ] {
+            view.apply(action);
+            assert_eq!(batched(&view), whole, "{action:?} changed the batch");
+            assert_eq!(view.marked().claims, 5, "{action:?} changed the counter");
+        }
+        // …and by this point the view shows nothing at all, which is a legitimate place for
+        // the axes to be and changes nothing whatever about what is going to be deleted. That
+        // is the strongest form of the rule: a screen with no rows on it and a batch of five.
+        assert_eq!(view.total().claims, 0);
+        assert_eq!(view.hidden(), 5);
+        assert_eq!(batched(&view).len(), 5);
+    }
+
+    #[test]
+    fn a_hand_built_view_that_lands_on_a_preset_is_called_by_its_name() {
+        // The other half of naming the view honestly: a reader who toggles their way onto
+        // `dependencies` is on `dependencies`, and the footer should say so rather than
+        // spelling out axes that have a name.
+        let mut view = mixed();
+        view.apply(Action::ToggleKind(Kind::Build));
+        view.apply(Action::ToggleKind(Kind::Cache));
+        assert_eq!(view.preset(), Some(Preset::Dependencies));
+        assert_eq!(view.view_label(), "dependencies");
+
+        // …and one that lands nowhere near a preset says the axes instead, because that is the
+        // only description a nameless view has.
+        view.apply(Action::ToggleKind(Kind::Dependencies));
+        view.apply(Action::ToggleKind(Kind::Build));
+        view.apply(Action::CycleTiers);
+        assert_eq!(view.preset(), None);
+        assert_eq!(view.view_label(), "named + gitignored · build");
+    }
+
+    #[test]
+    fn toggling_what_is_visible_never_changes_what_is_selected() {
+        // **The rule the whole model turns on.** Hiding a row is not unselecting it.
+        let mut view = mixed();
+        // Marked through the widest view, so what follows is the whole scan being narrowed
+        // around a selection rather than a selection that was never that big.
+        showing(&mut view, Preset::All);
+        point_at(&mut view, "/scan");
+        view.apply(Action::Mark);
+        let whole = batched(&view);
+        assert_eq!(whole.len(), 5);
+
+        for preset in Preset::ALL {
+            showing(&mut view, preset);
+            assert_eq!(batched(&view), whole, "{preset} changed the batch");
+            assert_eq!(view.marked().claims, 5, "{preset} changed the counter");
+        }
+    }
+
+    #[test]
+    fn a_mark_keeps_meaning_the_view_it_was_made_through() {
+        // Mark `~/repos` under Dependencies, widen to All, and the build artefacts under it
+        // are still unmarked. A mark stored as "the subtree under N" could not do this: it
+        // would re-derive under the new view and quietly take everything.
+        let mut view = mixed();
+        showing(&mut view, Preset::Dependencies);
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Mark);
+        assert_eq!(batched(&view), [PathBuf::from("/scan/nx/node_modules")]);
+
+        showing(&mut view, Preset::All);
+        assert_eq!(
+            batched(&view),
+            [PathBuf::from("/scan/nx/node_modules")],
+            "widening the view widened the selection"
+        );
+        assert_eq!(view.mark_of(at(&view, "/scan/nx")), Mark::Partial);
+    }
+
+    #[test]
+    fn a_second_mark_through_a_second_view_adds_to_the_first() {
+        // The axes are a way of saying what to select, not a mode the selection lives in, so
+        // two passes over one directory under two views is a union rather than a replacement.
+        // The second view here is one the axis keys built and no preset names, which is the
+        // point: a mark carries whatever the reader could see, preset or not.
+        let mut view = mixed();
+        showing(&mut view, Preset::Dependencies);
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Mark);
+
+        view.apply(Action::CycleTiers);
+        view.apply(Action::CycleTiers);
+        view.apply(Action::ToggleKind(Kind::Dependencies));
+        assert_eq!(view.view_label(), "gitignored · none");
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Mark);
+
+        showing(&mut view, Preset::All);
+        assert_eq!(
+            batched(&view),
+            [
+                PathBuf::from("/scan/nx/node_modules"),
+                PathBuf::from("/scan/nx/out"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_partial_glyph_is_computed_against_the_view_the_reader_is_looking_through() {
+        // An ancestor can be FULLY marked under one view and PARTIALLY marked under another,
+        // and the glyph has to say which — a box drawn full over rows that are visibly
+        // unmarked is the screen contradicting itself.
+        let mut view = mixed();
+        showing(&mut view, Preset::Dependencies);
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Mark);
+        assert_eq!(view.mark_of(at(&view, "/scan/nx")), Mark::All);
+        assert!((view.share(at(&view, "/scan/nx")) - 1.0).abs() < f64::EPSILON);
+
+        showing(&mut view, Preset::All);
+        assert_eq!(view.mark_of(at(&view, "/scan/nx")), Mark::Partial);
+        // 200 of the 311 bytes under `nx` are marked, and the glyph says so rather than
+        // merely saying "some".
+        assert!((view.share(at(&view, "/scan/nx")) - 200.0 / 311.0).abs() < 0.001);
+
+        // The case a globally-computed glyph gets exactly backwards: a selection that is
+        // entirely out of sight, over a row whose visible claims are all unmarked. Counting
+        // the whole selection would draw the box FULL over rows the reader can see are empty.
+        //
+        // Changing the view says so in the footer, and that sentence is a rung of its own —
+        // so it is taken by name rather than by spending one of the two `Esc`s below on it.
+        // Those two are the rungs this setup is actually after: the view, then the marks.
+        view.apply(Action::Dismiss);
+        view.apply(Action::Back);
+        view.apply(Action::Back);
+        assert!(batched(&view).is_empty());
+        point_at(&mut view, "/scan/nx/dist");
+        view.apply(Action::Mark);
+        showing(&mut view, Preset::Dependencies);
+        assert_eq!(view.marked().claims, 1, "the selection is still there");
+        assert_eq!(view.mark_of(at(&view, "/scan/nx")), Mark::None);
+    }
+
+    #[test]
+    fn a_claim_that_streams_in_under_a_mark_joins_it_when_it_matches_that_marks_view() {
+        // Why the pair is resolved on demand rather than frozen into a list of ids: results
+        // stream in, so a subtree marked at seven seconds has to pick up what arrives at
+        // forty. And only what the mark's own view would have taken.
+        let mut view = mixed();
+        showing(&mut view, Preset::Dependencies);
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Mark);
+
+        view.found(sized(
+            of_kind("/scan/nx/packages/ui/node_modules", Kind::Dependencies),
+            50,
+        ));
+        view.found(sized(of_kind("/scan/nx/packages/ui/dist", Kind::Build), 50));
+        view.sync();
+
+        showing(&mut view, Preset::All);
+        assert_eq!(
+            batched(&view),
+            [
+                PathBuf::from("/scan/nx/node_modules"),
+                PathBuf::from("/scan/nx/packages/ui/node_modules"),
+            ],
+            "a build artefact joined a dependencies mark"
+        );
+    }
+
+    #[test]
+    fn sparing_one_row_out_of_a_marked_subtree_keeps_sparing_it_as_more_arrives() {
+        // The exclusion's advantage over the push-down it replaced. A push-down marks every
+        // sibling *that exists at that instant*, so a claim arriving beside the spared row a
+        // minute later would silently be spared too — a statement about a moment, standing in
+        // for a statement about a directory.
+        let mut view = mixed();
+        point_at(&mut view, "/scan");
+        view.apply(Action::Mark);
+        point_at(&mut view, "/scan/nx/dist");
+        view.apply(Action::Mark);
+        assert!(!batched(&view).contains(&PathBuf::from("/scan/nx/dist")));
+
+        view.found(sized(of_kind("/scan/nx/late", Kind::Build), 5));
+        view.sync();
+        assert!(
+            batched(&view).contains(&PathBuf::from("/scan/nx/late")),
+            "a claim that arrived beside the spared row was spared too"
+        );
+        assert!(!batched(&view).contains(&PathBuf::from("/scan/nx/dist")));
+    }
+
+    #[test]
+    fn a_spared_subtree_can_be_marked_again_from_inside_it() {
+        // Marks and exclusions interleave down a path, and the deepest thing on it is what
+        // speaks. A shallower mark must not be able to reach back through an exclusion below
+        // it, and an exclusion must not be able to hold out against a mark below itself.
+        let mut view = mixed();
+        point_at(&mut view, "/scan");
+        view.apply(Action::Mark);
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Mark);
+        assert_eq!(batched(&view), [PathBuf::from("/scan/old/target")]);
+
+        point_at(&mut view, "/scan/nx/dist");
+        view.apply(Action::Mark);
+        assert_eq!(
+            batched(&view),
+            [
+                PathBuf::from("/scan/nx/dist"),
+                PathBuf::from("/scan/old/target"),
+            ]
+        );
+    }
+
+    #[test]
+    fn unmarking_a_row_nothing_was_covering_leaves_no_exclusion_behind() {
+        // An exclusion is invisible: two views with the same rows drawn, the same glyphs and
+        // the same batch can differ by one, and it only shows up in what a *later* keystroke
+        // does. Today every later keystroke that could be affected happens to clear it —
+        // marking a directory drops the exclusions beneath it — so this is a test about the
+        // state rather than about an observable difference, and that is the point. The
+        // question `unmark` asks is answered by the counts, and the counts are one keystroke
+        // behind until the pass is re-run.
+        let mut view = mixed();
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Mark);
+        view.apply(Action::Mark);
+
+        assert!(batched(&view).is_empty());
+        assert!(view.marks.is_empty());
+        assert!(
+            view.spared.is_empty(),
+            "a plain unmark left an exclusion for an ancestor that does not exist"
+        );
+    }
+
+    #[test]
+    fn the_batch_is_the_whole_selection_and_the_counter_says_how_much_is_out_of_sight() {
+        // Deleting acts on everything that is marked, so the number a reader checks has to
+        // describe the same set. What narrowing the view changes is the count beside it.
+        let mut view = mixed();
+        showing(&mut view, Preset::All);
+        point_at(&mut view, "/scan");
+        view.apply(Action::Mark);
+        assert_eq!(view.marked().claims, 5);
+        assert_eq!(view.hidden(), 0);
+
+        showing(&mut view, Preset::Dependencies);
+        assert_eq!(view.marked().claims, 5, "the counter followed the view");
+        assert_eq!(batched(&view).len(), 5, "the batch followed the view");
+        assert_eq!(view.hidden(), 4);
+        assert!(
+            view.notice().unwrap().contains("out of sight"),
+            "{:?}",
+            view.notice()
+        );
+    }
+
+    #[test]
+    fn the_confirmation_lists_the_whole_batch_and_names_what_is_out_of_sight() {
+        let mut view = mixed();
+        showing(&mut view, Preset::All);
+        point_at(&mut view, "/scan");
+        view.apply(Action::Mark);
+        showing(&mut view, Preset::Dependencies);
+        let Effect::Plan(batch) = view.apply(Action::Commit) else {
+            panic!("the key that writes did not ask");
+        };
+        view.asking(
+            &batch
+                .iter()
+                .map(|target| Planned::at(target.path.clone(), target.size))
+                .collect::<Vec<_>>(),
+            &[],
+        );
+
+        let pending = view.pending().unwrap();
+        assert_eq!(pending.entries().len(), 5);
+        assert_eq!(pending.hidden(), 4);
+        // Grouped by kind: dependencies, then build, then cache, then the tier nothing named.
+        let kinds: Vec<Option<Kind>> = pending.entries().iter().map(|entry| entry.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                Some(Kind::Dependencies),
+                Some(Kind::Build),
+                Some(Kind::Build),
+                Some(Kind::Cache),
+                None,
+            ]
+        );
+        // …and each line says whether the reader can currently see it.
+        let seen: Vec<bool> = pending.entries().iter().map(|entry| entry.hidden).collect();
+        assert_eq!(seen, [false, true, true, true, true]);
+    }
+
+    // ---- the report and the confirmation are two things, not one ----------------------
+    //
+    // Both are drawn over the tree and both say something about a batch, which is the whole
+    // reason to pin them apart. A [`Notice`] is a report of what has already happened and its
+    // lifetime is a reader's action; the confirmation is the question asked *before* anything
+    // happens, and it is mandatory whenever part of the selection is out of sight. Nothing
+    // that gets rid of the first may touch the second.
+
+    #[test]
+    fn a_standing_report_does_not_stand_in_for_the_confirmation() {
+        let mut view = mixed();
+        showing(&mut view, Preset::All);
+        point_at(&mut view, "/scan");
+        view.apply(Action::Mark);
+        showing(&mut view, Preset::Dependencies);
+        assert_eq!(view.hidden(), 4);
+
+        // The stickiest thing the footer can be holding: a report naming what the safety model
+        // left alone, which waits to be dismissed rather than going with the next keystroke.
+        view.deleted(
+            Notice::standing("removed 10 B from 1 directory, 1 directory left alone"),
+            10,
+        );
+
+        // It does not answer the question, so it must not be allowed to look like an answer.
+        // `x` still plans, and the box still opens on the whole selection — four fifths of
+        // which the reader cannot currently see.
+        let Effect::Plan(batch) = view.apply(Action::Commit) else {
+            panic!("a report in the footer swallowed the batch");
+        };
+        assert!(view.notice_stands(), "the report went with the keystroke");
+        view.asking(
+            &batch
+                .iter()
+                .map(|target| Planned::at(target.path.clone(), target.size))
+                .collect::<Vec<_>>(),
+            &[],
+        );
+
+        let pending = view.pending().expect("no confirmation over a standing report");
+        assert_eq!(pending.entries().len(), 5);
+        assert_eq!(pending.hidden(), 4);
+        // Both on the screen at once, saying different things about different moments.
+        assert!(view.notice().is_some());
+    }
+
+    #[test]
+    fn getting_rid_of_the_report_never_gets_rid_of_the_confirmation() {
+        let mut view = mixed();
+        showing(&mut view, Preset::All);
+        point_at(&mut view, "/scan");
+        view.apply(Action::Mark);
+        showing(&mut view, Preset::Dependencies);
+        view.deleted(Notice::standing("1 directory left alone"), 10);
+        view.asking(&planned(&["/scan/nx/node_modules", "/scan/nx/dist"]), &[]);
+        assert!(view.pending().is_some());
+
+        // A press on the footer is aimed at the sentence and nothing else. The confirmation is
+        // the one screen where a batch the reader cannot fully see can still be changed, so a
+        // gesture that means "I have read that" must never be what takes it away.
+        view.apply(Action::Dismiss);
+        assert_eq!(view.notice(), None);
+        assert!(
+            view.pending().is_some(),
+            "dismissing the report took the question with it"
+        );
+
+        // And on the ladder the box is in front: one `Esc` closes the question, and a report
+        // that was underneath it is still underneath it afterwards.
+        view.deleted(Notice::standing("1 directory left alone"), 10);
+        view.asking(&planned(&["/scan/nx/node_modules"]), &[]);
+        view.apply(Action::Back);
+        assert!(view.pending().is_none(), "Esc did not take the box first");
+        assert!(view.notice().is_some(), "Esc took both rungs at once");
+    }
+
+    #[test]
+    fn an_entry_can_be_taken_out_of_the_batch_from_the_confirmation_itself() {
+        // The answer to a surprise has to be better than "cancel and start again" — especially
+        // when the surprising row is one the current view is not even showing.
+        let mut view = mixed();
+        showing(&mut view, Preset::All);
+        point_at(&mut view, "/scan");
+        view.apply(Action::Mark);
+        showing(&mut view, Preset::Dependencies);
+        view.asking(&planned(&["/scan/nx/node_modules", "/scan/nx/dist"]), &[]);
+
+        // The cursor starts on the first line, and `↓` reaches the hidden one.
+        view.apply(Action::Listing(Motion::Down));
+        assert_eq!(
+            view.pending().unwrap().entries()[view.pending().unwrap().at()].path,
+            PathBuf::from("/scan/nx/dist")
+        );
+        view.apply(Action::Spare);
+
+        let pending = view.pending().unwrap();
+        assert_eq!(pending.entries().len(), 1);
+        assert_eq!(pending.targets, [PathBuf::from("/scan/nx/node_modules")]);
+        // The deed shrank with the line, and so did the tree behind the box: a listing that
+        // stopped showing a directory while the marks kept it would be the disagreement the
+        // screen exists to prevent.
+        assert!(!batched(&view).contains(&PathBuf::from("/scan/nx/dist")));
+        assert_eq!(view.hidden(), 3);
+    }
+
+    #[test]
+    fn taking_the_last_entry_out_closes_the_question_rather_than_asking_an_empty_one() {
+        let mut view = mixed();
+        point_at(&mut view, "/scan/nx/dist");
+        view.apply(Action::Mark);
+        view.asking(&planned(&["/scan/nx/dist"]), &[]);
+        view.apply(Action::Spare);
+
+        assert_eq!(view.overlay(), None);
+        assert!(view.notice().unwrap().contains("nothing left"));
+        assert!(batched(&view).is_empty());
+    }
+
+    #[test]
+    fn a_refused_directory_says_so_on_the_confirmation_rather_than_in_the_report() {
+        // The same refusal reporting, moved to the one moment where it can still change a
+        // decision. A reader who marked forty and is going to get thirty-eight should not
+        // learn that afterwards.
+        let mut view = mixed();
+        view.asking(
+            &planned(&["/scan/nx/node_modules"]),
+            &[Refused {
+                path: "/scan/old/target".into(),
+                reason: Refusal::HoldsCheckout,
+            }],
+        );
+        let pending = view.pending().unwrap();
+        assert_eq!(pending.kept(), 1);
+        let refused = pending
+            .entries()
+            .iter()
+            .find(|entry| entry.kept.is_some())
+            .unwrap();
+        assert_eq!(refused.path, PathBuf::from("/scan/old/target"));
+        assert!(refused.kept.as_ref().unwrap().contains("git checkout"));
+        // It is not on the deed, which is the point of saying it: the box promises exactly
+        // what it lists as going.
+        assert_eq!(pending.targets, [PathBuf::from("/scan/nx/node_modules")]);
+    }
+
+    #[test]
+    fn escape_takes_the_pattern_off_before_the_view_and_the_marks_last_of_all() {
+        // Two independent narrowings, so they come off as two rungs. A reader who typed a
+        // pattern over `dependencies` means to lose the pattern.
+        let mut view = mixed();
+        showing(&mut view, Preset::Dependencies);
+        filter(&mut view, "nx");
+        point_at(&mut view, "/scan");
+        view.apply(Action::Mark);
+
+        view.apply(Action::Back);
+        assert_eq!(view.filter(), None);
+        assert_eq!(view.preset(), Some(Preset::Dependencies));
+
+        view.apply(Action::Back);
+        assert_eq!(view.preset(), Some(Preset::Default));
+        assert!(!batched(&view).is_empty(), "the marks went with the view");
+
+        view.apply(Action::Back);
+        assert!(batched(&view).is_empty());
+    }
+
     // ---- the filter -------------------------------------------------------------------
 
     #[test]
@@ -2723,7 +4090,7 @@ mod tests {
     #[test]
     fn the_confirmation_opens_on_cancel_and_enter_takes_the_highlighted_answer() {
         let mut view = view();
-        view.ask(pending(&["/scan/old/target"]));
+        view.asking(&planned(&["/scan/old/target"]), &[]);
         assert_eq!(view.overlay(), Some(Overlay::Confirm));
         assert_eq!(view.pending().unwrap().answer, Answer::Cancel);
 
@@ -2731,7 +4098,7 @@ mod tests {
         assert_eq!(view.overlay(), None);
         assert!(!view.is_deleting());
 
-        view.ask(pending(&["/scan/old/target"]));
+        view.asking(&planned(&["/scan/old/target"]), &[]);
         view.apply(Action::Highlight(Turn::Next));
         assert_eq!(
             view.apply(Action::Answer),
@@ -2743,7 +4110,7 @@ mod tests {
     #[test]
     fn the_deed_is_what_the_question_named_rather_than_what_is_marked_when_it_is_answered() {
         let mut view = view();
-        view.ask(pending(&["/scan/old/target"]));
+        view.asking(&planned(&["/scan/old/target"]), &[]);
 
         // The tree moves while a box is up: a claim arrives, and the reader marks it. The
         // answer must still mean the directory the box described.
@@ -2766,13 +4133,13 @@ mod tests {
         assert!(view.notice().unwrap().contains("nothing is marked"));
 
         // …and so does a batch the safety model refused in full.
-        view.ask(Pending {
-            targets: Vec::new(),
-            bytes: 0,
-            unpriced: 0,
-            kept: vec!["/scan/old/target: it holds a git checkout".to_owned()],
-            answer: Answer::Cancel,
-        });
+        view.asking(
+            &[],
+            &[Refused {
+                path: "/scan/old/target".into(),
+                reason: Refusal::HoldsCheckout,
+            }],
+        );
         assert_eq!(view.overlay(), None);
         assert!(view.notice().unwrap().contains("left alone"));
     }
@@ -2780,7 +4147,7 @@ mod tests {
     #[test]
     fn a_second_delete_while_one_is_running_is_refused_rather_than_racing_it() {
         let mut view = view();
-        view.ask(pending(&["/scan/old/target"]));
+        view.asking(&planned(&["/scan/old/target"]), &[]);
         view.apply(Action::Highlight(Turn::Next));
         view.apply(Action::Answer);
 
@@ -3332,7 +4699,7 @@ mod tests {
     #[test]
     fn quitting_cannot_end_a_view_that_is_half_way_through_a_removal() {
         let mut view = view();
-        view.ask(pending(&["/scan/old/target"]));
+        view.asking(&planned(&["/scan/old/target"]), &[]);
         view.apply(Action::Highlight(Turn::Next));
         view.apply(Action::Answer);
         assert!(view.is_deleting());
@@ -3357,7 +4724,7 @@ mod tests {
     fn a_view_that_was_never_asked_to_quit_does_not_want_to() {
         let mut view = view();
         assert!(!view.wants_to_quit());
-        view.ask(pending(&["/scan/old/target"]));
+        view.asking(&planned(&["/scan/old/target"]), &[]);
         view.apply(Action::Highlight(Turn::Next));
         view.apply(Action::Answer);
         view.deleted(Notice::passing("removed 10 B from 1 directory"), 10);
@@ -3622,11 +4989,14 @@ mod tests {
     #[test]
     fn a_running_removal_counts_targets_against_the_batch_it_was_given() {
         let mut view = view();
-        view.ask(pending(&[
-            "/scan/nx/node_modules",
-            "/scan/nx/packages/ui/node_modules",
-            "/scan/old/target",
-        ]));
+        view.asking(
+            &planned(&[
+                "/scan/nx/node_modules",
+                "/scan/nx/packages/ui/node_modules",
+                "/scan/old/target",
+            ]),
+            &[],
+        );
         view.apply(Action::Highlight(Turn::Next));
         view.apply(Action::Answer);
 
@@ -3673,11 +5043,14 @@ mod tests {
     #[test]
     fn a_batch_that_fails_on_everything_still_shows_the_deleter_working_through_it() {
         let mut view = view();
-        view.ask(pending(&[
-            "/scan/nx/node_modules",
-            "/scan/nx/packages/ui/node_modules",
-            "/scan/old/target",
-        ]));
+        view.asking(
+            &planned(&[
+                "/scan/nx/node_modules",
+                "/scan/nx/packages/ui/node_modules",
+                "/scan/old/target",
+            ]),
+            &[],
+        );
         view.apply(Action::Highlight(Turn::Next));
         view.apply(Action::Answer);
 
@@ -3704,7 +5077,7 @@ mod tests {
     #[test]
     fn a_second_removal_is_refused_while_one_is_running() {
         let mut view = view();
-        view.ask(pending(&["/scan/old/target"]));
+        view.asking(&planned(&["/scan/old/target"]), &[]);
         view.apply(Action::Highlight(Turn::Next));
         view.apply(Action::Answer);
 
@@ -3897,14 +5270,12 @@ mod tests {
     }
 
     /// A resolved plan's worth of question, without needing a filesystem to resolve one.
-    fn pending(targets: &[&str]) -> Pending {
-        Pending {
-            targets: targets.iter().map(PathBuf::from).collect(),
-            bytes: 10,
-            unpriced: 0,
-            kept: Vec::new(),
-            answer: Answer::Cancel,
-        }
+    /// A resolved plan's worth of targets, without a filesystem to resolve one against.
+    fn planned(targets: &[&str]) -> Vec<Planned> {
+        targets
+            .iter()
+            .map(|path| Planned::at(*path, Size::Measured(10)))
+            .collect()
     }
 }
 
@@ -3934,28 +5305,49 @@ mod scale {
     //!
     //! | | per frame |
     //! |---|---|
-    //! | a frame with nothing arriving | **2 µs** |
-    //! | a frame with a claim arriving | **806 µs** |
-    //! | the same, with 8,661 marks | **1.5 ms** |
+    //! | nothing arriving | **1 µs** |
+    //! | a claim arriving, on a view that hides nothing | **782 µs** |
+    //! | the same, on the narrowed view a run opens on | **1.7 ms** |
+    //! | the same, everything marked | **1.9 ms** |
+    //! | the same, one row spared out of it | **2.4 ms** |
     //!
-    //! Three things worth reading off that. The interpolation itself is the first row — two
-    //! microseconds, because it is one entry per row the *pane* drew and the pane is fifty
-    //! rows whatever the tree is. The second row is #602's own number: it is the sort and the
-    //! re-flatten of everything, which the animation did not touch. The third is the one that
-    //! had to be measured rather than argued: sparing one row out of a marked-everything
-    //! pushes the mark down onto every sibling along the path, and one of those levels is
-    //! 8,660 wide — so the per-frame fold over the marks really does run over 8,661 of them,
-    //! and it costs 0.7 ms.
+    //! Five things worth reading off that. The interpolation itself is the first row — one
+    //! microsecond, because it is one entry per row the *pane* drew and the pane is fifty rows
+    //! whatever the tree holds. The second is #602's own number: the sort and the re-flatten of
+    //! everything, which neither the animation nor the marks touched.
     //!
-    //! And a frame only pays any of the last two when something moved. `sync` folds the marks
-    //! and the drains behind the same `stale` flag as the sort, so a reader sitting looking at
-    //! a still tree pays the 2 µs and nothing else.
+    //! The gap between the second row and the third is **what the narrowed default costs**, and
+    //! it is the one number #626 had to measure rather than argue. A view that hides something
+    //! has to be able to say what each row is worth *under it*, and a mark is a (directory,
+    //! view) pair whose partial glyph is computed against the **current** view — so "what is
+    //! visible and what of it is selected" is a walk of the whole tree once per frame that does
+    //! any work. The run opens on `default`, which hides the gitignored tier, so that walk
+    //! happens from the first frame: about 870 µs for 32,634 nodes, or 2.6% of the budget. On
+    //! `all-ignored` or `all` with nothing marked the pass is skipped outright, which is the
+    //! second row.
+    //!
+    //! **That walk is a `Vec` rather than a `HashMap`, and the difference was 3×.** The first
+    //! version hashed on [`NodeId`] and cost 7.2 ms — four `SipHash`es per node, for a key that
+    //! is already a dense arena index the tree never recycles. Indexing is what makes a
+    //! whole-tree pass per frame affordable at all, and it is worth knowing before the next
+    //! per-node cache is added.
+    //!
+    //! Sparing a row out of a marked-everything used to be the expensive case rather than a
+    //! rounding error on it: the mark was pushed down onto every sibling along the path, one of
+    //! those levels is 8,660 wide, and the per-frame fold then ran over 8,661 marks. #626
+    //! replaced the push-down with a single exclusion, so it is now **1 mark and 1 exclusion** —
+    //! which was a correctness change first (a push-down silently spares whatever streams in
+    //! beside the spared row) and a performance one by accident.
+    //!
+    //! And a frame only pays any of this when something moved. `sync` runs the pass behind the
+    //! same `stale` flag as the sort, so a reader sitting looking at a still tree pays the first
+    //! row and nothing else.
     //!
     //! `cargo test --release --lib scale -- --ignored --nocapture` re-runs it.
 
     use crate::fixture::priced;
     use crate::tree::{Order, Tree};
-    use crate::tui::keymap::{Action, Motion};
+    use crate::tui::keymap::{Action, Motion, Turn};
     use crate::tui::state::View;
     use std::time::Instant;
 
@@ -4045,20 +5437,67 @@ mod scale {
         }
         println!("frame during a scan:        {:?}", started.elapsed() / 100);
 
-        // And the expensive one, which is the whole reason this is measured rather than
-        // assumed: sparing one row out of a marked-everything pushes the root's mark down the
-        // path to it, leaving a mark per sibling on the way — and one of those levels is
-        // 8,660 wide. Every frame that does any work then re-folds all of them.
-        view.apply(Action::MarkAll);
-        select(&mut view, "/home/types/p0/node_modules");
-        view.apply(Action::Mark);
-        println!("marks after a push-down:    {}", view.marks.len());
+        // The same frame on a view that hides nothing, which is the one case that skips the
+        // whole-tree pass. It is what the run *used* to open on, so the difference between
+        // this line and the one above is exactly what the narrowed default costs per frame.
+        showing(&mut view, super::Preset::All);
         let started = Instant::now();
         for tick in 201..=300u32 {
+            view.found(priced(&format!("/home/repos/wide{tick}/node_modules"), 1));
+            view.animate(epoch + super::super::moving::COUNT_UP * tick);
+        }
+        println!("frame, nothing hidden:      {:?}", started.elapsed() / 100);
+
+        // And the expensive one, which is the whole reason this is measured rather than
+        // assumed. A mark is a (directory, view) pair resolved on demand, so "what is
+        // selected" is a walk of the whole tree rather than a fold over a handful of marks —
+        // one pass per frame that does any work, over 32,634 nodes.
+        showing(&mut view, super::Preset::Default);
+        view.apply(Action::MarkAll);
+        let started = Instant::now();
+        for tick in 301..=400u32 {
             view.found(priced(&format!("/home/repos/later{tick}/node_modules"), 1));
             view.animate(epoch + super::super::moving::COUNT_UP * tick);
         }
-        println!("frame, marks pushed down:   {:?}", started.elapsed() / 100);
+        println!("frame, everything marked:   {:?}", started.elapsed() / 100);
+
+        // Sparing one row out of that used to push the root's mark down onto every sibling
+        // along the path — and one of those levels is 8,660 wide. An exclusion says the same
+        // thing in one entry, so this is now the line above plus nothing.
+        select(&mut view, "/home/types/p0/node_modules");
+        view.apply(Action::Mark);
+        println!(
+            "marks and exclusions:       {} + {}",
+            view.marks.len(),
+            view.spared.len()
+        );
+        let started = Instant::now();
+        for tick in 401..=500u32 {
+            view.found(priced(&format!("/home/repos/spared{tick}/node_modules"), 1));
+            view.animate(epoch + super::super::moving::COUNT_UP * tick);
+        }
+        println!("frame, one row spared:      {:?}", started.elapsed() / 100);
+
+        // …and with a view narrowing on top, which is the pass at its most expensive: every
+        // claim is asked whether it survives the lens as well as whether a mark covers it.
+        view.apply(Action::ToggleKind(crate::rules::Kind::Dependencies));
+        let started = Instant::now();
+        for tick in 501..=600u32 {
+            view.found(priced(&format!("/home/repos/lens{tick}/node_modules"), 1));
+            view.animate(epoch + super::super::moving::COUNT_UP * tick);
+        }
+        println!("frame, marked and narrowed: {:?}", started.elapsed() / 100);
+    }
+
+    /// Presses `f` until the view is the one named.
+    fn showing(view: &mut View, preset: super::Preset) {
+        for _ in 0..super::Preset::ALL.len() {
+            if view.preset() == Some(preset) {
+                return;
+            }
+            view.apply(Action::CyclePreset(Turn::Next));
+        }
+        panic!("{preset} is not on the cycle");
     }
 
     /// Puts the cursor on a row by walking to it, which is all a reader can do.
