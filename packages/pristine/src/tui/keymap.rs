@@ -113,6 +113,13 @@ pub enum Action {
     /// find out whether it is armed. The key **asks** and never deletes; the only thing that
     /// commits is the dialog handing back what it was holding.
     Commit,
+    /// `m` — show or hide the treemap pane.
+    ///
+    /// A key rather than a flag, and the reason is the one every part of [`super::treemap`]
+    /// turns on: an enhancement a reader cannot dismiss is not an enhancement. It is on the
+    /// tree's surface rather than among the globals because what it changes is how the tree
+    /// pane is laid out.
+    ToggleMap,
     /// `s` — the next sort key.
     CycleSort,
     /// `S` — the same key, upside down.
@@ -480,6 +487,12 @@ fn tree_verbs() -> Vec<Binding> {
             &[key('x')],
             "delete what is marked — asks first",
             Action::Commit,
+        ),
+        bind(
+            Tree,
+            &[key('m')],
+            "show or hide the map beside the tree",
+            Action::ToggleMap,
         ),
         bind(Tree, &[key('s')], "the next sort key", Action::CycleSort),
         bind(

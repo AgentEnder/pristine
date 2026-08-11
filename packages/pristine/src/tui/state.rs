@@ -401,6 +401,22 @@ pub struct View {
     stale: bool,
     /// Whether the tree's levels are in the current sort order.
     sorted: bool,
+    /// The treemap pane: whether this terminal could draw one, and whether the reader wants
+    /// it. Told to the view the way [`View::viewport`] is — the renderer owns the fact and
+    /// the view owns the decision, so `m` has one place to act on and the layout has one
+    /// place to read.
+    map: Map,
+}
+
+/// Whether the map pane is possible, and whether it is on.
+///
+/// Two booleans rather than one, because the answer to `m` differs: a reader on a terminal
+/// that cannot draw one has to be *told* that, where a silent no-op on a documented key is
+/// the same failure shape as a mark box that cannot be pressed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Map {
+    possible: bool,
+    on: bool,
 }
 
 impl View {
@@ -429,6 +445,12 @@ impl View {
             notice: None,
             stale: true,
             sorted: false,
+            // On wherever it is possible, which is the spike's own bet: a feature nobody
+            // turns on is a feature nobody judges.
+            map: Map {
+                possible: false,
+                on: true,
+            },
         };
         view.sync();
         view
@@ -538,6 +560,17 @@ impl View {
         self.settle(&anchor);
         self.follow_cursor();
         self.stale = false;
+    }
+
+    /// Whether this terminal can draw a map at all. Told once, at start-up.
+    pub fn allow_maps(&mut self, possible: bool) {
+        self.map.possible = possible;
+    }
+
+    /// Whether the map pane is on the screen.
+    #[must_use]
+    pub fn maps(&self) -> bool {
+        self.map.possible && self.map.on
     }
 
     /// How many rows the tree pane can draw. Set by the renderer, used by the page keys.
@@ -770,6 +803,7 @@ impl View {
             Action::Mark => self.toggle_mark(),
             Action::MarkAll => self.mark_all(),
             Action::Commit => return self.commit(),
+            Action::ToggleMap => self.toggle_map(),
             Action::CycleSort => self.resort(Sort {
                 by: self.sort.by.next(),
                 reverse: self.sort.reverse,
@@ -788,6 +822,20 @@ impl View {
         }
         self.sync();
         Effect::None
+    }
+
+    /// `m`: the map pane, or the reason there is not one.
+    ///
+    /// A terminal that cannot draw one is told so rather than left pressing a documented key
+    /// that does nothing — the same rule as a mark box that is drawn and cannot be pressed.
+    fn toggle_map(&mut self) {
+        if !self.map.possible {
+            self.notice = Some(
+                "this terminal does not read the graphics protocol, so there is no map".to_owned(),
+            );
+            return;
+        }
+        self.map.on = !self.map.on;
     }
 
     /// `q`: leave — unless something irreversible is in flight, in which case wait for it.

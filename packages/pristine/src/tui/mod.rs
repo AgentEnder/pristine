@@ -65,6 +65,7 @@ pub mod chrome;
 pub mod keymap;
 pub mod render;
 pub mod state;
+pub mod treemap;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -92,6 +93,7 @@ use chrome::{Chrome, Decor, Status};
 use keymap::{Action, Gesture, Motion, action_for, finish};
 use render::{Placed, Spot};
 use state::{Effect, Pending, View, plural};
+use treemap::{Pane, Screen};
 
 /// How long the loop waits on the terminal before repainting anyway.
 ///
@@ -195,16 +197,21 @@ struct Restore<W: Write> {
     alternate: bool,
     mouse: bool,
     chrome: Chrome<W>,
+    /// The treemap's image, which is the one piece of state here that lives in **another
+    /// program's memory**: a graphics image is stored by the terminal, so a process that
+    /// exits without deleting one leaves it there with nothing alive to notice.
+    screen: Screen<W>,
 }
 
 impl<W: Write> Restore<W> {
     /// A guard that has taken nothing yet, holding the decorations it will hand back.
-    fn new(chrome: Chrome<W>) -> Self {
+    fn new(chrome: Chrome<W>, screen: Screen<W>) -> Self {
         Self {
             raw: false,
             alternate: false,
             mouse: false,
             chrome,
+            screen,
         }
     }
 
@@ -214,10 +221,13 @@ impl<W: Write> Restore<W> {
     /// still on the alternate screen, or the other way round, is no better than one that was
     /// never restored, and the failing call says nothing about whether the next one would.
     fn finish(&mut self) -> io::Result<()> {
-        // The decorations first: they were taken last, and the one that matters most —
-        // closing a synchronized update — is the difference between a terminal that repaints
-        // and one that shows a frozen frame forever.
-        let mut first = self.chrome.restore();
+        // The image first, because it was written last and because it is the only one of
+        // these whose undoing is somebody else's memory rather than a mode of this terminal.
+        let mut first = self.screen.restore();
+        // Then the decorations: the one that matters most — closing a synchronized update —
+        // is the difference between a terminal that repaints and one that shows a frozen
+        // frame forever.
+        first = first.and(self.chrome.restore());
         if std::mem::take(&mut self.mouse) {
             first = first.and(execute!(io::stdout(), DisableMouseCapture));
         }
@@ -436,7 +446,11 @@ impl Events for Keyboard {
 pub fn run(options: &Options, ruleset: Arc<Ruleset>) -> io::Result<Outcome> {
     // Detected once, from the environment and a `is_terminal`, and never probed for: see
     // [`chrome`] for why nothing here asks the terminal a question it has to wait for.
-    let mut restore = Restore::new(Chrome::new(io::stdout(), Decor::detect()));
+    let decor = Decor::detect();
+    let mut restore = Restore::new(
+        Chrome::new(io::stdout(), decor),
+        Screen::new(io::stdout(), decor.graphics),
+    );
     enable_raw_mode()?;
     restore.raw = true;
     execute!(io::stdout(), EnterAlternateScreen)?;
@@ -455,6 +469,7 @@ pub fn run(options: &Options, ruleset: Arc<Ruleset>) -> io::Result<Outcome> {
         &mut terminal,
         &mut Keyboard,
         &mut restore.chrome,
+        &mut restore.screen,
         options,
         ruleset,
     );
@@ -474,11 +489,15 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
     terminal: &mut Terminal<B>,
     events: &mut dyn Events,
     chrome: &mut Chrome<W>,
+    screen: &mut Screen<W>,
     options: &Options,
     ruleset: Arc<Ruleset>,
 ) -> io::Result<Outcome> {
     let (post, inbox) = channel();
     let mut view = View::new(Tree::new(&options.root));
+    // Told once: whether a map is possible at all is a fact about the terminal, and the view
+    // owns the decision that reads it. Same split as `View::viewport`.
+    view.allow_maps(screen.allowed());
 
     let walker = spawn_walk(options, ruleset, post.clone());
     let mut outcome = Outcome::default();
@@ -530,12 +549,20 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
         chrome.begin_frame()?;
         // The geometry comes back out of the draw rather than being computed beside it, so a
         // press is resolved against the frame the reader is looking at. See [`Placed`].
-        let drawn = terminal.draw(|frame| placed = render::draw(frame, &mut view, &outcome.errors));
+        // The frame is dropped rather than kept: a `CompletedFrame` borrows the terminal,
+        // and the image below has to be written *through* the same one.
+        let drawn = terminal
+            .draw(|frame| placed = render::draw(frame, &mut view, &outcome.errors))
+            .map(|_| ());
+        // Inside the synchronized update, after the cells and before the frame is closed:
+        // the image and the text around it have to land together or the pane tears in a way
+        // a full repaint cannot fix, because ratatui will not redraw cells it did not change.
+        let mapped = map(screen, terminal, &view, &placed);
         // Ended before the draw's failure is reported, never after: a terminal left inside a
         // synchronized update keeps showing the frame before last, so a `?` here would trade
         // a reported error for a screen that is silently frozen.
         let ended = chrome.end_frame();
-        drawn.and(ended)?;
+        drawn.and(mapped).and(ended)?;
 
         // A quit that was held back while a removal ran, now that it is over. Checked here
         // rather than where the key was pressed, because what the key produced was a promise
@@ -618,6 +645,42 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
     // waiting.
     drop(walker);
     Ok(outcome)
+}
+
+/// Puts the treemap on the frame that has just been drawn, or takes it off.
+///
+/// Three reasons it comes off, and they are all "the map cannot be right", not "the map is
+/// not wanted": there is no pane on this frame, an overlay is over the place it would go, or
+/// the terminal will not say how big a cell is.
+///
+/// **A terminal that refuses `TIOCGWINSZ` is not an error.** The whole feature is an
+/// enhancement, so every way it can fail has to end in there being no picture rather than in
+/// a run that stops — which is why the size is read with `ok()` where nearly every other
+/// call in this file carries a `?`.
+fn map<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
+    screen: &mut Screen<W>,
+    terminal: &mut Terminal<B>,
+    view: &View,
+    placed: &Placed,
+) -> io::Result<()> {
+    // An overlay is drawn by ratatui *as cells*, and the image sits above them — so a help
+    // page over the map would be a help page behind it. The picture goes away instead.
+    let Some(cells) = placed.map.filter(|_| view.overlay().is_none()) else {
+        return screen.hide();
+    };
+    let Some(cell) = terminal
+        .backend_mut()
+        .window_size()
+        .ok()
+        .and_then(|window| {
+            let (across, down) = (window.columns_rows.width, window.columns_rows.height);
+            (across > 0 && down > 0)
+                .then(|| (window.pixels.width / across, window.pixels.height / down))
+        })
+    else {
+        return screen.hide();
+    };
+    screen.show(view, Pane { cells, cell }, Instant::now())
 }
 
 /// Notices a removal that ended without saying what it did.
@@ -840,7 +903,7 @@ pub fn size_mode(asked: SizeMode) -> SizeMode {
 #[cfg(test)]
 mod tests {
     use super::{
-        Batch, Chrome, Decor, Message, Options, Outcome, Restore, SizeMode, drain, reap,
+        Batch, Chrome, Decor, Message, Options, Outcome, Restore, Screen, SizeMode, drain, reap,
         spawn_pricer, summarise,
     };
     use crate::delete::{Failure, Refusal, Refused, Removal, Removed};
@@ -1228,7 +1291,10 @@ mod tests {
         // It really does call `disable_raw_mode` and leave the alternate screen, on a process
         // that is in neither state. Both are no-ops there, and the escape sequence goes to
         // the harness's captured stdout.
-        let mut restore = Restore::new(Chrome::new(Vec::new(), Decor::silent()));
+        let mut restore = Restore::new(
+            Chrome::new(Vec::new(), Decor::silent()),
+            Screen::new(Vec::new(), false),
+        );
         assert!(restore.finish().is_ok(), "nothing was taken");
 
         restore.raw = true;
@@ -1251,15 +1317,19 @@ mod tests {
         // The reason the chrome is a field of `Restore` rather than a guard beside it. What
         // is asserted is that the ordinary way out and the drop path are one path: `finish`
         // does the whole undoing, and `Drop` afterwards has nothing left to write.
-        let mut restore = Restore::new(Chrome::new(
-            Vec::new(),
-            Decor {
-                sync: true,
-                title: Some(XTERM_STACK),
-                progress: true,
-                notify: None,
-            },
-        ));
+        let mut restore = Restore::new(
+            Chrome::new(
+                Vec::new(),
+                Decor {
+                    sync: true,
+                    title: Some(XTERM_STACK),
+                    progress: true,
+                    notify: None,
+                    graphics: false,
+                },
+            ),
+            Screen::new(Vec::new(), false),
+        );
         restore.chrome.enter().unwrap();
         restore.chrome.begin_frame().unwrap();
         restore.finish().unwrap();
@@ -1288,7 +1358,7 @@ mod tests {
 /// seams, which is exactly why they are here.
 #[cfg(test)]
 mod loop_tests {
-    use super::{Chrome, Decor, Events, Options, drive};
+    use super::{Chrome, Decor, Events, Options, Screen, drive};
     use crate::Ruleset;
     use crate::size::SizeMode;
     use crate::tui::chrome::XTERM_STACK;
@@ -1482,6 +1552,7 @@ mod loop_tests {
             &mut terminal,
             &mut keys,
             &mut Chrome::new(Vec::new(), Decor::silent()),
+            &mut Screen::new(Vec::new(), false),
             &Options {
                 root: tmp.path().to_path_buf(),
                 min_size: crate::DEFAULT_MIN_SIZE,
@@ -1560,6 +1631,7 @@ mod loop_tests {
             &mut terminal,
             &mut hand,
             &mut Chrome::new(Vec::new(), Decor::silent()),
+            &mut Screen::new(Vec::new(), false),
             &Options {
                 root: tmp.path().to_path_buf(),
                 min_size: crate::DEFAULT_MIN_SIZE,
@@ -1610,12 +1682,18 @@ mod loop_tests {
                 title: Some(XTERM_STACK),
                 progress: true,
                 notify: None,
+                graphics: true,
             },
         );
+        // A terminal that reads the graphics protocol as well, so the map's own wiring is
+        // driven by the same run: the pane is split off the body, the image is written
+        // inside the synchronized update, and it is taken down when the confirmation goes up.
+        let mut screen = Screen::new(Vec::new(), true);
         let outcome = drive(
             &mut terminal,
             &mut keys,
             &mut chrome,
+            &mut screen,
             &Options {
                 root: tmp.path().to_path_buf(),
                 min_size: crate::DEFAULT_MIN_SIZE,
@@ -1657,5 +1735,22 @@ mod loop_tests {
         // The bar reaches 0 only when the guard restores it, which this test does not use, so
         // what the run itself must not do is leave it at a percentage it never got to.
         assert!(said.contains("\x1b]9;4;"), "no progress was ever reported");
+
+        // The map, through the same run. What matters is not that a picture appeared but
+        // that every one of them is *balanced*: an image transmitted and never deleted is a
+        // megabyte left in the terminal's memory after this process has gone.
+        let drawn = String::from_utf8_lossy(screen.sink()).into_owned();
+        assert!(drawn.contains("\x1b_Ga=T,"), "no map was ever drawn");
+        assert!(
+            drawn.matches("a=d,d=I").count() >= drawn.matches("a=T,").count(),
+            "an image was transmitted without a delete to match it"
+        );
+        // Every placement is inside a cursor save/restore, because the cursor belongs to
+        // ratatui and a frame drawn from where an image left it is a frame in the wrong place.
+        assert_eq!(
+            drawn.matches("\x1b7").count(),
+            drawn.matches("\x1b8").count(),
+            "the cursor was not put back after a placement"
+        );
     }
 }
