@@ -1519,7 +1519,7 @@ mod loop_tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     /// A result from a backend that cannot fail, in the shape of one that can.
@@ -1587,12 +1587,27 @@ mod loop_tests {
         }
     }
 
-    /// How many events a script will perform before it gives up and quits anyway.
+    /// How long a script will keep performing before it gives up and quits anyway.
     ///
-    /// Only reached by a run that never satisfies its `until`, which is a real failure — the
-    /// point of the ceiling is that such a run *ends*, so the test reports what it found
-    /// instead of hanging with no output.
-    const PATIENCE: usize = 10_000;
+    /// Only reached by a run that has not satisfied its `until` — which may be a fault in what
+    /// is being tested and may be a machine too busy to have got there yet, and nothing in here
+    /// can tell those apart. So the ceiling ends the run and [`Script::why`] reports it without
+    /// claiming which. The point of having one at all is that such a run *ends*, and says what
+    /// it found rather than hanging with no output.
+    ///
+    /// **In seconds, and deliberately not in events.** An event count measures how fast this
+    /// loop spins, which is the one quantity here that moves the *wrong* way under load: the
+    /// script's `poll` never blocks, so a busy machine makes the loop burn its allowance
+    /// faster at exactly the moment the walker it is waiting on is most starved. Measured on
+    /// an idle machine a run performs about 400 events; measured under twenty-two concurrent
+    /// copies of this binary, 14,533 — past the 10,000 this ceiling used to be, so it was
+    /// firing on real runs and being read as a fault in whatever the next assertion tested.
+    /// Wall-clock time is the honest expression of "this run has had a fair chance", because
+    /// it does not depend on how many frames got drawn while nothing happened.
+    ///
+    /// Two orders of magnitude above the half-second a healthy run takes, because the only job
+    /// left to it is ending a genuinely stuck run before the harness's own timeout does.
+    const PATIENCE: Duration = Duration::from_secs(60);
 
     /// A reader who performs the same short phrase over and over.
     ///
@@ -1615,16 +1630,124 @@ mod loop_tests {
         /// So the quit is a condition, which is the discipline the sibling test already
         /// applies to breaking the terminal: wait for the thing to have actually happened.
         until: Option<Box<dyn Fn() -> bool + Send>>,
+        /// How long to keep going before quitting anyway. [`PATIENCE`] unless a test is about
+        /// the ceiling itself.
+        patience: Duration,
+        /// When the first event was read, which is the closest this can get to when [`drive`]
+        /// started — the script is not built at the same moment it is handed over.
+        started: Option<Instant>,
+        /// How long the run had been going when the ceiling fired, if it did.
+        ///
+        /// Recorded rather than merely acted on, because acting on it is invisible: see
+        /// [`Script::why`], which is the only thing that reads it.
+        ///
+        /// The duration rather than a flag, because the sentence that reports this has to name
+        /// the ceiling **this** script waited out. Interpolating [`PATIENCE`] would print 60 s
+        /// for a test that set its own, which is the "never invent a number" rule broken in
+        /// the one place a reader has nothing else to go on.
+        expired: Option<Duration>,
+    }
+
+    impl Script {
+        /// A reader performing `events` over and over, patient for [`PATIENCE`].
+        fn new(events: Vec<Event>) -> Self {
+            Self {
+                events,
+                at: 0,
+                until: None,
+                patience: PATIENCE,
+                started: None,
+                expired: None,
+            }
+        }
+
+        /// Presses `q` once `finished` says the run has done its job.
+        fn until(mut self, finished: impl Fn() -> bool + Send + 'static) -> Self {
+            self.until = Some(Box::new(finished));
+            self
+        }
+
+        /// Gives up sooner than [`PATIENCE`], for the one test that is about giving up.
+        fn patience(mut self, patience: Duration) -> Self {
+            self.patience = patience;
+            self
+        }
+
+        /// How long this script waited before giving up, or `None` if it never did — which is
+        /// to say, if the run ended because it got what it was waiting for.
+        fn gave_up(&self) -> Option<Duration> {
+            self.expired
+        }
+
+        /// What a failing assertion says: `otherwise`, unless this script is what ended the run.
+        ///
+        /// **A timeout is not a verdict, and saying which it was is not this method's to do.**
+        /// A script that gives up presses `q`, and `q` is indistinguishable from a reader
+        /// leaving — so an assertion downstream reads a run that never got to the end as a run
+        /// that got there and got it wrong, and states its own subject as the cause. That is
+        /// how "the pointer marked nothing" came to be printed for a run that timed out, and
+        /// it sent a reader to the hit-testing.
+        ///
+        /// The correction is to report and **not** to classify. A pointer that has stopped
+        /// hit-testing, a planner refusing every target and a deleter that never starts all
+        /// leave the condition false until the ceiling fires — which is the same observable
+        /// state as a machine too busy to run the walk. Nothing here can tell those apart, so
+        /// naming either one would be the same invented fact in the opposite direction:
+        /// exonerating the code under test on evidence that never mentioned it, in the queue
+        /// gate, where a hidden regression costs the most.
+        ///
+        /// So this says how long it waited, what is still on disk, and which assertion was
+        /// waiting — and stops. The reader gets the two facts and draws their own conclusion.
+        ///
+        /// A verdict rather than an assertion of its own, which is a separate point and still
+        /// holds: giving up is **not** a failure. The ceiling can fire while a removal is in
+        /// flight, and the view holds the quit until that removal reports — so the run goes on
+        /// to do exactly what it was asked. Only the filesystem gets to say whether the job was
+        /// done; this only fills in the sentence when it says no.
+        fn why(&self, otherwise: &str, target: &Path) -> String {
+            let Some(waited) = self.expired else {
+                return otherwise.to_owned();
+            };
+            format!(
+                "timed out after {waited:?}: the run was still going when the script ran out of \
+                 patience, and {} still holds {} files. A starved machine and a real regression \
+                 both look like this from here, so this names neither — the assertion that was \
+                 waiting is {otherwise:?}",
+                target.display(),
+                files_under(target),
+            )
+        }
     }
 
     impl Events for Script {
+        /// Always an event waiting — but yielding first.
+        ///
+        /// The real `event::poll` blocks for its timeout, so the shipped loop spends most of
+        /// its life asleep. This one cannot block, and a script that says "yes" instantly
+        /// turns the loop into a spinner that holds a core against the very walker and deleter
+        /// it is waiting on — hardest on the loaded machine where they can least afford it.
+        ///
+        /// Measured on this box, eighteen concurrent copies of these tests across fourteen
+        /// cores: a run burns a median of 608 events without the yield and 234 with it. Same
+        /// work, 2.6× less spinning, and the difference is time handed back to the threads the
+        /// assertions are waiting for. It costs nothing on an idle machine, where there is no
+        /// other runnable thread to hand over to.
         fn poll(&mut self, _timeout: Duration) -> io::Result<bool> {
+            std::thread::yield_now();
             Ok(true)
         }
 
         fn read(&mut self) -> io::Result<Event> {
+            let started = *self.started.get_or_insert_with(Instant::now);
+            let waited = started.elapsed();
+            if waited >= self.patience {
+                // The first expiry's figure, kept: every read after this one is also past the
+                // ceiling, and the number worth reporting is how long the run took to give up
+                // rather than how long the quit then took to be honoured.
+                self.expired.get_or_insert(waited);
+            }
             let leaving =
-                self.at >= PATIENCE || self.until.as_ref().is_some_and(|finished| finished());
+                self.expired.is_some() || self.until.as_ref().is_some_and(|finished| finished());
             let event = if leaving {
                 key(KeyCode::Char('q'))
             } else {
@@ -1684,6 +1807,79 @@ mod loop_tests {
     }
 
     #[test]
+    fn a_script_that_runs_out_of_patience_reports_a_timeout_rather_than_a_verdict() {
+        // #632: the ceiling is the harness giving up, and until it said so every assertion
+        // downstream reported it as the *loop* failing at whatever that assertion was about.
+        // A run that never marks anything is the shape both a starved walker and a broken
+        // gesture leave behind — the row never arrives either way — so this drives the same
+        // loop with a phrase that cannot mark, and asserts the report keeps the two facts it
+        // can see apart from the cause it cannot: nothing was removed, the script stopped
+        // waiting, and which of those explains the other is left to the reader.
+        let (tmp, target) = fixture();
+        let mut terminal = Terminal::new(Flaky {
+            inner: TestBackend::new(100, 24),
+            broken: Arc::new(AtomicBool::new(false)),
+        })
+        .unwrap();
+        // `↓` and `↑` move a cursor and nothing else, so this run can only ever end on the
+        // ceiling — there is no `q` in the phrase and no condition to satisfy.
+        let mut idle = Script::new(vec![key(KeyCode::Down), key(KeyCode::Up)])
+            .patience(Duration::from_millis(250));
+
+        let outcome = drive(
+            &mut terminal,
+            &mut idle,
+            &mut Chrome::new(Vec::new(), Decor::silent()),
+            &mut Screen::new(Vec::new(), false),
+            &Options {
+                root: tmp.path().to_path_buf(),
+                min_size: crate::DEFAULT_MIN_SIZE,
+                size_mode: SizeMode::Skip,
+                one_file_system: true,
+                older_than: None,
+            },
+            Arc::new(Ruleset::builtin().unwrap()),
+        )
+        .unwrap();
+
+        // It *ended*, which is the whole point of having a ceiling…
+        assert!(idle.gave_up().is_some(), "the run ended some other way");
+        // …nothing went, because nothing in the phrase can mark…
+        assert!(target.exists(), "the phrase cannot mark, so nothing can go");
+        assert!(
+            outcome.whole(),
+            "a run that did nothing is still a whole run"
+        );
+
+        // …and this is the fix. The sentence handed to a downstream assertion reports the two
+        // things it can actually see — how long it waited, and what is still on disk — and
+        // keeps the assertion that was waiting, so the reader still knows what was being asked.
+        let said = idle.why("the pointer marked nothing", &target);
+        assert!(said.contains("timed out after"), "{said}");
+        assert!(said.contains("holds 2000 files"), "{said}");
+        assert!(said.contains("\"the pointer marked nothing\""), "{said}");
+
+        // And it stops there, which is the half a first attempt at this got wrong. This run
+        // genuinely *was* starved — nothing in its phrase can mark — but a pointer that had
+        // stopped hit-testing leaves exactly the same state, so a message that ruled one out
+        // would be inventing the one fact it cannot observe, in the direction that hides a
+        // regression. Naming neither is what keeps the queue gate able to fail on a real one.
+        assert!(said.contains("names neither"), "{said}");
+        assert!(
+            !said.contains("NOT"),
+            "the timeout exonerated the code under test: {said}"
+        );
+
+        // And the other half, without which this would just be a louder false block: a script
+        // that did *not* give up hands the sentence straight back, so an ordinary failure
+        // still says the ordinary thing.
+        assert_eq!(
+            Script::new(Vec::new()).why("the pointer marked nothing", &target),
+            "the pointer marked nothing"
+        );
+    }
+
+    #[test]
     fn a_terminal_that_fails_mid_removal_still_waits_for_the_batch() {
         let (tmp, target) = fixture();
         let whole = files_under(&target);
@@ -1709,18 +1905,14 @@ mod loop_tests {
         // Mark the scan root, then ask-highlight-confirm, on repeat. The root row exists from
         // the first frame, and a mark on it covers whatever the walk finds underneath —
         // which is the streaming property doing the test's synchronisation for it.
-        let mut keys = Script {
-            events: vec![
-                key(KeyCode::Char(' ')),
-                key(KeyCode::Char('x')),
-                key(KeyCode::Right),
-                key(KeyCode::Enter),
-            ],
-            at: 0,
-            // Nothing to wait for: this run is ended by the terminal failing, which is the
-            // whole subject of the test.
-            until: None,
-        };
+        // Nothing to wait for: this run is ended by the terminal failing, which is the whole
+        // subject of the test, so the script carries no `until`.
+        let mut keys = Script::new(vec![
+            key(KeyCode::Char(' ')),
+            key(KeyCode::Char('x')),
+            key(KeyCode::Right),
+            key(KeyCode::Enter),
+        ]);
 
         let outcome = drive(
             &mut terminal,
@@ -1738,14 +1930,24 @@ mod loop_tests {
         );
         watcher.join().unwrap();
 
+        // First, because a script that gave up quit on its own and the terminal never got the
+        // chance to fail — which would make every sentence below this one describe the wrong
+        // run. See [`Script::expired`].
         // The loop left through a `?`, which is the path that used to abandon the thread…
-        assert!(outcome.is_err(), "the terminal was supposed to fail");
+        assert!(
+            outcome.is_err(),
+            "{}",
+            keys.why("the terminal was supposed to fail", &target)
+        );
         // …and the batch the reader confirmed is finished rather than half done. Without the
         // join this is 2,000 files minus however many fitted into a few microseconds.
         assert!(
             !target.exists(),
-            "{} survived a removal that was abandoned",
-            target.display()
+            "{}",
+            keys.why(
+                &format!("{} survived a removal that was abandoned", target.display()),
+                &target
+            )
         );
     }
 
@@ -1772,39 +1974,36 @@ mod loop_tests {
         // tests; this one is about a click.
         let name_of_root = (10, 2);
         let gone = target.clone();
-        let mut hand = Script {
-            events: vec![
-                at(
-                    MouseEventKind::Down(MouseButton::Left),
-                    box_of_root.0,
-                    box_of_root.1,
-                ),
-                at(
-                    MouseEventKind::Up(MouseButton::Left),
-                    box_of_root.0,
-                    box_of_root.1,
-                ),
-                key(KeyCode::Char('x')),
-                key(KeyCode::Right),
-                key(KeyCode::Enter),
-                at(
-                    MouseEventKind::Down(MouseButton::Left),
-                    name_of_root.0,
-                    name_of_root.1,
-                ),
-                at(
-                    MouseEventKind::Up(MouseButton::Left),
-                    name_of_root.0,
-                    name_of_root.1,
-                ),
-            ],
-            at: 0,
-            // The same condition the sibling test quits on, and for the same reason: a `q`
-            // inside the cycle would end the run whether or not the walker had published the
-            // row the pointer is aiming at, so the assertion would fire on scheduling rather
-            // than on a fault.
-            until: Some(Box::new(move || !gone.exists())),
-        };
+        let mut hand = Script::new(vec![
+            at(
+                MouseEventKind::Down(MouseButton::Left),
+                box_of_root.0,
+                box_of_root.1,
+            ),
+            at(
+                MouseEventKind::Up(MouseButton::Left),
+                box_of_root.0,
+                box_of_root.1,
+            ),
+            key(KeyCode::Char('x')),
+            key(KeyCode::Right),
+            key(KeyCode::Enter),
+            at(
+                MouseEventKind::Down(MouseButton::Left),
+                name_of_root.0,
+                name_of_root.1,
+            ),
+            at(
+                MouseEventKind::Up(MouseButton::Left),
+                name_of_root.0,
+                name_of_root.1,
+            ),
+        ])
+        // The same condition the sibling test quits on, and for the same reason: a `q`
+        // inside the cycle would end the run whether or not the walker had published the
+        // row the pointer is aiming at, so the assertion would fire on scheduling rather
+        // than on a fault.
+        .until(move || !gone.exists());
 
         let outcome = drive(
             &mut terminal,
@@ -1822,7 +2021,16 @@ mod loop_tests {
         )
         .unwrap();
 
-        assert!(!target.exists(), "the pointer marked nothing");
+        // The message #632 exists for. A starved walker never publishes the row the press is
+        // aiming at, so the run ends on the ceiling with the target untouched — and stating
+        // "the pointer marked nothing" flatly about a run that timed out names a cause the run
+        // never established. It stays as the sentence a *finished* run fails with; a timed-out
+        // one gets it quoted alongside the timeout instead. See [`Script::why`].
+        assert!(
+            !target.exists(),
+            "{}",
+            hand.why("the pointer marked nothing", &target)
+        );
         assert!(outcome.whole(), "{outcome:?}");
         assert!(
             tmp.path().join("app/package.json").exists(),
@@ -1844,20 +2052,17 @@ mod loop_tests {
         })
         .unwrap();
         let gone = target.clone();
-        let mut keys = Script {
-            events: vec![
-                key(KeyCode::Char(' ')),
-                key(KeyCode::Char('x')),
-                key(KeyCode::Right),
-                key(KeyCode::Enter),
-            ],
-            at: 0,
-            // The target is `rmdir`ed only once every child under it is gone, so this becomes
-            // true exactly when the batch the test is about has finished. A `q` before then
-            // would be the script racing the walker rather than the loop doing its job — and
-            // a `q` after it is held by the view anyway until the removal reports.
-            until: Some(Box::new(move || !gone.exists())),
-        };
+        let mut keys = Script::new(vec![
+            key(KeyCode::Char(' ')),
+            key(KeyCode::Char('x')),
+            key(KeyCode::Right),
+            key(KeyCode::Enter),
+        ])
+        // The target is `rmdir`ed only once every child under it is gone, so this becomes
+        // true exactly when the batch the test is about has finished. A `q` before then
+        // would be the script racing the walker rather than the loop doing its job — and
+        // a `q` after it is held by the view anyway until the removal reports.
+        .until(move || !gone.exists());
 
         let mut chrome = Chrome::new(
             Vec::new(),
@@ -1889,7 +2094,13 @@ mod loop_tests {
         )
         .unwrap();
 
-        assert!(!target.exists(), "nothing was removed");
+        // The sibling test's rule: "nothing was removed" is a true sentence about the wrong
+        // subject when the run never got as far as removing anything. See [`Script::why`].
+        assert!(
+            !target.exists(),
+            "{}",
+            keys.why("nothing was removed", &target)
+        );
         assert!(outcome.whole(), "{outcome:?}");
         assert!(
             tmp.path().join("app/package.json").exists(),
