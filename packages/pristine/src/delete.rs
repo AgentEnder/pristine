@@ -395,8 +395,54 @@ impl Planner {
     }
 }
 
-/// Somebody watching a removal happen, one target at a time. See [`Deleter::watching`].
-type Watcher = Arc<dyn Fn(&Removed) + Send + Sync>;
+/// Somebody watching a removal happen. See [`Deleter::watching`].
+type Watcher = Arc<dyn Fn(&Step) + Send + Sync>;
+
+/// What a removal reports while it is happening.
+///
+/// Two events rather than one, for the same reason [`crate::Found`] has three: the bytes leave
+/// the disk over seconds and the target finishes once, and those are different facts. A live
+/// view needs both — a row cannot show its size falling toward zero if the only news it ever
+/// gets is that the directory has already gone.
+#[derive(Debug, Clone)]
+pub enum Step {
+    /// Bytes have left the disk and this target is still being swept.
+    Freeing(Freeing),
+    /// The sweep is finished with this target, in whole or in part.
+    Finished(Removed),
+}
+
+/// How far into one target a sweep has got.
+#[derive(Debug, Clone)]
+pub struct Freeing {
+    /// The target.
+    pub path: PathBuf,
+    /// Allocated bytes given back **so far**, counting a hard-linked file once — the same
+    /// accounting [`Removed::bytes`] uses, because they are the same running total read at
+    /// different moments.
+    ///
+    /// **Cumulative, never a delta.** Each report supersedes the last for this path, so a
+    /// consumer that coalesces two of them loses nothing, and one that keeps the latest per
+    /// target cannot double-count however the pool interleaves them. It is also what makes
+    /// reconciling against the final [`Removal`] exact rather than approximate: the last word
+    /// on a target is a total, not a correction.
+    pub bytes: u64,
+    /// Entries unlinked so far.
+    pub entries: u64,
+}
+
+/// How many entries a sweep unlinks between progress reports.
+///
+/// A report per entry would be 24,001 channel messages for one `node_modules` and a `PathBuf`
+/// clone for each. This is the granularity a 30fps view can actually use: a target big enough
+/// to watch emits hundreds of these, and one small enough not to is over before it matters.
+const REPORT_EVERY: u64 = 64;
+
+/// …or this many bytes, whichever comes first.
+///
+/// Entries alone would leave a target that is sixteen very large files reporting nothing until
+/// it finished, which is the exact failure this event exists to remove.
+const REPORT_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Removes what a [`Plan`] says to remove, and nothing else.
 #[derive(Clone, Default)]
@@ -431,20 +477,22 @@ impl Deleter {
         self
     }
 
-    /// Reports each target as it finishes, rather than only in the [`Removal`] at the end.
+    /// Reports the removal as it happens, rather than only in the [`Removal`] at the end.
     ///
     /// The batch CLI has no use for this — it prints one report when the removal is over —
-    /// but a live view does: a row for a directory that is already gone is a row a reader can
-    /// still put a cursor on, and one they can watch a second delete keystroke land on. The
-    /// front end takes each of these and drops the row, which is also why its cursor is
-    /// anchored to a path rather than to a position.
+    /// but a live view does, twice over. [`Step::Finished`] is what drops a row: a row for a
+    /// directory that is already gone is one a reader can still put a cursor on, and one they
+    /// can watch a second delete keystroke land on. [`Step::Freeing`] is what lets that row
+    /// **empty** first, on the bytes actually leaving the disk rather than on a timer — the
+    /// difference between showing what is happening and animating over the fact that it
+    /// already happened.
     ///
     /// Called from the pool, so `sink` is `Send + Sync` and may be called from several
-    /// threads at once and in any order. It sees exactly what [`Removal::removed`] will
-    /// contain — same condition, same values — because both come from
-    /// [`Sweep::reported`].
+    /// threads at once and in any order. A `Finished` sees exactly what [`Removal::removed`]
+    /// will contain — same condition, same values — because both come from
+    /// [`Sweep::reported`], and a `Freeing` is the same running total read earlier.
     #[must_use]
-    pub fn watching(mut self, sink: impl Fn(&Removed) + Send + Sync + 'static) -> Self {
+    pub fn watching(mut self, sink: impl Fn(&Step) + Send + Sync + 'static) -> Self {
         self.watching = Some(Arc::new(sink));
         self
     }
@@ -494,11 +542,11 @@ impl Deleter {
                         let Some(target) = plan.targets.get(at) else {
                             break;
                         };
-                        let sweep = Sweep::new(plan, &root).run(target);
+                        let sweep = Sweep::new(plan, &root, self.watching.as_ref()).run(target);
                         if let (Some(watching), Some(removed)) =
                             (self.watching.as_ref(), sweep.reported())
                         {
-                            watching(&removed);
+                            watching(&Step::Finished(removed));
                         }
                         mine.push(sweep);
                     }
@@ -602,10 +650,15 @@ struct Sweep<'a> {
     linked: HashSet<(u64, u64)>,
     kept: Vec<Refused>,
     failures: Vec<Failure>,
+    /// Where progress goes while this sweep runs, and the totals already sent, so a report is
+    /// a step forward rather than a repeat.
+    watching: Option<&'a Watcher>,
+    told_bytes: u64,
+    told_entries: u64,
 }
 
 impl<'a> Sweep<'a> {
-    fn new(plan: &'a Plan, root: &'a fs::File) -> Self {
+    fn new(plan: &'a Plan, root: &'a fs::File, watching: Option<&'a Watcher>) -> Self {
         Self {
             plan,
             root,
@@ -616,6 +669,9 @@ impl<'a> Sweep<'a> {
             linked: HashSet::new(),
             kept: Vec::new(),
             failures: Vec::new(),
+            watching,
+            told_bytes: 0,
+            told_entries: 0,
         }
     }
 
@@ -814,10 +870,37 @@ impl<'a> Sweep<'a> {
         self.entries += 1;
         if let Some(identity) = multiply_linked(metadata) {
             if !self.linked.insert(identity) {
+                self.tell();
                 return;
             }
         }
         self.bytes += allocated(metadata);
+        self.tell();
+    }
+
+    /// Says how far this sweep has got, when it has got far enough to be worth saying.
+    ///
+    /// The one place a removal speaks while it is still running, and it is deliberately here
+    /// — inside the single function that accounts for a freed entry — rather than at the
+    /// traversal's branches. A report emitted anywhere else would be a second opinion about
+    /// how much has gone, and the whole value of the event is that it is the *same* running
+    /// total the final [`Removed`] carries, read earlier.
+    fn tell(&mut self) {
+        let Some(watching) = self.watching else {
+            return;
+        };
+        if self.entries - self.told_entries < REPORT_EVERY
+            && self.bytes - self.told_bytes < REPORT_BYTES
+        {
+            return;
+        }
+        self.told_entries = self.entries;
+        self.told_bytes = self.bytes;
+        watching(&Step::Freeing(Freeing {
+            path: self.path.clone(),
+            bytes: self.bytes,
+            entries: self.entries,
+        }));
     }
 
     fn failed(&mut self, path: &Path, err: &impl fmt::Display) {

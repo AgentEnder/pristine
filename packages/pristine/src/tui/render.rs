@@ -254,10 +254,13 @@ fn tree(view: &View, width: u16, height: usize) -> Table<'static> {
                 Style::default()
                     .bg(Color::Rgb(48, 48, 64))
                     .add_modifier(Modifier::BOLD)
-            } else if view.is_draining(row.id) {
-                // Emptied, and on its way out. Dim rather than struck through or coloured:
-                // the directory is gone and the row is a receipt, so it should be receding
-                // from the reader's attention rather than competing for it.
+            } else if view.is_spent(row.id) {
+                // Emptied, and on its way out — dimmed only once its number has reached zero,
+                // never while it is still falling. A row dimmed throughout would be saying
+                // "this is over" during the seconds it is actually happening, which is the
+                // opposite of what the falling number is for. Dim rather than struck through
+                // or coloured: the directory is gone and the row is a receipt now, so it
+                // should recede rather than compete.
                 Style::default().fg(Color::DarkGray)
             } else {
                 arrival(view, row.id)
@@ -788,8 +791,10 @@ mod tests {
     #[test]
     fn the_footer_keeps_the_freed_total_after_the_notice_has_moved_on() {
         let mut view = view();
-        view.freed(2 * 1024 * 1024);
-        view.deleted("removed 2.0 MiB from 1 directory".to_owned());
+        view.deleted(
+            "removed 2.0 MiB from 1 directory".to_owned(),
+            2 * 1024 * 1024,
+        );
         view.animate(std::time::Instant::now() + COUNT_UP * 8);
         let frame = painted(&mut view, 100, 8);
 

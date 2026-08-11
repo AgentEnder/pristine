@@ -75,10 +75,12 @@ one.
   afterwards, because a mark is a statement about a subtree rather than about the rows that
   happened to exist when you pressed the key.
 - `x` deletes what is marked, after a confirmation that opens on **cancel**. A row does not blink
-  out: it empties, dims, and collapses away as the deleter finishes each target, with the freed
-  total climbing in the footer as the reclaimable one falls. The cursor follows the *directory* it
-  was on rather than the row number, and a target that could not be finished keeps its row —
-  labelled with why it was left alone, calmly rather than as an error, because the safety model
+  out: it **empties** as the bytes actually leave the disk — the deleter reports its progress and
+  the row's number is what is left of it — then dims once it reaches zero, then collapses away.
+  The freed total in the footer climbs on the same reports the reclaimable total falls on, so the
+  two are one number read from each end. The cursor follows the *directory* it was on rather than
+  the row number, and a target that could not be finished keeps its row, worth what survived and
+  labelled with why it was left alone — calmly rather than as an error, because the safety model
   refusing a nested checkout is the tool working.
 - Sorting is per level, because children have to stay under their parent. `/` filters on a regex
   over the whole path, and a filtered row's number counts only what the filter shows, so a mark

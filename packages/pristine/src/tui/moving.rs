@@ -62,12 +62,13 @@ pub const FLASH: Duration = Duration::from_millis(160);
 /// reader worked out.
 pub const RUNG: Duration = Duration::from_millis(45);
 
-/// How long a removed row keeps its place, emptying, before it collapses away.
+/// How long an emptied row stays on screen, dimmed, before it collapses away.
 ///
-/// The directory is already gone from the disk when this starts — the deleter only reports a
-/// target once it is finished with it — so this is not a delay before something happens. It is
-/// the row spending its last third of a second saying what happened to it.
-pub const DRAIN: Duration = Duration::from_millis(350);
+/// The *emptying* before this has no duration of its own — it takes exactly as long as the
+/// deleter takes, because it is driven by the bytes the deleter reports leaving the disk. This
+/// is only the beat after the number reaches zero, so the row is seen to have emptied rather
+/// than vanishing on the same frame as its last byte.
+pub const DIM: Duration = Duration::from_millis(200);
 
 /// How long the pricing shimmer takes to cross its column once.
 pub const SHIMMER: Duration = Duration::from_millis(700);
@@ -171,14 +172,30 @@ pub struct Moving {
     /// When each rung of the last mark cascade lights up. Ancestors only, so it is bounded by
     /// the depth of the tree — ten, on a real home directory.
     cascade: HashMap<NodeId, Instant>,
-    /// Rows the deleter has finished with, still emptying. The view reads the deadline off
-    /// this and takes the row out of the tree for real when it passes.
-    draining: HashMap<NodeId, Instant>,
+    /// Targets the deleter is part way through, and the bytes it says have gone from each so
+    /// far. Cumulative, straight off [`crate::delete::Freeing`] — nothing here interpolates
+    /// toward a guess, because the guess is not needed once the real figure is arriving.
+    freeing: HashMap<NodeId, u64>,
+    /// Targets the deleter has finished with, spending their last moment dimmed. The view
+    /// reads the deadline off this and takes the row out of the tree when it passes.
+    spent: HashMap<NodeId, Instant>,
+    /// Bytes from targets of the running batch whose rows have already collapsed away.
+    ///
+    /// They cannot stay in `freeing`, because that map is what "a row is still emptying" is
+    /// read from and a row that has gone is not. They cannot be dropped either: the batch has
+    /// not reported its own total yet, and a counter that fell back by what it had already
+    /// given back would be the one number a reader came back for, going the wrong way.
+    settled: u64,
     /// Claims a pricing thread is inside at this instant. Exactly as many as the pool has
     /// threads, which is the fact the shimmer is drawing.
     hot: HashSet<NodeId>,
-    /// What the session has given back, climbing.
-    freed: Chase,
+    /// What the session has given back.
+    ///
+    /// Not a [`Chase`], deliberately. It moves on the deleter's own progress reports, which is
+    /// the same source and the same instant as the fall on every row above the target — so
+    /// easing it would put the two counters that are meant to move against each other a
+    /// fifth of a second out of step, for no gain over a figure that is already true.
+    freed: u64,
     now: Instant,
 }
 
@@ -190,9 +207,11 @@ impl Moving {
             rows: HashMap::new(),
             arrived: HashMap::new(),
             cascade: HashMap::new(),
-            draining: HashMap::new(),
+            freeing: HashMap::new(),
+            spent: HashMap::new(),
+            settled: 0,
             hot: HashSet::new(),
-            freed: Chase::new(0, now),
+            freed: 0,
             now,
         }
     }
@@ -231,7 +250,7 @@ impl Moving {
         }
         // A chase stamped with any earlier frame belongs to a row nobody is drawing.
         self.rows.retain(|_, chase| chase.at == now);
-        self.freed.advance(freed, now);
+        self.freed = freed;
         self.arrived
             .retain(|_, at| now.saturating_duration_since(*at) < ARRIVAL);
         // The stamp is when a rung *lights*, which for the outer ones is still in the future —
@@ -247,10 +266,10 @@ impl Moving {
         self.rows.get(&id).map_or(truth, Chase::value)
     }
 
-    /// What the session has given back so far, climbing.
+    /// What the session has given back so far.
     #[must_use]
     pub fn freed(&self) -> u64 {
-        self.freed.value()
+        self.freed
     }
 
     /// Notes a directory that has just appeared in the tree.
@@ -330,49 +349,78 @@ impl Moving {
         usize::try_from(elapsed / step.max(1) % width as u128).unwrap_or(0)
     }
 
-    /// Starts a removed row emptying.
-    pub fn drains(&mut self, id: NodeId, now: Instant) {
-        self.draining.entry(id).or_insert(now);
-    }
-
-    /// Whether this row is on its way out.
-    #[must_use]
-    pub fn is_draining(&self, id: NodeId) -> bool {
-        self.draining.contains_key(&id)
-    }
-
-    /// Every row on its way out, for the counters that have to leave them out.
-    pub fn draining(&self) -> impl Iterator<Item = NodeId> + '_ {
-        self.draining.keys().copied()
-    }
-
-    /// How much of a draining row is left, from 1.0 down to 0.0 over [`DRAIN`].
+    /// Records how much of a target the deleter says has gone so far.
     ///
-    /// A straight ramp, and it is the one number here that is **not** a [`Chase`]: an
-    /// exponential approach never formally arrives, so a row easing toward zero would still be
-    /// showing a few hundred kilobytes at the moment it collapsed away. This one reaches zero
-    /// exactly when the row goes, which is the whole claim the effect makes — the row emptied,
-    /// and then it was gone.
-    #[must_use]
-    pub fn draining_share(&self, id: NodeId) -> Option<f64> {
-        let at = self.draining.get(&id)?;
-        let elapsed = self.now.saturating_duration_since(*at).as_secs_f64();
-        Some((1.0 - elapsed / DRAIN.as_secs_f64()).clamp(0.0, 1.0))
+    /// Taken as the total rather than added to, because that is what the event carries: a
+    /// report that arrives out of order behind a later one is discarded rather than winding
+    /// the row backwards, which the pool makes possible and nothing else would catch.
+    pub fn frees(&mut self, id: NodeId, bytes: u64) {
+        let freed = self.freeing.entry(id).or_insert(0);
+        *freed = (*freed).max(bytes);
     }
 
-    /// The rows whose drain has run its course, which the view then takes out of the tree for
-    /// real. Forgotten here in the same breath, so each is handed over exactly once.
-    pub fn drained(&mut self, now: Instant) -> Vec<NodeId> {
+    /// Records that the deleter has finished with a target, and starts its dimmed beat.
+    pub fn spends(&mut self, id: NodeId, bytes: u64, now: Instant) {
+        self.frees(id, bytes);
+        self.spent.entry(id).or_insert(now);
+    }
+
+    /// Whether bytes are leaving this target right now.
+    #[must_use]
+    pub fn is_freeing(&self, id: NodeId) -> bool {
+        self.freeing.contains_key(&id) && !self.spent.contains_key(&id)
+    }
+
+    /// Whether this row has emptied and is spending its last moment on screen.
+    #[must_use]
+    pub fn is_spent(&self, id: NodeId) -> bool {
+        self.spent.contains_key(&id)
+    }
+
+    /// Every row the running removal is still on screen for, with the bytes it has given
+    /// back so far.
+    ///
+    /// What every ancestor subtracts, and half of what the freed counter adds up. Spent
+    /// targets are in here too until their row collapses, because their bytes are just as
+    /// gone and the rows above them have to say so.
+    pub fn leaving(&self) -> impl Iterator<Item = (NodeId, u64)> + '_ {
+        self.freeing.iter().map(|(&id, &bytes)| (id, bytes))
+    }
+
+    /// What the running batch has given back in total, rows still on screen and rows already
+    /// collapsed alike.
+    #[must_use]
+    pub fn freed_so_far(&self) -> u64 {
+        self.settled + self.freeing.values().sum::<u64>()
+    }
+
+    /// The rows whose dimmed beat is over, which the view then takes out of the tree for real.
+    /// Forgotten here in the same breath, so each is handed over exactly once.
+    pub fn collapsed(&mut self, now: Instant) -> Vec<NodeId> {
         let due: Vec<NodeId> = self
-            .draining
+            .spent
             .iter()
-            .filter(|(_, at)| now.saturating_duration_since(**at) >= DRAIN)
+            .filter(|(_, at)| now.saturating_duration_since(**at) >= DIM)
             .map(|(&id, _)| id)
             .collect();
         for id in &due {
-            self.draining.remove(id);
+            self.spent.remove(id);
+            // Out of the per-row map and into the batch's running total. Left where it was it
+            // would keep the view reporting itself in motion for a row nobody can see.
+            self.settled += self.freeing.remove(id).unwrap_or(0);
         }
         due
+    }
+
+    /// Hands the running total over to the caller's own, when the batch has reported one.
+    ///
+    /// The per-target figures and the [`crate::delete::Removal`] are the same arithmetic from
+    /// the same accounting, so keeping both would count every byte twice. The dimmed rows stay
+    /// where they are: what they are worth on screen is zero either way, and it is the *tree*
+    /// that still has to lose them.
+    pub fn banked(&mut self) {
+        self.freeing.clear();
+        self.settled = 0;
     }
 
     /// Whether anything at all is still in motion.
@@ -383,17 +431,17 @@ impl Moving {
     #[must_use]
     pub fn is_moving(&self) -> bool {
         !self.hot.is_empty()
-            || !self.draining.is_empty()
+            || !self.freeing.is_empty()
+            || !self.spent.is_empty()
             || !self.cascade.is_empty()
             || !self.arrived.is_empty()
-            || !self.freed.settled()
             || self.rows.values().any(|chase| !chase.settled())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ARRIVAL, COUNT_UP, Chase, DRAIN, FLASH, Moving, RUNG};
+    use super::{ARRIVAL, COUNT_UP, Chase, DIM, FLASH, Moving, RUNG};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -500,19 +548,54 @@ mod tests {
     }
 
     #[test]
-    fn a_draining_row_is_handed_back_once_and_only_once() {
+    fn a_row_stays_until_its_dimmed_beat_is_over_and_is_handed_back_once() {
         let start = Instant::now();
         let mut moving = Moving::new(start);
-        moving.drains(3, start);
-        assert!(moving.is_draining(3));
+        moving.frees(3, 40);
+        assert!(moving.is_freeing(3));
+        assert!(!moving.is_spent(3), "dimmed while it is still emptying");
+        assert_eq!(moving.leaving().collect::<Vec<_>>(), [(3, 40)]);
 
-        assert!(moving.drained(start + DRAIN / 2).is_empty());
-        assert_eq!(moving.drained(start + DRAIN), vec![3]);
+        moving.spends(3, 100, start);
+        assert!(moving.is_spent(3));
+        assert!(!moving.is_freeing(3));
+        // The finished total supersedes the last progress report rather than adding to it.
+        assert_eq!(moving.leaving().collect::<Vec<_>>(), [(3, 100)]);
+
+        assert!(moving.collapsed(start + DIM / 2).is_empty());
+        assert_eq!(moving.collapsed(start + DIM), vec![3]);
         // Handed over twice, the view would try to remove the same claim from the tree twice —
         // and the second removal would be refused, silently, which is the shape of bug this
         // whole file has to avoid.
-        assert!(moving.drained(start + DRAIN * 2).is_empty());
-        assert!(!moving.is_draining(3));
+        assert!(moving.collapsed(start + DIM * 2).is_empty());
+        assert!(!moving.is_spent(3));
+    }
+
+    #[test]
+    fn a_progress_report_that_arrives_behind_a_later_one_does_not_wind_the_row_backwards() {
+        let start = Instant::now();
+        let mut moving = Moving::new(start);
+        // The pool calls the sink from several threads, so two reports about one target can
+        // reach the channel in either order. Each is a total, so the newest is the largest —
+        // and taking the maximum is what makes that true of what is drawn as well.
+        moving.frees(3, 900);
+        moving.frees(3, 400);
+        assert_eq!(moving.leaving().collect::<Vec<_>>(), [(3, 900)]);
+    }
+
+    #[test]
+    fn banking_a_batch_leaves_nothing_for_the_counter_to_count_twice() {
+        let start = Instant::now();
+        let mut moving = Moving::new(start);
+        moving.spends(3, 100, start);
+
+        moving.banked();
+
+        // The batch report carries the same bytes, so the running figures have to go — but
+        // the row itself is still dimmed, and it is the tree that has yet to lose it.
+        assert_eq!(moving.leaving().count(), 0);
+        assert!(moving.is_spent(3));
+        assert_eq!(moving.collapsed(start + DIM), vec![3]);
     }
 
     #[test]

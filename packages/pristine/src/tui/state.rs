@@ -295,23 +295,6 @@ impl Filter {
     }
 }
 
-/// What has been removed from under one node, and how much of it the screen has caught up
-/// with.
-///
-/// Two numbers rather than one, and the distinction is the whole of "gravity after the point
-/// of no return". `gone` is the truth about the disk the instant the deleter says a target is
-/// finished with, and it is what the **batch and the selection counter** are stated in — a
-/// counter that took a third of a second to notice a deletion would disagree with the batch it
-/// describes for exactly as long. `showing` is what the row is still drawing while it empties,
-/// which is a statement about the screen and is allowed to lag.
-#[derive(Clone, Copy, Debug, Default)]
-struct Drained {
-    /// Everything that has left, in full, straight away.
-    gone: Roll,
-    /// The part of `gone.bytes` the rows have not finished emptying yet.
-    showing: u64,
-}
-
 /// What the event loop has to do about a keystroke, once the view has done its part.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
@@ -398,12 +381,17 @@ pub struct View {
     sorted: bool,
     /// What is in flight on screen: see [`Moving`].
     moving: Moving,
-    /// What has gone from at or below each node, as of this frame. Rebuilt each frame in
-    /// [`View::animate`] from the rows the deleter has finished with.
+    /// What has already left the disk from at or below each node, as of this frame. Rebuilt in
+    /// [`View::animate`] from what the deleter has reported freeing.
     ///
-    /// Bounded by the targets a removal finishes inside a third of a second, times the depth
-    /// of the tree, and it is built once per frame rather than asked per row.
-    drained: HashMap<NodeId, Drained>,
+    /// The bytes here are the deleter's own running total, so a row emptying is the disk
+    /// emptying and not a timer dressed up as one. The **claims** move separately and later:
+    /// a target part way through is a directory that still exists, and it stops being counted
+    /// only when the sweep says it has finished with it.
+    ///
+    /// Bounded by the targets one removal has in flight, times the depth of the tree, and
+    /// built once per frame rather than asked per row.
+    drained: HashMap<NodeId, Roll>,
     /// This frame's instant. Handed in by [`View::animate`] and read by everything else, so
     /// nothing in this file calls a clock.
     now: Instant,
@@ -494,25 +482,44 @@ impl View {
         self.sorted = false;
     }
 
+    /// Bytes the deleter has just given back from a target it is still working through.
+    ///
+    /// This is what makes a row **empty** rather than merely disappear, and the reason it is
+    /// an event rather than a timer: the number falling is the number of bytes that have
+    /// actually left the disk. A fixed animation started after the fact would look the same
+    /// for a target that took ten seconds and one that took ten milliseconds, which is the
+    /// definition of motion that is not information.
+    pub fn freeing(&mut self, path: &Path, bytes: u64) {
+        if let Some(id) = self.tree.find(path) {
+            self.moving.frees(id, bytes);
+            self.stale = true;
+        }
+    }
+
     /// A target the deleter has finished with.
     ///
     /// Only a *complete* removal takes the row away. A target the sweep entered and did not
     /// finish — a checkout inside it, an unreadable subtree — is still on disk, and dropping
     /// its row would tell a reader something was deleted that was not.
     ///
-    /// A complete one does not take it away *yet*. The row spends [`super::moving::DRAIN`]
-    /// emptying — its number falling to zero, which is literally what happened to the disk —
-    /// and [`View::animate`] is what finally removes it. The wait is presentational and the
-    /// consequences are not: a draining row is out of the batch and out of the marks from this
-    /// moment, because it is a row for a directory that is already gone.
-    pub fn removed(&mut self, path: &Path, complete: bool) {
-        if !complete {
-            return;
-        }
+    /// A complete one does not take it away on this frame either. Its number is already at
+    /// zero, having got there on the bytes reported by [`View::freeing`]; what it spends now
+    /// is [`super::moving::DIM`] dimmed, so the row is seen to have emptied instead of
+    /// vanishing on the same frame as its last byte. That beat is presentational and its
+    /// consequences are not: the row is out of the batch and out of the marks from the moment
+    /// the sweep first touched it.
+    pub fn removed(&mut self, path: &Path, bytes: u64, complete: bool) {
         let Some(id) = self.tree.find(path) else {
             return;
         };
-        self.moving.drains(id, self.now);
+        if complete {
+            self.moving.spends(id, bytes, self.now);
+        } else {
+            // Still on disk, and the bytes that did go are still gone. The row keeps its
+            // place showing what is left of it, which is the honest reading of a sweep that
+            // went in and came out again.
+            self.moving.frees(id, bytes);
+        }
         self.stale = true;
     }
 
@@ -532,21 +539,21 @@ impl View {
         self.moving.cooled();
     }
 
-    /// The removal is over, and this is what it did.
-    pub fn deleted(&mut self, notice: String) {
+    /// The removal is over, `notice` is what it did, and `freed` is what the session has given
+    /// back across every batch it has run.
+    ///
+    /// The freed figure is **set** rather than added to, and it is the batch report's own
+    /// arithmetic rather than a second tally kept here: the per-target totals the counter has
+    /// been climbing on and [`crate::delete::Removal::bytes_freed`] are the same bytes counted
+    /// by the same code, so keeping both would count each one twice. The running figures are
+    /// dropped in the same breath that this one lands, which is why the counter hands over
+    /// without so much as a flicker.
+    pub fn deleted(&mut self, notice: String, freed: u64) {
         self.deleting = false;
         self.notice = Some(notice);
+        self.freed = freed;
+        self.moving.banked();
         self.stale = true;
-    }
-
-    /// What the session has given back so far, across every batch.
-    ///
-    /// Set rather than added to, and told to the view rather than counted here, because the
-    /// run's [`super::Outcome`] is already keeping this number for the exit status — and two
-    /// records of one fact is how a footer ends up disagreeing with the window title about
-    /// how much a session got back.
-    pub fn freed(&mut self, total: u64) {
-        self.freed = total;
     }
 
     /// Opens the confirmation on a resolved plan.
@@ -596,8 +603,9 @@ impl View {
         // whole mark set ten thousand times. A draining row goes with them — it is a row for a
         // directory that is no longer on the disk, and a mark on one would put it in the next
         // batch.
+        let (tree, moving) = (&self.tree, &self.moving);
         self.marks
-            .retain(|&id| self.tree.is_attached(id) && !self.moving.is_draining(id));
+            .retain(|&id| tree.is_attached(id) && !(moving.is_freeing(id) || moving.is_spent(id)));
         self.expanded.retain(|&id| self.tree.is_attached(id));
         self.kept.retain(|&id, _| self.tree.is_attached(id));
         // A claim the reader deleted while a pricing thread was inside it never gets its
@@ -634,7 +642,7 @@ impl View {
     pub fn animate(&mut self, now: Instant) {
         self.now = now;
         self.moving.tick(now);
-        for id in self.moving.drained(now) {
+        for id in self.moving.collapsed(now) {
             let path = self.tree.node(id).path.clone();
             self.tree.remove(&path);
             self.stale = true;
@@ -649,66 +657,79 @@ impl View {
                     .take(self.page)
                     .map(|row| row.id),
             )
-            .map(|id| (id, self.emptying(id), self.drained.contains_key(&id)))
+            // Never eased: these numbers come from the deleter and they are already the
+            // truth, so smoothing them would be putting a guess in front of a measurement.
+            // The chase is for values that jump — an arrival, a price — and a row emptying
+            // does not jump, it is reported as it happens.
+            .map(|id| (id, self.live(id).bytes, self.drained.contains_key(&id)))
             .collect();
-        self.moving.advance(now, &targets, self.freed);
+        self.moving.advance(now, &targets, self.freed_total());
     }
 
-    /// Rebuilds [`View::drained`] from the rows that are emptying.
+    /// What the session has given back, counting the batch that is running.
     ///
-    /// One walk up the ancestors per draining row, which is the same shape as
-    /// [`View::recount_marks`] and for the same reason: a subtraction applied when a row
-    /// started emptying would have to be un-applied correctly when it finished, and being
-    /// wrong leaves a total that never comes back.
+    /// One source at a time and no overlap between them: while a removal is in flight the
+    /// figure climbs on the per-target totals the deleter is reporting, and the moment the
+    /// batch reports its own the running figures are dropped for it. See [`View::deleted`].
+    fn freed_total(&self) -> u64 {
+        self.freed + self.moving.freed_so_far()
+    }
+
+    /// Rebuilds [`View::drained`] from what the deleter has reported freeing.
+    ///
+    /// One walk up the ancestors per target in flight, which is the same shape as
+    /// [`View::recount_marks`] and for the same reason: a subtraction applied when a target
+    /// started would have to be un-applied correctly when it finished, and being wrong leaves
+    /// a total that never comes back.
+    ///
+    /// The two halves move at different times on purpose. **Bytes** come off as they are
+    /// freed, because they really have gone. **Claims** come off only when the sweep says it
+    /// has finished with the target, because until then the directory is still there — and
+    /// "how many directories" is what the selection counter and the batch are stated in, so
+    /// dropping it early would say a row had been deleted while it was still being deleted.
     fn recount_drains(&mut self) {
         self.drained.clear();
-        for id in self.moving.draining().collect::<Vec<_>>() {
-            let Some(left) = self.moving.draining_share(id) else {
-                continue;
-            };
+        for (id, freed) in self.moving.leaving().collect::<Vec<_>>() {
             let roll = self.roll(id);
-            #[expect(
-                clippy::cast_precision_loss,
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "a byte count on a ramp between zero and itself, bound for a display \
-                          with one decimal place"
-            )]
-            let showing = (roll.bytes as f64 * left) as u64;
+            let gone = if self.moving.is_spent(id) {
+                // Finished with. Whatever the sweep managed to count, the directory is gone,
+                // so the row is worth nothing and its claim stops counting.
+                roll
+            } else {
+                Roll {
+                    bytes: freed.min(roll.bytes),
+                    claims: 0,
+                    unpriced: 0,
+                }
+            };
             let mut at = Some(id);
             while let Some(current) = at {
                 let drained = self.drained.entry(current).or_default();
-                drained.gone.bytes += roll.bytes;
-                drained.gone.claims += roll.claims;
-                drained.gone.unpriced += roll.unpriced;
-                drained.showing += showing;
+                drained.bytes += gone.bytes;
+                drained.claims += gone.claims;
+                drained.unpriced += gone.unpriced;
                 at = self.tree.node(current).parent;
             }
         }
     }
 
-    /// What a row is worth once the rows emptying under it are taken off.
+    /// What a row is worth once what has already left the disk is taken off.
     ///
-    /// The truth about the disk, which the tree itself cannot state for another third of a
-    /// second: the deleter reports a target only once it has finished with it, so a draining
-    /// row names a directory that is already gone. This is what a decision is made on — the
-    /// batch, the selection counter — and it never lags.
+    /// The truth the tree itself cannot state, because the tree learns about a removal only
+    /// when the deleter has finished with the whole target: this is the same number a second
+    /// or two earlier, falling as the bytes do. It is what the screen draws *and* what a
+    /// decision is made on — the batch, the selection counter — and there is deliberately no
+    /// second, laggier version of it for display.
     fn live(&self, id: NodeId) -> Roll {
         let roll = self.roll(id);
-        let Some(drained) = self.drained.get(&id) else {
+        let Some(gone) = self.drained.get(&id) else {
             return roll;
         };
         Roll {
-            bytes: roll.bytes.saturating_sub(drained.gone.bytes),
-            claims: roll.claims.saturating_sub(drained.gone.claims),
-            unpriced: roll.unpriced.saturating_sub(drained.gone.unpriced),
+            bytes: roll.bytes.saturating_sub(gone.bytes),
+            claims: roll.claims.saturating_sub(gone.claims),
+            unpriced: roll.unpriced.saturating_sub(gone.unpriced),
         }
-    }
-
-    /// The same, plus whatever the rows under it have not finished emptying — what the screen
-    /// shows on the way to [`View::live`].
-    fn emptying(&self, id: NodeId) -> u64 {
-        self.live(id).bytes + self.drained.get(&id).map_or(0, |drained| drained.showing)
     }
 
     /// Whether anything on screen is still in motion, which is what the event loop reads to
@@ -778,7 +799,7 @@ impl View {
     #[must_use]
     pub fn drawn(&self, id: NodeId) -> Roll {
         Roll {
-            bytes: self.moving.shown(id, self.emptying(id)),
+            bytes: self.moving.shown(id, self.live(id).bytes),
             ..self.live(id)
         }
     }
@@ -797,9 +818,12 @@ impl View {
     }
 
     /// Whether anything has been freed this session at all.
+    ///
+    /// True as soon as the first bytes leave rather than when the batch reports, so the
+    /// counter that climbs is on screen for the whole of the fall it is the counterpart to.
     #[must_use]
     pub fn has_freed(&self) -> bool {
-        self.freed > 0
+        self.freed_total() > 0
     }
 
     /// How lit a newly found row is, from 1.0 down to 0.0 over about a second.
@@ -814,10 +838,25 @@ impl View {
         self.moving.is_hot(id)
     }
 
-    /// Whether this row is emptying on its way out.
+    /// Whether bytes are leaving this row right now.
     #[must_use]
-    pub fn is_draining(&self, id: NodeId) -> bool {
-        self.moving.is_draining(id)
+    pub fn is_freeing(&self, id: NodeId) -> bool {
+        self.moving.is_freeing(id)
+    }
+
+    /// Whether this row has emptied and is spending its last moment on screen.
+    #[must_use]
+    pub fn is_spent(&self, id: NodeId) -> bool {
+        self.moving.is_spent(id)
+    }
+
+    /// Whether the deleter has touched this row at all — either phase.
+    ///
+    /// The one predicate the batch, the marks and `space` all read, so "a directory the
+    /// deleter is part way through is not a directory to delete again" is stated once rather
+    /// than in three places that could drift.
+    fn is_leaving(&self, id: NodeId) -> bool {
+        self.moving.is_freeing(id) || self.moving.is_spent(id)
     }
 
     /// Whether the mark cascade is passing through this row right now.
@@ -1211,7 +1250,7 @@ impl View {
         let mut batch = Vec::new();
         let mut stack: Vec<NodeId> = self.marks.iter().copied().collect();
         while let Some(id) = stack.pop() {
-            if !self.shown(id) || self.moving.is_draining(id) {
+            if !self.shown(id) || self.is_leaving(id) {
                 continue;
             }
             let node = self.tree.node(id);
@@ -1424,7 +1463,7 @@ impl View {
         // A directory the deleter has already finished with is not something to mark for
         // deletion. Its row is still on screen because it is emptying, which is a statement
         // about the past.
-        if self.moving.is_draining(row.id) {
+        if self.is_leaving(row.id) {
             return;
         }
         if self.covered(row.id) {
@@ -1590,9 +1629,9 @@ mod tests {
     use crate::fixture::hit;
     use crate::size::Size;
     use crate::tree::{Order, Sort, Tree};
-    use crate::tui::moving::{ARRIVAL, COUNT_UP, DRAIN, FLASH, RUNG};
+    use crate::tui::moving::{ARRIVAL, COUNT_UP, DIM, FLASH, RUNG};
     use std::path::{Path, PathBuf};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     /// A view over a fixed little tree:
     ///
@@ -1641,7 +1680,7 @@ mod tests {
     /// tree. Every test written before the drain existed used a bare `sync` for this, and the
     /// substitution is exact: the removal still happens, a third of a second later.
     fn settle(view: &mut View) {
-        view.animate(Instant::now() + DRAIN * 2);
+        view.animate(Instant::now() + DIM * 2);
     }
 
     /// Moves the cursor onto a row that is already visible, using only the keys a reader has.
@@ -1852,7 +1891,7 @@ mod tests {
         view.apply(Action::ToggleSubtree);
         point_at(&mut view, "/scan/nx/packages/ui/node_modules");
 
-        view.removed(Path::new("/scan/nx/packages/ui/node_modules"), true);
+        view.removed(Path::new("/scan/nx/packages/ui/node_modules"), 100, true);
         settle(&mut view);
 
         // `ui` and `packages` held nothing else, so they went too. `nx` is what is left of
@@ -1867,7 +1906,7 @@ mod tests {
     fn deleting_everything_a_reader_was_looking_at_lands_on_the_scan_root_and_not_on_a_stranger() {
         let mut view = view();
         point_at(&mut view, "/scan/old");
-        view.removed(Path::new("/scan/old/target"), true);
+        view.removed(Path::new("/scan/old/target"), 10, true);
         settle(&mut view);
 
         // The chain ends at the scan root, so that is where a cursor with nothing else left
@@ -1907,7 +1946,7 @@ mod tests {
         let mut view = view();
         let before = view.total();
 
-        view.removed(Path::new("/scan/old/target"), false);
+        view.removed(Path::new("/scan/old/target"), 0, false);
         view.sync();
 
         // The sweep went in and came out again — a checkout inside it, an unreadable
@@ -2017,7 +2056,7 @@ mod tests {
         view.apply(Action::Mark);
         assert_eq!(view.marked().claims, 1);
 
-        view.removed(Path::new("/scan/old/target"), true);
+        view.removed(Path::new("/scan/old/target"), 10, true);
         settle(&mut view);
 
         assert_eq!(view.marked().claims, 0);
@@ -2282,7 +2321,7 @@ mod tests {
 
         // …and the keystroke is remembered rather than dropped: the loop leaves on the first
         // frame after the removal reports.
-        view.deleted("removed 10 B from 1 directory".to_owned());
+        view.deleted("removed 10 B from 1 directory".to_owned(), 10);
         assert!(view.wants_to_quit());
     }
 
@@ -2293,7 +2332,7 @@ mod tests {
         view.ask(pending(&["/scan/old/target"]));
         view.apply(Action::Highlight(Turn::Next));
         view.apply(Action::Answer);
-        view.deleted("removed 10 B from 1 directory".to_owned());
+        view.deleted("removed 10 B from 1 directory".to_owned(), 10);
         assert!(!view.wants_to_quit());
     }
 
@@ -2412,8 +2451,8 @@ mod tests {
         // the path is gone. Nothing else would ever cool it: it would shimmer for a thread
         // that finished long ago, and hold the whole view at the animating frame rate to do
         // it — a quiet, permanent cost on a row nobody can see.
-        view.removed(Path::new("/scan/old/target"), true);
-        view.animate(start + DRAIN);
+        view.removed(Path::new("/scan/old/target"), 10, true);
+        view.animate(start + DIM);
 
         assert!(view.tree().find(Path::new("/scan/old/target")).is_none());
         assert!(!view.is_moving());
@@ -2483,7 +2522,7 @@ mod tests {
     // ---- deletion, restrained ---------------------------------------------------------
 
     #[test]
-    fn a_removed_row_empties_before_it_collapses_away() {
+    fn a_row_empties_on_the_bytes_the_deleter_says_have_gone() {
         let mut view = view();
         let start = Instant::now();
         view.animate(start);
@@ -2491,21 +2530,27 @@ mod tests {
         view.apply(Action::Expand);
         let claim = at(&view, "/scan/nx/node_modules");
 
-        view.removed(Path::new("/scan/nx/node_modules"), true);
+        // Half of the 200-byte target is off the disk. Nothing about this is a timer: the
+        // row is worth exactly what is left of it, and the next report decides the next
+        // frame — so a target that takes ten seconds empties over ten seconds and one that
+        // takes ten milliseconds does not pretend otherwise.
+        view.freeing(Path::new("/scan/nx/node_modules"), 100);
         view.animate(start);
-        assert!(view.is_draining(claim));
-        assert_eq!(view.drawn(claim).bytes, 200);
+        assert!(view.is_freeing(claim));
+        assert!(!view.is_spent(claim), "dimmed while it is still emptying");
+        assert_eq!(view.drawn(claim).bytes, 100);
+        // Its ancestors are lighter by the same bytes, on the same event.
+        assert_eq!(view.drawn(at(&view, "/scan/nx")).bytes, 200);
 
-        view.animate(start + DRAIN / 2);
-        let emptying = view.drawn(claim).bytes;
-        assert!(emptying > 0 && emptying < 200, "{emptying}");
-        // Its ancestors empty in step rather than holding still and then jumping: the row is
-        // 200 bytes lighter on the disk already, and every total above it is too.
-        assert_eq!(view.drawn(at(&view, "/scan/nx")).bytes, emptying + 100);
+        view.freeing(Path::new("/scan/nx/node_modules"), 180);
+        view.animate(start + Duration::from_millis(10));
+        assert_eq!(view.drawn(claim).bytes, 20);
 
-        // It reaches zero exactly as it goes, rather than blinking out at whatever figure it
-        // happened to be showing. That is why the drain is a ramp and not a chase.
-        view.animate(start + DRAIN * 999 / 1000);
+        // The sweep finishes. Only now is the row dim, and only after the beat does it go.
+        view.removed(Path::new("/scan/nx/node_modules"), 200, true);
+        view.animate(start + Duration::from_millis(20));
+        assert!(view.is_spent(claim));
+        assert!(!view.is_freeing(claim));
         assert_eq!(view.drawn(claim).bytes, 0);
         assert!(
             view.tree()
@@ -2513,7 +2558,7 @@ mod tests {
                 .is_some()
         );
 
-        view.animate(start + DRAIN);
+        view.animate(start + Duration::from_millis(20) + DIM);
         assert!(
             view.tree()
                 .find(Path::new("/scan/nx/node_modules"))
@@ -2523,7 +2568,31 @@ mod tests {
     }
 
     #[test]
-    fn a_row_that_is_emptying_is_out_of_the_batch_and_out_of_the_counter() {
+    fn a_row_the_sweep_could_not_finish_keeps_what_is_left_of_it() {
+        let mut view = view();
+        let start = Instant::now();
+        view.animate(start);
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Expand);
+        let claim = at(&view, "/scan/nx/node_modules");
+
+        // A checkout inside it, an unreadable corner: the sweep went in, freed some of it and
+        // came out again. The directory is still there, so the row stays — worth what is left
+        // rather than what it was, which is the only figure that is true of the disk.
+        view.removed(Path::new("/scan/nx/node_modules"), 150, false);
+        view.animate(start + DIM * 2);
+
+        assert!(
+            view.tree()
+                .find(Path::new("/scan/nx/node_modules"))
+                .is_some()
+        );
+        assert!(!view.is_spent(claim), "a row that survived was collapsed");
+        assert_eq!(view.drawn(claim).bytes, 50);
+    }
+
+    #[test]
+    fn a_row_the_deleter_has_touched_is_out_of_the_batch_and_out_of_the_counter() {
         let mut view = view();
         let start = Instant::now();
         view.animate(start);
@@ -2531,25 +2600,29 @@ mod tests {
         view.apply(Action::Mark);
         assert_eq!(view.marked().claims, 2);
 
-        view.removed(Path::new("/scan/nx/node_modules"), true);
+        // Part way through, not finished: the bytes are gone but the directory is not, so the
+        // counter loses the bytes and keeps the count.
+        view.freeing(Path::new("/scan/nx/node_modules"), 200);
         view.animate(start);
-
-        // The deleter reports a target once it has *finished* with it, so a draining row
-        // names a directory that is already gone. Offering it to a second removal would
-        // report a failure for the one thing that worked.
+        assert_eq!(view.marked().claims, 2);
+        assert_eq!(view.marked().bytes, 100);
+        // It is out of the batch from the moment the sweep first touched it, though. Offering
+        // a directory that is being deleted to a second removal would report a failure for
+        // the one thing that worked.
         assert_eq!(
             batched(&view),
             [PathBuf::from("/scan/nx/packages/ui/node_modules")]
         );
-        // …and the counter that describes the batch says the same thing it does. A selection
-        // stated in bytes from one set and directories from another is the arithmetic a
-        // reader catches first.
+
+        // And the claim stops counting when the sweep says it has finished with it.
+        view.removed(Path::new("/scan/nx/node_modules"), 200, true);
+        view.animate(start);
         assert_eq!(view.marked().claims, 1);
         assert_eq!(view.marked().bytes, 100);
     }
 
     #[test]
-    fn a_row_that_is_emptying_cannot_be_marked() {
+    fn a_row_the_deleter_has_touched_cannot_be_marked() {
         let mut view = view();
         let start = Instant::now();
         view.animate(start);
@@ -2557,18 +2630,19 @@ mod tests {
         view.apply(Action::Expand);
         point_at(&mut view, "/scan/old/target");
 
-        view.removed(Path::new("/scan/old/target"), true);
+        view.freeing(Path::new("/scan/old/target"), 5);
         view.animate(start);
         view.apply(Action::Mark);
 
-        // The cursor is still on it, because it is still on screen — saying what happened to
-        // it. A mark aimed at a directory that has already gone is a statement about the past.
+        // The cursor is still on it, because it is still on screen saying what is happening to
+        // it. A mark aimed at a directory that is being deleted is a keystroke with nowhere
+        // to land.
         assert_eq!(view.marked().claims, 0);
         assert!(view.batch().is_empty());
     }
 
     #[test]
-    fn the_freed_counter_climbs_while_the_reclaimable_one_falls() {
+    fn the_freed_counter_climbs_on_the_same_bytes_the_reclaimable_one_loses() {
         // Its own tree, with sizes a disk would actually have: a chase snaps once it is
         // within a byte of its target, so a ten-byte counter arrives before it has moved.
         let mut tree = Tree::new("/scan");
@@ -2579,29 +2653,49 @@ mod tests {
         let start = Instant::now();
         view.animate(start);
         assert!(!view.has_freed());
+        assert_eq!(view.drawn_total().bytes, 400_000);
 
-        view.removed(Path::new("/scan/old/target"), true);
-        view.freed(100_000);
-        view.deleted("removed 97.7 KiB from 1 directory".to_owned());
-        view.animate(start + DRAIN / 2);
-
-        // The whole payoff of the one irreversible thing this tool does, and it needs no
-        // help: two numbers, moving in opposite directions, both true.
+        // One event, both counters. They are not two accounts of a deletion that have to be
+        // kept in step — they are one number read from each end, which is why they cannot
+        // drift apart or lag one another.
+        view.freeing(Path::new("/scan/old/target"), 40_000);
+        view.animate(start + COUNT_UP * 8);
         assert!(view.has_freed());
-        let reclaimable = view.drawn_total().bytes;
-        let freed = view.drawn_freed();
-        assert!(
-            (300_000..400_000).contains(&reclaimable),
-            "{reclaimable} is not on its way down"
-        );
-        assert!(
-            (1..100_000).contains(&freed),
-            "{freed} is not on its way up"
-        );
+        assert_eq!(view.drawn_total().bytes, 360_000);
+        assert_eq!(view.drawn_freed(), 40_000);
 
-        view.animate(start + DRAIN + COUNT_UP * 8);
+        view.removed(Path::new("/scan/old/target"), 100_000, true);
+        view.animate(start + COUNT_UP * 16);
         assert_eq!(view.drawn_total().bytes, 300_000);
         assert_eq!(view.drawn_freed(), 100_000);
+    }
+
+    #[test]
+    fn the_batch_report_replaces_the_running_total_rather_than_adding_to_it() {
+        let mut tree = Tree::new("/scan");
+        tree.insert(hit("/scan/old/target", Size::Measured(100_000), 100));
+        let mut view = View::new(tree);
+        view.viewport(40);
+        let start = Instant::now();
+        view.animate(start);
+
+        view.freeing(Path::new("/scan/old/target"), 60_000);
+        view.removed(Path::new("/scan/old/target"), 100_000, true);
+        view.animate(start + COUNT_UP * 8);
+        assert_eq!(view.drawn_freed(), 100_000);
+
+        // The batch's own arithmetic over the same bytes. Added to what the counter had
+        // already climbed, this would read 200_000 — every byte counted twice, on the one
+        // number a reader came back for.
+        view.deleted("removed 97.7 KiB from 1 directory".to_owned(), 100_000);
+        view.animate(start + COUNT_UP * 16);
+        assert_eq!(view.drawn_freed(), 100_000);
+
+        // …and it survives the row finally collapsing away, which is what would drop the
+        // per-target figures if they were still the ones being counted.
+        view.animate(start + COUNT_UP * 16 + DIM * 2);
+        assert_eq!(view.drawn_freed(), 100_000);
+        assert!(view.tree().find(Path::new("/scan/old/target")).is_none());
     }
 
     #[test]

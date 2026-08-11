@@ -61,7 +61,7 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend};
 
-use crate::delete::{Deleter, Planner, Removal, Target};
+use crate::delete::{Deleter, Planner, Removal, Step, Target};
 use crate::size::{SizeMode, human};
 use crate::tree::Tree;
 use crate::walk::{Found, WalkOutcome, Walker};
@@ -107,7 +107,10 @@ pub struct Options {
 enum Message {
     Found(Found),
     Scanned(WalkOutcome),
-    Removed { path: PathBuf, complete: bool },
+    /// A removal reporting on itself as it happens: see [`crate::delete::Step`]. Carried
+    /// through rather than flattened, because the two halves land on the view differently —
+    /// bytes as they leave, the row when the sweep is finished with it.
+    Removing(Step),
     Deleted(Box<Removal>),
 }
 
@@ -435,7 +438,10 @@ fn reap(
         outcome.failures += 1;
         // The freed total is left where it stands: a removal that said nothing is a removal
         // that gave no figure, and inventing one is the opposite of what this branch is for.
-        view.deleted("the removal ended without reporting what it did".to_owned());
+        view.deleted(
+            "the removal ended without reporting what it did".to_owned(),
+            outcome.freed,
+        );
     }
 }
 
@@ -453,15 +459,25 @@ fn drain(view: &mut View, inbox: &Receiver<Message>, outcome: &mut Outcome) {
                 outcome.errors.extend(walk.errors);
                 view.scanned();
             }
-            Ok(Message::Removed { path, complete }) => view.removed(&path, complete),
+            // Both halves reach the view, and both carry the deleter's own running byte
+            // total — which is what lets a row's number fall on bytes that have genuinely
+            // left the disk rather than on a timer started once they already had.
+            Ok(Message::Removing(Step::Freeing(freeing))) => {
+                view.freeing(&freeing.path, freeing.bytes);
+            }
+            Ok(Message::Removing(Step::Finished(removed))) => {
+                view.removed(&removed.path, removed.bytes, removed.complete);
+            }
             Ok(Message::Deleted(removal)) => {
                 outcome.failures += removal.failures.len();
                 outcome.freed += removal.bytes_freed();
                 // The rows the safety model left standing, so each one can say so where it
                 // is. The footer's count says how many; only the row can say which.
                 view.refused(&removal.kept);
-                view.freed(outcome.freed);
-                view.deleted(summarise(&removal));
+                // The batch's own arithmetic replaces the per-target figures the counter has
+                // been climbing on, rather than being added to them: they are the same bytes
+                // counted by the same code, so adding would double every one of them.
+                view.deleted(summarise(&removal), outcome.freed);
             }
             // Disconnected as well as empty: the walk finishing drops its sender, and there
             // is nothing left to say either way.
@@ -503,11 +519,8 @@ fn spawn_delete(options: &Options, targets: Vec<PathBuf>, post: Sender<Message>)
         let plan = planner.plan(targets.iter().map(Target::at));
         let reporting = post.clone();
         let removal = Deleter::new()
-            .watching(move |removed| {
-                let _ = reporting.send(Message::Removed {
-                    path: removed.path.clone(),
-                    complete: removed.complete,
-                });
+            .watching(move |step| {
+                let _ = reporting.send(Message::Removing(step.clone()));
             })
             .remove(&plan);
         // Posted before the thread ends, which is what lets `reap` read a finished thread
@@ -576,6 +589,7 @@ mod tests {
     use crate::tui::chrome::XTERM_STACK;
     use crate::tui::state::View;
     use crate::walk::{Found, WalkError, WalkOutcome};
+    use std::path::Path;
     use std::sync::mpsc::channel;
 
     fn view() -> View {
@@ -616,6 +630,64 @@ mod tests {
         assert_eq!(outcome.errors.len(), 1);
         assert!(!outcome.whole());
         assert!(!view.is_scanning());
+    }
+
+    #[test]
+    fn a_removals_progress_reaches_the_rows_and_the_freed_counter_from_one_event() {
+        use crate::delete::{Freeing, Step};
+        use crate::size::Size;
+        use std::time::Instant;
+
+        let (post, inbox) = channel();
+        let mut tree = Tree::new("/scan");
+        tree.insert(crate::fixture::hit(
+            "/scan/app/node_modules",
+            Size::Measured(1000),
+            0,
+        ));
+        let mut view = View::new(tree);
+        view.viewport(20);
+        let mut outcome = Outcome::default();
+        let start = Instant::now();
+        view.animate(start);
+        assert_eq!(view.drawn_total().bytes, 1000);
+        assert!(!view.has_freed());
+
+        // What the deleter says while it is working. The wiring is the point of this test:
+        // the same event has to reach the row's number and the freed counter, because the
+        // two moving in opposite directions is only true if they are the same bytes.
+        post.send(Message::Removing(Step::Freeing(Freeing {
+            path: "/scan/app/node_modules".into(),
+            bytes: 600,
+            entries: 12,
+        })))
+        .unwrap();
+        drain(&mut view, &inbox, &mut outcome);
+        view.animate(start);
+
+        assert_eq!(view.drawn_total().bytes, 400);
+        assert_eq!(view.drawn_freed(), 600);
+        // Still on disk, still on screen, and not yet dimmed — it is emptying, not emptied.
+        let row = view
+            .tree()
+            .find(Path::new("/scan/app/node_modules"))
+            .unwrap();
+        assert!(view.is_freeing(row));
+        assert!(!view.is_spent(row));
+
+        post.send(Message::Removing(Step::Finished(Removed {
+            path: "/scan/app/node_modules".into(),
+            bytes: 1000,
+            entries: 20,
+            complete: true,
+        })))
+        .unwrap();
+        drain(&mut view, &inbox, &mut outcome);
+        view.animate(start);
+
+        assert_eq!(view.drawn_total().bytes, 0);
+        assert_eq!(view.drawn_freed(), 1000);
+        assert!(view.is_spent(row));
     }
 
     #[test]
