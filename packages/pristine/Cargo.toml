@@ -38,6 +38,24 @@ ignore = "0.4.33"
 # Already in the tree via `ignore`, so the marker/target globs (`*.csproj`, `bazel-*`) cost
 # no new compilation.
 globset = "0.4.20"
+# The front end. `crossterm` is deliberately not a second direct dependency: ratatui
+# re-exports the exact version it was built against as `ratatui::crossterm`, and a separately
+# pinned copy is how a project ends up handing a `KeyEvent` from one semver-incompatible
+# crossterm to a backend expecting another — which compiles until the two versions drift.
+#
+# Default features off because they are not free: `all-widgets` pulls a calendar (and `time`
+# behind it), `macros` a proc-macro crate, `palette` a colour-science library. This draws a
+# tree, a header and a footer. `layout-cache` is kept, because the layout is recomputed on
+# every frame and every resize, which is exactly what it caches.
+ratatui = { version = "0.30", default-features = false, features = [
+  "crossterm",
+  "layout-cache",
+] }
+# The `/` filter, which npkill is right to make a regex over the whole path rather than a
+# substring: `work/.*/data` is the query a tree of checkouts actually wants. `regex-automata`
+# and `regex-syntax` are already in the graph under `globset`, so this is the API on top of
+# machinery that was being compiled anyway.
+regex = "1.12"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.4"
 unicode-normalization = "0.1.25"

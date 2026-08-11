@@ -21,7 +21,7 @@
 //! [`Size::Unmeasured`] until a caller asks for a breakdown with
 //! [`SizeMode::Breakdown`](size::SizeMode::Breakdown) — which costs an order of magnitude more
 //! than the scan it prices. [`SizeMode::BreakdownUnder`](size::SizeMode::BreakdownUnder) buys
-//! the same answer for one subtree at that subtree's price, and is what a TUI drill-in runs.
+//! the same answer for one subtree at that subtree's price.
 //!
 //! When a breakdown is asked for, **the prices do not hold the claims up**. A claim is
 //! published as [`Found::Claim`] the moment it is judged and a pool of threads prices it
@@ -46,6 +46,11 @@
 //! executes the resulting [`Plan`] and decides nothing. That split is what makes a dry run
 //! honest: the plan a preview prints is the same object the removal consumes.
 //!
+//! What a person actually uses to steer all of this is [`tui`]: the filesystem tree with the
+//! reclaimable bytes rolled up into every ancestor, collapsed by default, where marking one
+//! closed row covers everything beneath it and the batch it commits goes through the same
+//! [`Planner`] and [`Deleter`].
+//!
 //! All of the above is the *sweep*: point it at a tree of unrelated projects and ask what is
 //! reclaimable across all of them. The second mode is [`repo`], which points at one git
 //! checkout and replaces `git clean -fdx`. It enumerates nothing itself — `git clean -n -d`
@@ -63,6 +68,7 @@ pub mod repo;
 pub mod rules;
 pub mod size;
 pub mod tree;
+pub mod tui;
 pub mod walk;
 
 pub use delete::{
