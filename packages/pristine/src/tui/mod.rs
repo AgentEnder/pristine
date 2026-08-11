@@ -39,7 +39,27 @@
 //! and #618 is why: prices are computed on a pool and arrive as separate events, so the rows
 //! are on screen at 7.5 s while the numbers fill in behind them for the following minute. The
 //! reader marks and deletes throughout. `--breakdown-under <PATH>` still means what it says,
-//! for a reader who wants one subtree priced and the rest left alone.
+//! for a reader who wants one subtree priced and the rest left alone — and a **double click**
+//! is the same request made afterwards, on the one row in front of the reader.
+//!
+//! # The pointer is generic, and that is the whole choice
+//!
+//! The alternative on the table was OSC 8 hyperlinks, which only ever express "open this path".
+//! A pointer gives row selection, click-to-expand, click-to-mark, the wheel and column-heading
+//! sorting from one hit test, and every later feature gets it for free. Three parts, mirroring
+//! the keyboard's three:
+//!
+//! - [`render::hit`] resolves a cell to a [`Spot`] against the frame that was drawn. That is
+//!   also where the routing lives — an overlay covers the screen it is over, so a press inside
+//!   one *cannot* reach the tree, without anything restating the order.
+//! - [`Pointer`] holds what one event cannot see about the events before it: what the press
+//!   landed on, whether it has moved since, and whether one landed here a moment ago.
+//! - [`keymap::pointer`] turns a gesture and a spot into an [`Action`], off a table the help
+//!   overlay reads too.
+//!
+//! A [`Spot::Row`] names its row by **identity** and never by position, which matters more here
+//! than in pua: rows re-sort as prices land and *vanish* as removals complete, and a press
+//! resolved to a position and acted on a moment later would delete the wrong subtree.
 
 pub mod chrome;
 pub mod keymap;
@@ -53,20 +73,24 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{self, Event};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, MouseButton, MouseEventKind,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use ratatui::layout::Position;
 use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend};
 
 use crate::delete::{Deleter, Planner, Removal, Target};
-use crate::size::{SizeMode, human};
+use crate::size::{Measurer, SizeMode, human};
 use crate::tree::Tree;
-use crate::walk::{Found, WalkOutcome, Walker};
+use crate::walk::{Found, Priced, WalkOutcome, Walker};
 use crate::{Ruleset, WalkError};
 use chrome::{Chrome, Decor, Status};
-use keymap::action_for;
+use keymap::{Action, Gesture, Motion, action_for, finish};
+use render::{Placed, Spot};
 use state::{Effect, Pending, View, plural};
 
 /// How long the loop waits on the terminal before repainting anyway.
@@ -75,6 +99,9 @@ use state::{Effect, Pending, View, plural};
 /// thinking: `event::poll` returns the moment a key is pressed, so this only bounds how stale
 /// a *number* can be, not how long a keystroke waits.
 const TICK: Duration = Duration::from_millis(100);
+
+/// How close together two presses on one row have to be to make a double click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 /// Everything the front end needs from the command line.
 #[derive(Debug, Clone)]
@@ -97,8 +124,19 @@ pub struct Options {
 enum Message {
     Found(Found),
     Scanned(WalkOutcome),
-    Removed { path: PathBuf, complete: bool },
+    Removed {
+        path: PathBuf,
+        complete: bool,
+    },
     Deleted(Box<Removal>),
+    /// A subtree the reader double-clicked, now that it has been priced.
+    ///
+    /// The prices themselves went out one at a time as [`Found::Priced`], exactly as the
+    /// walk's do. This is what the pass could not read, plus the count for the footer.
+    Repriced {
+        claims: usize,
+        errors: Vec<WalkError>,
+    },
 }
 
 /// What the run turns out to have been, for the exit status.
@@ -135,7 +173,7 @@ impl Outcome {
 ///
 /// A guard rather than a pair of calls at the end, because the two things that go wrong are
 /// both invisible until somebody is left with a broken terminal: an *early* failure between
-/// the two setup steps skips a cleanup that had not been written yet, and a `?` on the first
+/// the setup steps skips a cleanup that had not been written yet, and a `?` on the first
 /// cleanup step skips the second. Each flag is set the moment its state is genuinely entered,
 /// so [`Restore::finish`] and [`Drop`] both undo exactly what happened and nothing else.
 ///
@@ -143,10 +181,17 @@ impl Outcome {
 /// point of it being here: a window title, a taskbar bar and an open synchronized update are
 /// three more things a `?` can walk away from, and three guards that each undo a third of the
 /// terminal are three chances to miss one. One owner, one order — innermost first.
+///
+/// **Mouse reporting is here for the same reason and is the sharpest case of it.** A process
+/// that dies with capture on leaves a shell that answers every movement of the hand with
+/// escape gibberish, and nothing is still alive to notice. This guard covers all three ways
+/// out — the ordinary return, a `?`, and a panic, since [`Drop`] runs while the stack unwinds
+/// — so no separate panic hook is needed to reach it.
 #[derive(Debug)]
 struct Restore<W: Write> {
     raw: bool,
     alternate: bool,
+    mouse: bool,
     chrome: Chrome<W>,
 }
 
@@ -156,6 +201,7 @@ impl<W: Write> Restore<W> {
         Self {
             raw: false,
             alternate: false,
+            mouse: false,
             chrome,
         }
     }
@@ -170,6 +216,9 @@ impl<W: Write> Restore<W> {
         // closing a synchronized update — is the difference between a terminal that repaints
         // and one that shows a frozen frame forever.
         let mut first = self.chrome.restore();
+        if std::mem::take(&mut self.mouse) {
+            first = first.and(execute!(io::stdout(), DisableMouseCapture));
+        }
         if std::mem::take(&mut self.raw) {
             first = first.and(disable_raw_mode());
         }
@@ -226,6 +275,129 @@ impl Drop for Batch {
     }
 }
 
+/// The button that is down: what it landed on, and whether it has moved since.
+///
+/// Held rather than acted on, because "was this a click or a drag" is a question the press
+/// cannot answer about itself. Carrying the [`Spot`] as well is what makes the deferral honest
+/// rather than merely delayed: the release dispatches what the press was **aimed** at,
+/// resolved against the frame the reader was looking at when they aimed, rather than
+/// re-testing a screen that has moved since.
+#[derive(Clone, Copy, Debug)]
+struct Press {
+    /// What it landed on — the click's target.
+    spot: Spot,
+    /// Whether it completed a double click, judged when it landed.
+    ///
+    /// Then rather than at the release, because a double click is two *presses* close
+    /// together and it is the second one's timing that says so.
+    double: bool,
+    /// Whether it has moved since: a drag rather than a click.
+    ///
+    /// **Sticky**, and deliberately not "the pointer is somewhere else now": a hand that
+    /// wanders a cell and comes back has still dragged, and finishing that as a click would
+    /// open or mark a row on the way out of a gesture that was not one.
+    moved: bool,
+}
+
+/// What the loop knows about a mouse event that the event itself does not.
+///
+/// # Why the loop holds this rather than the view
+///
+/// Every field is a judgement about a **previous** event, which the one in hand cannot see: a
+/// `Drag` says where the pointer is now and not where it started, and a press's [`Spot`]
+/// belongs to an event that was handled and is gone. Keeping them here is what lets
+/// [`keymap::pointer`] stay a pure function of one gesture and one spot.
+///
+/// # The click happens on the **release**, because until then it is not one
+///
+/// A press that releases without moving is a click, and a press that moves is not — but which
+/// of the two it is is unknown when the button goes down. Acting at the press and merely
+/// declining to act again at the release is not enough, because the press's action has already
+/// happened: a drag beginning on a column heading re-sorts the tree under the hand that was
+/// about to select from it, and one beginning on an expander opens a subtree nobody aimed at.
+///
+/// So a press **aims and nothing else**, and everything it landed on is carried in [`Press`]
+/// until the gesture says what it was.
+#[derive(Debug, Default)]
+struct Pointer {
+    /// The spot the last press landed on, and when — the double click's other half.
+    last: Option<(Spot, Instant)>,
+    /// The button that is down, if one is.
+    press: Option<Press>,
+}
+
+impl Pointer {
+    /// What this mouse event means, given what it landed on.
+    ///
+    /// Takes the spot rather than hit-testing, which makes the ordering safe by construction:
+    /// there is no way to ask this without having resolved the event against the frame that
+    /// was drawn.
+    fn read(&mut self, kind: MouseEventKind, spot: Spot, now: Instant) -> Action {
+        match kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let double = self.judge(spot, now);
+                self.press = Some(Press {
+                    spot,
+                    double,
+                    moved: false,
+                });
+                // Aiming only: see the note above for what this press *does*.
+                keymap::pointer(Gesture::Aim, spot)
+            }
+            // A press that moved is a drag, not a click, and cannot be half of a double one
+            // either. Without the second half, dragging out a selection and then pressing
+            // where the drag started would toggle a subtree the reader was aiming to select
+            // from.
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.last = None;
+                if let Some(press) = self.press.as_mut() {
+                    press.moved = true;
+                }
+                Action::Ignore
+            }
+            // The release is judged against the press it ends, and only then is the press
+            // forgotten: a gesture is not over until the button is up.
+            MouseEventKind::Up(MouseButton::Left) => match self.press.take() {
+                Some(press) if !press.moved => finish(press.spot, press.double, spot),
+                // A drag's release, or a button that went down before pristine was
+                // reporting. Neither is a click.
+                _ => Action::Ignore,
+            },
+            // Over an answer this is the hover highlight; everywhere else it must stay free.
+            // Capture asks the terminal for *every* movement of the pointer, so anything that
+            // acted here would act at the speed of a hand crossing the window.
+            MouseEventKind::Moved => keymap::pointer(Gesture::Aim, spot),
+            MouseEventKind::ScrollUp => keymap::pointer(Gesture::Wheel(Motion::Up), spot),
+            MouseEventKind::ScrollDown => keymap::pointer(Gesture::Wheel(Motion::Down), spot),
+            // The two buttons pristine does not use, and their drags.
+            _ => Action::Ignore,
+        }
+    }
+
+    /// Whether this press completes a double click.
+    ///
+    /// It compares **spots**, and that is this method's whole correctness. A double click is a
+    /// claim about *what* was pressed twice, and on this screen the cell and the thing are not
+    /// the same question: rows re-sort as prices land and vanish as removals finish, so
+    /// between two presses 200 ms apart the cell under a steady finger can come to hold a
+    /// different directory. Judged on coordinates, the second press would then price — or, on
+    /// a row whose zone changed under it, open — something the reader never aimed at.
+    ///
+    /// Two consequences, both wanted. **A row is the target, not a cell of it**: two presses
+    /// anywhere on one row are a double, because [`keymap::Target`] collapses the zones for
+    /// everything but a click. And **a row that moved is a different target**: the press that
+    /// lands on another directory after a re-sort is a first press, and selects.
+    fn judge(&mut self, spot: Spot, now: Instant) -> bool {
+        let double = self.last.is_some_and(|(before, when)| {
+            before == spot && now.saturating_duration_since(when) <= DOUBLE_CLICK
+        });
+        // A completed double starts over rather than arming the next press: without this,
+        // leaning on the button prices a row over and over, and a triple click is two doubles.
+        self.last = (!double).then_some((spot, now));
+        double
+    }
+}
+
 /// Where keystrokes come from.
 ///
 /// A seam with exactly one implementation in the shipped binary, and it exists so the event
@@ -267,6 +439,8 @@ pub fn run(options: &Options, ruleset: Arc<Ruleset>) -> io::Result<Outcome> {
     restore.raw = true;
     execute!(io::stdout(), EnterAlternateScreen)?;
     restore.alternate = true;
+    execute!(io::stdout(), EnableMouseCapture)?;
+    restore.mouse = true;
     restore.chrome.enter()?;
 
     let mut terminal = Terminal::with_options(
@@ -317,6 +491,12 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
     let mut batch_since = Instant::now();
     let mut scanning = view.is_scanning();
     let mut deleting = view.is_deleting();
+    // Where the last frame put everything a press can land on, and what the loop knows about
+    // a gesture that the event in hand does not. Both start empty, which is the honest
+    // description of a run that has not drawn yet: a press before the first frame resolves to
+    // `Spot::Nowhere` and does nothing.
+    let mut placed = Placed::default();
+    let mut pointer = Pointer::default();
 
     loop {
         drain(&mut view, &inbox, &mut outcome);
@@ -342,7 +522,9 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
         chrome.show(Status::of(&view, outcome.freed))?;
 
         chrome.begin_frame()?;
-        let drawn = terminal.draw(|frame| render::draw(frame, &mut view, &outcome.errors));
+        // The geometry comes back out of the draw rather than being computed beside it, so a
+        // press is resolved against the frame the reader is looking at. See [`Placed`].
+        let drawn = terminal.draw(|frame| placed = render::draw(frame, &mut view, &outcome.errors));
         // Ended before the draw's failure is reported, never after: a terminal left inside a
         // synchronized update keeps showing the frame before last, so a `?` here would trade
         // a reported error for a screen that is silently frozen.
@@ -359,9 +541,10 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
             continue;
         }
         let event = events.read()?;
-        match &event {
+        let action = match &event {
             // A resize is not a keystroke and produces no action; the redraw above is the
-            // whole of what it needs.
+            // whole of what it needs. The geometry it invalidates is replaced by that
+            // redraw before the next event is read.
             Event::Resize(..) => continue,
             // Focus reporting was asked for by the chrome and is answered to it: it is the
             // one thing that can tell a notification whether anybody is there to read it.
@@ -373,9 +556,15 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
                 chrome.focused(false);
                 continue;
             }
-            _ => {}
-        }
-        match view.apply(action_for(&event, view.overlay())) {
+            // Resolved to a *spot* first and to an action second, which is what keeps the
+            // layout's order in one place: see [`render::hit`].
+            Event::Mouse(mouse) => {
+                let spot = render::hit(&view, &placed, Position::new(mouse.column, mouse.row));
+                pointer.read(mouse.kind, spot, Instant::now())
+            }
+            _ => action_for(&event, view.overlay()),
+        };
+        match view.apply(action) {
             Effect::None => {}
             // Only ever reached with nothing in flight: the view holds a quit back while it
             // is deleting, and hands it over through `wants_to_quit` instead.
@@ -391,6 +580,9 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
                 batch_since = Instant::now();
                 batch.takes_over(spawn_delete(options, targets, post.clone()));
             }
+            // Detached rather than held, for the walk's reason and not the removal's: this
+            // only *reads*, so abandoning one at the end of a run costs nothing.
+            Effect::Price(paths) => spawn_price(options, paths, post.clone()),
         }
     }
 
@@ -439,6 +631,12 @@ fn drain(view: &mut View, inbox: &Receiver<Message>, outcome: &mut Outcome) {
                 view.scanned();
             }
             Ok(Message::Removed { path, complete }) => view.removed(&path, complete),
+            Ok(Message::Repriced { claims, errors }) => {
+                // The walk's rule, kept: a pass that could not read everything makes every
+                // total it fed a lower bound, and the header says so beside the numbers.
+                outcome.errors.extend(errors);
+                view.repriced(claims);
+            }
             Ok(Message::Deleted(removal)) => {
                 outcome.failures += removal.failures.len();
                 outcome.freed += removal.bytes_freed();
@@ -495,6 +693,51 @@ fn spawn_delete(options: &Options, targets: Vec<PathBuf>, post: Sender<Message>)
         // with an empty channel as "this one died without saying anything".
         let _ = post.send(Message::Deleted(Box::new(removal)));
     })
+}
+
+/// Prices the claims a double click asked about, reporting each one as the walk would.
+///
+/// A full [`SizeMode::Breakdown`] whatever the command line asked for, and that is the whole
+/// gesture: `--breakdown-under` scopes what the *scan* pays for, and this is the reader
+/// pointing at one more subtree afterwards and paying for that one too. It stays on one
+/// filesystem when the run does, because what the deleter will not cross the measurer must
+/// not count.
+///
+/// Nothing stops a reader double-clicking the same subtree twice, and nothing needs to:
+/// [`crate::tree::Tree::price`] refuses a claim that already carries a size, so a second pass
+/// over the same claims costs the traversal and changes no number. That is what makes an
+/// unbounded, unjoined gesture safe rather than merely tolerated.
+fn spawn_price(options: &Options, paths: Vec<PathBuf>, post: Sender<Message>) {
+    let measurer = Measurer::new(SizeMode::Breakdown).same_file_system(options.one_file_system);
+    std::thread::spawn(move || {
+        let claims = paths.len();
+        let mut errors = Vec::new();
+        for path in paths {
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                // The directory has gone since the scan claimed it. Not a failure of the
+                // run — somebody else's `rm` is a fact about the machine — but it is why the
+                // row is about to keep its dash, so it is said rather than swallowed.
+                Err(err) => {
+                    errors.push(WalkError {
+                        path: Some(path),
+                        message: err.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let sized = measurer.measure(&path, &metadata);
+            errors.extend(sized.unreadable.into_iter().map(|path| WalkError {
+                path: Some(path),
+                message: "unreadable, so this size is a lower bound".to_owned(),
+            }));
+            let _ = post.send(Message::Found(Found::Priced(Priced {
+                path,
+                size: sized.size,
+            })));
+        }
+        let _ = post.send(Message::Repriced { claims, errors });
+    });
 }
 
 /// One line about what the scan found, for the notification that says it is over.
@@ -715,6 +958,161 @@ mod tests {
         assert!(said.contains("1 directory failed"), "{said}");
     }
 
+    // ---- the pointer's gestures -------------------------------------------------------
+    //
+    // The three facts the loop holds that a mouse event cannot see: whether a press has
+    // already moved, what it landed on, and whether one landed on this same thing a moment
+    // ago. Asserted here rather than through a terminal, because a test cannot press a
+    // button on a real one — and because `Pointer` is where the whole gesture lives.
+
+    use super::{Action, Motion, Pointer};
+    use crate::tree::Order;
+    use crate::tui::render::{Spot, Zone};
+    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+    use std::time::{Duration, Instant};
+
+    fn down() -> MouseEventKind {
+        MouseEventKind::Down(MouseButton::Left)
+    }
+
+    fn up() -> MouseEventKind {
+        MouseEventKind::Up(MouseButton::Left)
+    }
+
+    fn row(id: crate::tree::NodeId) -> Spot {
+        Spot::Row {
+            id,
+            zone: Zone::Name,
+        }
+    }
+
+    #[test]
+    fn a_press_aims_and_the_click_happens_when_it_is_let_go() {
+        let mut pointer = Pointer::default();
+        let now = Instant::now();
+        let heading = Spot::Heading(Order::Age);
+
+        // The rule the deferred click exists for. A press that acted would have re-sorted
+        // the tree by the time a drag could decline to act again.
+        assert_eq!(pointer.read(down(), heading, now), Action::Ignore);
+        assert_eq!(pointer.read(up(), heading, now), Action::SortBy(Order::Age));
+        // …and a release with nothing behind it — a button that went down before pristine
+        // was reporting — is not a click either.
+        assert_eq!(pointer.read(up(), heading, now), Action::Ignore);
+    }
+
+    #[test]
+    fn a_press_that_moved_is_a_drag_and_never_becomes_a_click() {
+        let mut pointer = Pointer::default();
+        let now = Instant::now();
+        let heading = Spot::Heading(Order::Size);
+
+        pointer.read(down(), heading, now);
+        assert_eq!(
+            pointer.read(MouseEventKind::Drag(MouseButton::Left), Spot::Tree, now),
+            Action::Ignore
+        );
+        // Sticky: a hand that wandered a cell and came back has still dragged, so the
+        // release finishes nothing however close to the press it lands.
+        assert_eq!(pointer.read(up(), heading, now), Action::Ignore);
+    }
+
+    #[test]
+    fn a_drag_cannot_be_half_of_a_double_click() {
+        let mut pointer = Pointer::default();
+        let now = Instant::now();
+
+        // Drag a selection out of a row, then press where the drag started. Without the
+        // rule, that second press completes a double and prices a subtree the reader was
+        // aiming to select from.
+        pointer.read(down(), row(4), now);
+        pointer.read(MouseEventKind::Drag(MouseButton::Left), row(4), now);
+        pointer.read(up(), row(4), now);
+
+        pointer.read(down(), row(4), now + Duration::from_millis(50));
+        assert_eq!(
+            pointer.read(up(), row(4), now + Duration::from_millis(50)),
+            Action::Select(4)
+        );
+    }
+
+    #[test]
+    fn a_completed_double_click_starts_over_rather_than_arming_the_next_press() {
+        let mut pointer = Pointer::default();
+        let mut now = Instant::now();
+        let click = |pointer: &mut Pointer, now: Instant| {
+            pointer.read(down(), row(9), now);
+            pointer.read(up(), row(9), now)
+        };
+
+        assert_eq!(click(&mut pointer, now), Action::Select(9));
+        now += Duration::from_millis(50);
+        assert_eq!(click(&mut pointer, now), Action::Price(9));
+        // The third press of a triple is a first press again. Without this, leaning on the
+        // button prices the row over and over and a triple click is two doubles.
+        now += Duration::from_millis(50);
+        assert_eq!(click(&mut pointer, now), Action::Select(9));
+    }
+
+    #[test]
+    fn two_presses_far_enough_apart_are_two_clicks() {
+        let mut pointer = Pointer::default();
+        let now = Instant::now();
+        pointer.read(down(), row(2), now);
+        pointer.read(up(), row(2), now);
+
+        let late = now + super::DOUBLE_CLICK + Duration::from_millis(1);
+        pointer.read(down(), row(2), late);
+        assert_eq!(pointer.read(up(), row(2), late), Action::Select(2));
+    }
+
+    #[test]
+    fn a_row_that_moved_under_a_steady_finger_is_a_first_press_and_not_a_double() {
+        let mut pointer = Pointer::default();
+        let now = Instant::now();
+
+        // The same cell, 50 ms apart, holding a different directory — which is what a price
+        // landing between two presses does to a level sorted by size. Judged on coordinates
+        // this would price the stranger that fell into the position; judged on the spot it
+        // selects, which is what a first press means.
+        pointer.read(down(), row(4), now);
+        pointer.read(up(), row(4), now);
+        pointer.read(down(), row(11), now + Duration::from_millis(50));
+        assert_eq!(
+            pointer.read(up(), row(11), now + Duration::from_millis(50)),
+            Action::Select(11)
+        );
+    }
+
+    #[test]
+    fn the_wheel_needs_no_press_behind_it() {
+        let mut pointer = Pointer::default();
+        assert_eq!(
+            pointer.read(MouseEventKind::ScrollDown, Spot::Tree, Instant::now()),
+            Action::ScrollRows(Motion::Down)
+        );
+        assert_eq!(
+            pointer.read(MouseEventKind::ScrollUp, Spot::Tree, Instant::now()),
+            Action::ScrollRows(Motion::Up)
+        );
+    }
+
+    #[test]
+    fn the_buttons_pristine_does_not_use_are_left_to_the_terminals_own_menus() {
+        let mut pointer = Pointer::default();
+        let now = Instant::now();
+        for kind in [
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Up(MouseButton::Right),
+            MouseEventKind::Down(MouseButton::Middle),
+        ] {
+            assert_eq!(pointer.read(kind, row(1), now), Action::Ignore, "{kind:?}");
+        }
+        // …and a right-button press does not arm a left-button release either.
+        pointer.read(MouseEventKind::Down(MouseButton::Right), row(1), now);
+        assert_eq!(pointer.read(up(), row(1), now), Action::Ignore);
+    }
+
     #[test]
     fn restoring_the_terminal_attempts_every_step_that_was_reached() {
         // The states are global to the process, so what is asserted here is the bookkeeping:
@@ -731,12 +1129,17 @@ mod tests {
 
         restore.raw = true;
         restore.alternate = true;
+        restore.mouse = true;
         assert!(restore.finish().is_ok());
         assert!(!restore.raw, "raw mode would be disabled twice");
         assert!(
             !restore.alternate,
             "the alternate screen would be left twice"
         );
+        // The sharpest case of the rule, because its failure is the one nothing in the
+        // process is still alive to notice: a shell left reporting the mouse answers every
+        // movement of the hand with escape gibberish.
+        assert!(!restore.mouse, "the mouse would be released twice");
     }
 
     #[test]
@@ -788,7 +1191,9 @@ mod loop_tests {
     use ratatui::Terminal;
     use ratatui::backend::{Backend, TestBackend, WindowSize};
     use ratatui::buffer::Cell;
-    use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use ratatui::layout::{Position, Size};
     use std::io;
     use std::path::{Path, PathBuf};
@@ -862,14 +1267,14 @@ mod loop_tests {
         }
     }
 
-    /// A keyboard that types the same short phrase over and over.
+    /// A reader who performs the same short phrase over and over.
     ///
     /// Repeated rather than sequenced because the loop and the walk are concurrent: the row
     /// to mark does not exist until the walker finds it, and a script that fired once would
-    /// be racing that. Every key in this cycle is harmless before it is useful — `x` with an
+    /// be racing that. Every event in a cycle is harmless before it is useful — `x` with an
     /// empty batch says "nothing is marked", and `→`/`Enter` on a childless row do nothing.
     struct Script {
-        keys: Vec<KeyCode>,
+        events: Vec<Event>,
         at: usize,
     }
 
@@ -879,10 +1284,23 @@ mod loop_tests {
         }
 
         fn read(&mut self) -> io::Result<Event> {
-            let code = self.keys[self.at % self.keys.len()];
+            let event = self.events[self.at % self.events.len()].clone();
             self.at += 1;
-            Ok(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+            Ok(event)
         }
+    }
+
+    fn key(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn at(kind: MouseEventKind, column: u16, row: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
     }
 
     fn files_under(dir: &Path) -> usize {
@@ -947,11 +1365,11 @@ mod loop_tests {
         // the first frame, and a mark on it covers whatever the walk finds underneath —
         // which is the streaming property doing the test's synchronisation for it.
         let mut keys = Script {
-            keys: vec![
-                KeyCode::Char(' '),
-                KeyCode::Char('x'),
-                KeyCode::Right,
-                KeyCode::Enter,
+            events: vec![
+                key(KeyCode::Char(' ')),
+                key(KeyCode::Char('x')),
+                key(KeyCode::Right),
+                key(KeyCode::Enter),
             ],
             at: 0,
         };
@@ -983,6 +1401,81 @@ mod loop_tests {
     }
 
     #[test]
+    fn a_batch_marked_with_the_pointer_is_removed_through_the_real_loop() {
+        // The wiring no unit test reaches: the geometry comes back out of a real `draw`, a
+        // real press is resolved against it, and the action that comes out drives the same
+        // plan-confirm-delete pipeline `space` does. #602's own lesson was that the bug the
+        // unit tests all missed was found by driving the whole thing at once.
+        let (tmp, target) = fixture();
+        let mut terminal = Terminal::new(Flaky {
+            inner: TestBackend::new(100, 24),
+            broken: Arc::new(AtomicBool::new(false)),
+        })
+        .unwrap();
+
+        // Row 0 of the tree is the scan root, and it exists from the first frame: the header
+        // is line 0, the column heading is line 1, so the root's mark box is cell (0, 2).
+        // The reader marks it by pressing there and letting go, which is the whole deferred
+        // click — a press alone would do nothing.
+        let box_of_root = (0, 2);
+        // The second press of the cycle is on the root's *name* rather than its box, so that
+        // a repeat of the cycle is never read as a double click. That gesture has its own
+        // tests; this one is about a click.
+        let name_of_root = (10, 2);
+        let mut hand = Script {
+            events: vec![
+                at(
+                    MouseEventKind::Down(MouseButton::Left),
+                    box_of_root.0,
+                    box_of_root.1,
+                ),
+                at(
+                    MouseEventKind::Up(MouseButton::Left),
+                    box_of_root.0,
+                    box_of_root.1,
+                ),
+                key(KeyCode::Char('x')),
+                key(KeyCode::Right),
+                key(KeyCode::Enter),
+                key(KeyCode::Char('q')),
+                at(
+                    MouseEventKind::Down(MouseButton::Left),
+                    name_of_root.0,
+                    name_of_root.1,
+                ),
+                at(
+                    MouseEventKind::Up(MouseButton::Left),
+                    name_of_root.0,
+                    name_of_root.1,
+                ),
+            ],
+            at: 0,
+        };
+
+        let outcome = drive(
+            &mut terminal,
+            &mut hand,
+            &mut Chrome::new(Vec::new(), Decor::silent()),
+            &Options {
+                root: tmp.path().to_path_buf(),
+                min_size: crate::DEFAULT_MIN_SIZE,
+                size_mode: SizeMode::Skip,
+                one_file_system: true,
+                older_than: None,
+            },
+            Arc::new(Ruleset::builtin().unwrap()),
+        )
+        .unwrap();
+
+        assert!(!target.exists(), "the pointer marked nothing");
+        assert!(outcome.whole(), "{outcome:?}");
+        assert!(
+            tmp.path().join("app/package.json").exists(),
+            "too much went"
+        );
+    }
+
+    #[test]
     fn a_marked_batch_is_removed_through_the_real_loop() {
         // The same machinery, ending the ordinary way: it is worth one test that the keys, the
         // planner and the deleter meet correctly, because everything else about the loop is
@@ -996,12 +1489,12 @@ mod loop_tests {
         })
         .unwrap();
         let mut keys = Script {
-            keys: vec![
-                KeyCode::Char(' '),
-                KeyCode::Char('x'),
-                KeyCode::Right,
-                KeyCode::Enter,
-                KeyCode::Char('q'),
+            events: vec![
+                key(KeyCode::Char(' ')),
+                key(KeyCode::Char('x')),
+                key(KeyCode::Right),
+                key(KeyCode::Enter),
+                key(KeyCode::Char('q')),
             ],
             at: 0,
         };

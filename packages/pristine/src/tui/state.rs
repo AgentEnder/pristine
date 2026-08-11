@@ -49,8 +49,15 @@ use regex::Regex;
 use super::keymap::{Action, Motion, Overlay, Turn};
 use crate::delete::{Plan, Target};
 use crate::size::{Size, human};
-use crate::tree::{NodeId, Sort, Tree};
+use crate::tree::{NodeId, Order, Sort, Tree};
 use crate::walk::Hit;
+
+/// Rows one turn of the wheel moves the viewport.
+///
+/// Three rather than one because a wheel notch that moved a single row reads as a tool that
+/// is not answering, and rather than a page because a page is what `Ctrl-d` is for: the wheel
+/// is how a reader looks around without losing their place.
+const WHEEL: usize = 3;
 
 /// One line of the tree, once the collapsed subtrees have been left out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +163,34 @@ pub enum Answer {
     Cancel,
     /// Go ahead.
     Delete,
+}
+
+impl Answer {
+    /// Both answers, in the order the box draws them — safe one first, which is also the
+    /// order the arrow keys move through and the order a click is resolved against.
+    pub const ALL: [Self; 2] = [Self::Cancel, Self::Delete];
+
+    /// The word on the button.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cancel => "cancel",
+            Self::Delete => "delete",
+        }
+    }
+
+    /// Which way the highlight has to move to land on this answer.
+    ///
+    /// The pointer aims by naming an answer and the keyboard aims by turning; this is the one
+    /// place the two are reconciled, so a hover and a `→` cannot end up meaning different
+    /// things.
+    #[must_use]
+    pub fn turn(self) -> Turn {
+        match self {
+            Self::Cancel => Turn::Prev,
+            Self::Delete => Turn::Next,
+        }
+    }
 }
 
 /// The filter prompt, while it is up.
@@ -297,6 +332,12 @@ pub enum Effect {
     Plan(Vec<Target>),
     /// The question was answered yes. Remove exactly these.
     Delete(Vec<PathBuf>),
+    /// Put a size on these claims, which nobody has priced.
+    ///
+    /// Filesystem work, so the view asks for it rather than doing it — the same split
+    /// [`Plan`](Self::Plan) draws. Paths and not [`Target`]s, because the whole point is that
+    /// these carry no size yet: the answer comes back as the prices the walk would have sent.
+    Price(Vec<PathBuf>),
 }
 
 /// The live view.
@@ -416,6 +457,18 @@ impl View {
     /// The walk is over.
     pub fn scanned(&mut self) {
         self.scanning = false;
+    }
+
+    /// The pricing a double click asked for is over.
+    ///
+    /// The prices themselves arrived one at a time through [`View::priced`], exactly as the
+    /// walk's do — this is only the footer catching up, so a `pricing 12 directories…` notice
+    /// does not sit there after the work behind it has finished.
+    pub fn repriced(&mut self, claims: usize) {
+        self.notice = Some(format!(
+            "priced {}",
+            plural(claims, "directory", "directories")
+        ));
     }
 
     /// The removal is over, and this is what it did.
@@ -695,6 +748,7 @@ impl View {
             }
             Action::Answer => return self.answer(),
             Action::Cursor(motion) => self.move_cursor(motion),
+            Action::ScrollRows(motion) => self.scroll_rows(motion),
             Action::Expand => self.expand(),
             Action::Collapse => self.collapse(),
             Action::ToggleSubtree => self.toggle_subtree(),
@@ -713,7 +767,13 @@ impl View {
                 reverse: !self.sort.reverse,
                 ..self.sort
             }),
-            Action::SortBy(order) => self.resort(Sort::by(order)),
+            Action::SortBy(order) => self.sort_by(order),
+            Action::Select(id) => {
+                self.point_at(id);
+            }
+            Action::OpenRow(id) => self.open_row(id),
+            Action::MarkRow(id) => self.mark_row(id),
+            Action::Price(id) => return self.price_row(id),
         }
         self.sync();
         Effect::None
@@ -878,6 +938,142 @@ impl View {
         self.sort = sort;
         self.sorted = false;
         self.stale = true;
+    }
+
+    /// A digit, or a click on a column heading — order the levels by that key.
+    ///
+    /// One method for both doors, so an ordering cannot become the one in force two ways.
+    /// Naming the order **already in force** turns it upside down, which is what a reader
+    /// clicking a heading twice means and what `1 1` should therefore mean too.
+    ///
+    /// **A new column starts in its own natural order**, rather than inheriting whichever way
+    /// `S` last left things. The natural order is the useful one in every case — biggest
+    /// subtree first, names A–Z, stalest first — and carrying a reversal across a column
+    /// change would be reversing something the reader never asked to reverse.
+    fn sort_by(&mut self, order: Order) {
+        self.resort(if self.sort.by == order {
+            Sort {
+                by: order,
+                reverse: !self.sort.reverse,
+            }
+        } else {
+            Sort::by(order)
+        });
+    }
+
+    // ---- what a pointer does ----------------------------------------------------------
+
+    /// A click on a row — put the cursor on that **directory**.
+    ///
+    /// Selecting by identity rather than by the index the press resolved to, which is the
+    /// rule the whole pointer model turns on: rows re-sort as prices land and vanish as
+    /// removals finish, so an index taken at the press and acted on at the release names
+    /// somebody else. A directory that is no longer on screen leaves the cursor where it is
+    /// and says so by returning `false` — the honest outcome, since the row the reader aimed
+    /// at is gone.
+    fn point_at(&mut self, id: NodeId) -> bool {
+        let Some(at) = self.rows.iter().position(|row| row.id == id) else {
+            return false;
+        };
+        self.cursor = Some(at);
+        self.deselected = false;
+        self.follow_cursor();
+        true
+    }
+
+    /// A click on a row's `▸` — select it, and open or close it.
+    ///
+    /// The two steps `→` and `←` produce between them, reached with one gesture. A leaf is
+    /// selected and nothing else happens: there is nothing to open, and the cell its
+    /// indicator would be in is blank, so a press there cannot have been aimed at one.
+    fn open_row(&mut self, id: NodeId) {
+        if !self.point_at(id) || self.tree.children(id).is_empty() {
+            return;
+        }
+        if !self.expanded.insert(id) {
+            self.expanded.remove(&id);
+        }
+        self.stale = true;
+    }
+
+    /// A click on a row's `[ ]` — select it, and mark its subtree or unmark it.
+    fn mark_row(&mut self, id: NodeId) {
+        if self.point_at(id) {
+            self.mark_at(id);
+        }
+    }
+
+    /// A double click on a row — ask for a price on everything under it that has none.
+    ///
+    /// The gesture for the expensive action a reader wants on one specific thing. Under
+    /// `--breakdown-under` every row outside the named scope reads as a dash, and this is how
+    /// one of them is asked about without re-running the scan; on a fully priced tree it
+    /// finds nothing and says so rather than starting work with no result.
+    fn price_row(&mut self, id: NodeId) -> Effect {
+        self.point_at(id);
+        let unpriced = self.unpriced_under(id);
+        if unpriced.is_empty() {
+            self.notice = Some("everything under here already carries a price".to_owned());
+            return Effect::None;
+        }
+        self.notice = Some(format!(
+            "pricing {}…",
+            plural(unpriced.len(), "directory", "directories")
+        ));
+        Effect::Price(unpriced)
+    }
+
+    /// Every claim under `id` that nobody has put a number on.
+    ///
+    /// Filtered, for [`View::batch`]'s reason: what a row acts on is what its own number
+    /// describes, and a gesture that priced claims the filter is hiding would move a total
+    /// the reader cannot see.
+    fn unpriced_under(&self, id: NodeId) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut stack = vec![id];
+        while let Some(id) = stack.pop() {
+            if !self.shown(id) {
+                continue;
+            }
+            let node = self.tree.node(id);
+            match &node.hit {
+                Some(hit) if hit.size.bytes().is_none() => found.push(hit.path.clone()),
+                Some(_) => {}
+                None => stack.extend(node.children.iter().copied()),
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// The wheel — move the viewport, and take the cursor with it.
+    ///
+    /// pua leaves its cursor behind when the wheel moves its tree, because there a cursor only
+    /// highlights. Here it is what `space`, `→`, `←` and `*` act on, so a cursor scrolled off
+    /// the screen is a mark aimed at a row nobody can see — and [`View::follow_cursor`] would
+    /// drag the viewport back to it on the next frame anyway. It is pushed to the nearest row
+    /// still drawn instead, which is where a reader who scrolled to look at something would
+    /// have put it. A cursor that was taken away stays away: scrolling is not choosing.
+    fn scroll_rows(&mut self, motion: Motion) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let last = self.rows.len() - 1;
+        // Never past the point where the last row is at the bottom of the pane. The cursor
+        // keys reach that same limit through `follow_cursor`, which stops the moment the
+        // cursor is on screen; a wheel has no cursor pulling it up, so the limit is its own.
+        let furthest = self.rows.len().saturating_sub(self.page);
+        self.scroll = match motion {
+            Motion::Up => self.scroll.saturating_sub(WHEEL),
+            Motion::Down => (self.scroll + WHEEL).min(furthest),
+            Motion::PageUp => self.scroll.saturating_sub(self.page),
+            Motion::PageDown => (self.scroll + self.page).min(furthest),
+            Motion::Top => 0,
+            Motion::Bottom => furthest,
+        };
+        if let Some(at) = self.cursor {
+            self.cursor = Some(at.clamp(self.scroll, (self.scroll + self.page - 1).min(last)));
+        }
     }
 
     // ---- the cursor -------------------------------------------------------------------
@@ -1062,13 +1258,17 @@ impl View {
 
     /// `space`: mark the cursor's subtree, or unmark it.
     fn toggle_mark(&mut self) {
-        let Some(row) = self.row() else {
-            return;
-        };
-        if self.covered(row.id) {
-            self.unmark(row.id);
+        if let Some(row) = self.row() {
+            self.mark_at(row.id);
+        }
+    }
+
+    /// Marking one row, whichever door reached it — the key or the box under the pointer.
+    fn mark_at(&mut self, id: NodeId) {
+        if self.covered(id) {
+            self.unmark(id);
         } else {
-            self.mark(row.id);
+            self.mark(id);
         }
     }
 
@@ -1872,6 +2072,232 @@ mod tests {
         // under it. Left there, the pane draws as empty over a tree that is full.
         filter(&mut view, "matches nothing at all");
         assert_eq!(view.scroll(), 0);
+    }
+
+    // ---- what a pointer does ----------------------------------------------------------
+
+    #[test]
+    fn a_click_selects_the_directory_it_landed_on_and_not_the_position_it_was_at() {
+        let mut view = view();
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Expand);
+        let old = at(&view, "/scan/old");
+        assert_eq!(
+            shown(&view),
+            ["/scan", "  nx", "    node_modules", "    packages", "  old"]
+        );
+
+        // A claim arrives and re-sorts the level: `old` is now row 1 where it was row 4. A
+        // press taken as a *position* would select `nx`, whose subtree is everything the
+        // reader was looking at.
+        view.found(hit("/scan/old/big/node_modules", Size::Measured(9_000), 50));
+        view.sync();
+        assert_eq!(
+            shown(&view),
+            ["/scan", "  old", "  nx", "    node_modules", "    packages"]
+        );
+
+        view.apply(Action::Select(old));
+        assert_eq!(
+            view.tree().node(view.row().unwrap().id).path,
+            PathBuf::from("/scan/old")
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_row_that_is_gone_leaves_the_cursor_where_it_is() {
+        let mut view = view();
+        point_at(&mut view, "/scan/nx");
+        let target = at(&view, "/scan/old/target");
+
+        // The row the press aimed at has been deleted between the press and the release.
+        // Doing nothing is the honest outcome; the alternative is acting on whatever is now
+        // at that position.
+        view.removed(Path::new("/scan/old/target"), true);
+        view.sync();
+        view.apply(Action::Select(target));
+
+        assert_eq!(
+            view.tree().node(view.row().unwrap().id).path,
+            PathBuf::from("/scan/nx")
+        );
+    }
+
+    #[test]
+    fn a_click_on_the_indicator_opens_the_row_and_a_click_on_a_leafs_does_nothing_but_select() {
+        let mut view = view();
+        let nx = at(&view, "/scan/nx");
+        view.apply(Action::OpenRow(nx));
+        assert_eq!(
+            shown(&view),
+            ["/scan", "  nx", "    node_modules", "    packages", "  old"]
+        );
+        view.apply(Action::OpenRow(nx));
+        assert_eq!(shown(&view), ["/scan", "  nx", "  old"]);
+
+        // A leaf leaves the indicator's cell blank, so a press there cannot have been aimed
+        // at one. It selects the row and stops.
+        view.apply(Action::OpenRow(nx));
+        let leaf = at(&view, "/scan/nx/node_modules");
+        view.apply(Action::OpenRow(leaf));
+        assert_eq!(
+            view.tree().node(view.row().unwrap().id).path,
+            PathBuf::from("/scan/nx/node_modules")
+        );
+        assert_eq!(
+            shown(&view),
+            ["/scan", "  nx", "    node_modules", "    packages", "  old"]
+        );
+    }
+
+    #[test]
+    fn a_click_on_the_box_marks_exactly_what_the_key_marks() {
+        let mut view = view();
+        let nx = at(&view, "/scan/nx");
+        view.apply(Action::MarkRow(nx));
+
+        // One door, not two: the box under the pointer and `space` reach the same code, so a
+        // mark cannot mean one thing pressed and another typed.
+        assert_eq!(view.mark_of(nx), Mark::All);
+        assert_eq!(view.marked().claims, 2);
+        assert_eq!(
+            view.tree().node(view.row().unwrap().id).path,
+            PathBuf::from("/scan/nx")
+        );
+
+        view.apply(Action::MarkRow(nx));
+        assert_eq!(view.marked().claims, 0);
+    }
+
+    #[test]
+    fn naming_an_order_twice_turns_it_upside_down_and_a_new_column_starts_the_right_way_up() {
+        let mut view = view();
+        assert_eq!(view.sort(), Sort::by(Order::Size));
+
+        view.apply(Action::SortBy(Order::Path));
+        assert_eq!(view.sort(), Sort::by(Order::Path));
+        view.apply(Action::SortBy(Order::Path));
+        assert_eq!(
+            view.sort(),
+            Sort {
+                by: Order::Path,
+                reverse: true
+            }
+        );
+
+        // A new column starts in its own natural order rather than inheriting the reversal.
+        // Carrying it across would reverse something the reader never asked to reverse.
+        view.apply(Action::SortBy(Order::Size));
+        assert_eq!(view.sort(), Sort::by(Order::Size));
+    }
+
+    #[test]
+    fn the_wheel_moves_the_viewport_and_takes_the_cursor_with_it() {
+        let mut tree = Tree::new("/scan");
+        for n in 0..30 {
+            tree.insert(hit(
+                &format!("/scan/p{n:02}/node_modules"),
+                Size::Measured(1),
+                0,
+            ));
+        }
+        let mut view = View::new(tree);
+        view.viewport(10);
+        view.apply(Action::Cursor(Motion::Top));
+        assert_eq!((view.scroll(), view.cursor()), (0, Some(0)));
+
+        view.apply(Action::ScrollRows(Motion::Down));
+        // Three rows a notch, and the cursor is pushed to the top of what is now drawn: a
+        // cursor left off the screen is a `space` aimed at a row nobody can see.
+        assert_eq!((view.scroll(), view.cursor()), (3, Some(3)));
+
+        view.apply(Action::ScrollRows(Motion::Up));
+        assert_eq!(view.scroll(), 0);
+        // Coming back up leaves the cursor where it was — it is inside the pane again, and
+        // scrolling is not choosing.
+        assert_eq!(view.cursor(), Some(3));
+
+        // …and the wheel cannot scroll the last row off into an empty pane.
+        for _ in 0..40 {
+            view.apply(Action::ScrollRows(Motion::Down));
+        }
+        assert_eq!(view.scroll(), view.rows().len() - 10);
+    }
+
+    #[test]
+    fn a_wheel_over_a_view_with_no_cursor_does_not_hand_it_one() {
+        let mut view = view();
+        filter(&mut view, "nothing matches this");
+        view.apply(Action::Back);
+        assert_eq!(view.cursor(), None);
+
+        view.apply(Action::ScrollRows(Motion::Down));
+        assert_eq!(view.cursor(), None, "scrolling chose a row");
+    }
+
+    #[test]
+    fn a_double_click_asks_for_a_price_on_what_is_under_the_row_and_nothing_else() {
+        let mut tree = Tree::new("/scan");
+        tree.insert(hit("/scan/nx/node_modules", Size::Unmeasured, 900));
+        tree.insert(hit(
+            "/scan/nx/packages/ui/node_modules",
+            Size::Measured(5),
+            800,
+        ));
+        tree.insert(hit("/scan/old/target", Size::Unmeasured, 100));
+        let mut view = View::new(tree);
+        view.viewport(40);
+
+        let nx = at(&view, "/scan/nx");
+        let effect = view.apply(Action::Price(nx));
+
+        // Only what carries no price, and only what is under the row that was pressed —
+        // `old/target` is unpriced too and was not aimed at.
+        assert_eq!(
+            effect,
+            Effect::Price(vec![PathBuf::from("/scan/nx/node_modules")])
+        );
+        assert!(view.notice().unwrap().contains("pricing 1 directory"));
+
+        // A subtree that is already priced says so rather than starting work with no result.
+        let ui = at(&view, "/scan/nx/packages");
+        assert_eq!(view.apply(Action::Price(ui)), Effect::None);
+        assert!(view.notice().unwrap().contains("already carries a price"));
+    }
+
+    #[test]
+    fn a_double_click_never_prices_what_the_filter_is_hiding() {
+        let mut tree = Tree::new("/scan");
+        tree.insert(hit("/scan/nx/node_modules", Size::Unmeasured, 900));
+        tree.insert(hit(
+            "/scan/nx/packages/ui/node_modules",
+            Size::Unmeasured,
+            800,
+        ));
+        let mut view = View::new(tree);
+        view.viewport(40);
+        filter(&mut view, "ui/node_modules");
+
+        // The filter's own safety rule, kept: a row acts on what its number describes. A
+        // price landing on a hidden claim would move a total the reader cannot see.
+        let nx = at(&view, "/scan/nx");
+        assert_eq!(
+            view.apply(Action::Price(nx)),
+            Effect::Price(vec![PathBuf::from("/scan/nx/packages/ui/node_modules")])
+        );
+    }
+
+    #[test]
+    fn the_footer_stops_saying_a_price_is_being_worked_out_once_it_is() {
+        let mut tree = Tree::new("/scan");
+        tree.insert(hit("/scan/nx/node_modules", Size::Unmeasured, 900));
+        let mut view = View::new(tree);
+        let nx = at(&view, "/scan/nx");
+        view.apply(Action::Price(nx));
+        assert!(view.notice().unwrap().contains("pricing"));
+
+        view.repriced(1);
+        assert_eq!(view.notice(), Some("priced 1 directory"));
     }
 
     #[test]
