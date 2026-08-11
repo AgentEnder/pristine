@@ -2478,13 +2478,11 @@ impl View {
         self.marks.retain(|mark| {
             !(mark.lens == lens && mark.root != id && descends_from(tree, mark.root, id))
         });
-        if !self.marks.iter().any(|mark| {
-            *mark
-                == Marked {
-                    root: id,
-                    lens: lens.clone(),
-                }
-        }) {
+        if !self
+            .marks
+            .iter()
+            .any(|mark| mark.root == id && mark.lens == lens)
+        {
             self.marks.push(Marked { root: id, lens });
         }
         self.stale = true;
@@ -2499,11 +2497,15 @@ impl View {
     /// that instant, so a claim arriving next to a spared row a minute later was silently
     /// unmarked too.
     fn unmark(&mut self, id: NodeId) {
-        let had = self.marks.len();
         self.marks.retain(|mark| mark.root != id);
-        if self.marks.len() != had {
-            self.stale = true;
-        }
+        // **Re-derived before the next question rather than after this one.** The counts on
+        // hand describe the state before the line above, so asking them whether anything is
+        // still covering this row would answer about the mark that has just gone — and the
+        // answer decides whether an exclusion is left behind. A stray exclusion is invisible
+        // and outlives the keystroke that produced it: the next mark on an ancestor would
+        // quietly spare a subtree nobody spared.
+        self.stale = true;
+        self.sync();
         if self.mark_of(id) == Mark::None && !self.selects_anything_under(id) {
             return;
         }
@@ -3313,6 +3315,28 @@ mod tests {
                 PathBuf::from("/scan/nx/dist"),
                 PathBuf::from("/scan/old/target"),
             ]
+        );
+    }
+
+    #[test]
+    fn unmarking_a_row_nothing_was_covering_leaves_no_exclusion_behind() {
+        // An exclusion is invisible: two views with the same rows drawn, the same glyphs and
+        // the same batch can differ by one, and it only shows up in what a *later* keystroke
+        // does. Today every later keystroke that could be affected happens to clear it —
+        // marking a directory drops the exclusions beneath it — so this is a test about the
+        // state rather than about an observable difference, and that is the point. The
+        // question `unmark` asks is answered by the counts, and the counts are one keystroke
+        // behind until the pass is re-run.
+        let mut view = mixed();
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Mark);
+        view.apply(Action::Mark);
+
+        assert!(batched(&view).is_empty());
+        assert!(view.marks.is_empty());
+        assert!(
+            view.spared.is_empty(),
+            "a plain unmark left an exclusion for an ancestor that does not exist"
         );
     }
 
