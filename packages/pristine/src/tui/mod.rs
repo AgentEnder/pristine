@@ -1589,10 +1589,11 @@ mod loop_tests {
 
     /// How long a script will keep performing before it gives up and quits anyway.
     ///
-    /// Only reached by a run that has not satisfied its `until` — which is usually a fault and
-    /// is not always one, so the ceiling ends the run and [`Script::why`] decides what to say
-    /// about it. The point of having one at all is that such a run *ends*, and reports what it
-    /// found rather than hanging with no output.
+    /// Only reached by a run that has not satisfied its `until` — which may be a fault in what
+    /// is being tested and may be a machine too busy to have got there yet, and nothing in here
+    /// can tell those apart. So the ceiling ends the run and [`Script::why`] reports it without
+    /// claiming which. The point of having one at all is that such a run *ends*, and says what
+    /// it found rather than hanging with no output.
     ///
     /// **In seconds, and deliberately not in events.** An event count measures how fast this
     /// loop spins, which is the one quantity here that moves the *wrong* way under load: the
@@ -1678,28 +1679,40 @@ mod loop_tests {
             self.expired
         }
 
-        /// Why the run failed to do its job: `otherwise`, unless this script is what ended it.
+        /// What a failing assertion says: `otherwise`, unless this script is what ended the run.
         ///
-        /// **The whole of #632, in one method.** A script that gives up presses `q`, and `q`
-        /// is indistinguishable from a reader leaving — so an assertion downstream reads a run
-        /// that never got its chance as a run that took it and got it wrong, and accuses
-        /// whichever part it happens to be testing. That is how "the pointer marked nothing"
-        /// came to be printed for a starved walker, and it sent a reader to the hit-testing,
-        /// which is the one part of this that was not at fault.
+        /// **A timeout is not a verdict, and saying which it was is not this method's to do.**
+        /// A script that gives up presses `q`, and `q` is indistinguishable from a reader
+        /// leaving — so an assertion downstream reads a run that never got to the end as a run
+        /// that got there and got it wrong, and states its own subject as the cause. That is
+        /// how "the pointer marked nothing" came to be printed for a run that timed out, and
+        /// it sent a reader to the hit-testing.
         ///
-        /// A verdict rather than an assertion of its own, and that distinction is the point:
-        /// giving up is **not** a failure. The ceiling can fire while a removal is still in
+        /// The correction is to report and **not** to classify. A pointer that has stopped
+        /// hit-testing, a planner refusing every target and a deleter that never starts all
+        /// leave the condition false until the ceiling fires — which is the same observable
+        /// state as a machine too busy to run the walk. Nothing here can tell those apart, so
+        /// naming either one would be the same invented fact in the opposite direction:
+        /// exonerating the code under test on evidence that never mentioned it, in the queue
+        /// gate, where a hidden regression costs the most.
+        ///
+        /// So this says how long it waited, what is still on disk, and which assertion was
+        /// waiting — and stops. The reader gets the two facts and draws their own conclusion.
+        ///
+        /// A verdict rather than an assertion of its own, which is a separate point and still
+        /// holds: giving up is **not** a failure. The ceiling can fire while a removal is in
         /// flight, and the view holds the quit until that removal reports — so the run goes on
-        /// to do exactly what it was asked. Only the filesystem gets to say whether the job
-        /// was done; this only says what to blame when it was not.
+        /// to do exactly what it was asked. Only the filesystem gets to say whether the job was
+        /// done; this only fills in the sentence when it says no.
         fn why(&self, otherwise: &str, target: &Path) -> String {
             let Some(waited) = self.expired else {
                 return otherwise.to_owned();
             };
             format!(
-                "the run gave up after {waited:?} rather than finishing, so nothing below it \
-                 was ever tested — {} still holds {} files. This is the harness running out of \
-                 patience on a starved machine, NOT {otherwise:?}",
+                "timed out after {waited:?}: the run was still going when the script ran out of \
+                 patience, and {} still holds {} files. A starved machine and a real regression \
+                 both look like this from here, so this names neither — the assertion that was \
+                 waiting is {otherwise:?}",
                 target.display(),
                 files_under(target),
             )
@@ -1794,13 +1807,14 @@ mod loop_tests {
     }
 
     #[test]
-    fn a_script_that_runs_out_of_patience_says_so_rather_than_blaming_the_run() {
+    fn a_script_that_runs_out_of_patience_reports_a_timeout_rather_than_a_verdict() {
         // #632: the ceiling is the harness giving up, and until it said so every assertion
         // downstream reported it as the *loop* failing at whatever that assertion was about.
-        // A run that never marks anything is the shape of a starved walker — the row the
-        // gesture needs never arrives — so this drives the same loop with a phrase that
-        // cannot mark, and asserts the two facts stay separate: nothing was removed, AND the
-        // reason is that the script stopped waiting.
+        // A run that never marks anything is the shape both a starved walker and a broken
+        // gesture leave behind — the row never arrives either way — so this drives the same
+        // loop with a phrase that cannot mark, and asserts the report keeps the two facts it
+        // can see apart from the cause it cannot: nothing was removed, the script stopped
+        // waiting, and which of those explains the other is left to the reader.
         let (tmp, target) = fixture();
         let mut terminal = Terminal::new(Flaky {
             inner: TestBackend::new(100, 24),
@@ -1837,16 +1851,23 @@ mod loop_tests {
             "a run that did nothing is still a whole run"
         );
 
-        // …and this is the fix. The sentence handed to a downstream assertion names the
-        // ceiling and what was still on disk when it fired, and says outright that the thing
-        // the assertion was about is *not* what went wrong. The same run used to print "the
-        // pointer marked nothing" and send a reader to the hit-testing.
+        // …and this is the fix. The sentence handed to a downstream assertion reports the two
+        // things it can actually see — how long it waited, and what is still on disk — and
+        // keeps the assertion that was waiting, so the reader still knows what was being asked.
         let said = idle.why("the pointer marked nothing", &target);
-        assert!(said.contains("gave up after"), "{said}");
+        assert!(said.contains("timed out after"), "{said}");
         assert!(said.contains("holds 2000 files"), "{said}");
+        assert!(said.contains("\"the pointer marked nothing\""), "{said}");
+
+        // And it stops there, which is the half a first attempt at this got wrong. This run
+        // genuinely *was* starved — nothing in its phrase can mark — but a pointer that had
+        // stopped hit-testing leaves exactly the same state, so a message that ruled one out
+        // would be inventing the one fact it cannot observe, in the direction that hides a
+        // regression. Naming neither is what keeps the queue gate able to fail on a real one.
+        assert!(said.contains("names neither"), "{said}");
         assert!(
-            said.contains("NOT \"the pointer marked nothing\""),
-            "{said}"
+            !said.contains("NOT"),
+            "the timeout exonerated the code under test: {said}"
         );
 
         // And the other half, without which this would just be a louder false block: a script
@@ -2001,9 +2022,10 @@ mod loop_tests {
         .unwrap();
 
         // The message #632 exists for. A starved walker never publishes the row the press is
-        // aiming at, so the run ends on the ceiling with the target untouched — and "the
-        // pointer marked nothing" said about that sends the reader to the hit-testing, which
-        // is the one part of this that cannot be at fault. See [`Script::why`].
+        // aiming at, so the run ends on the ceiling with the target untouched — and stating
+        // "the pointer marked nothing" flatly about a run that timed out names a cause the run
+        // never established. It stays as the sentence a *finished* run fails with; a timed-out
+        // one gets it quoted alongside the timeout instead. See [`Script::why`].
         assert!(
             !target.exists(),
             "{}",
