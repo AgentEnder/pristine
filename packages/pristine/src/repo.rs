@@ -38,6 +38,7 @@ use std::{fmt, fs, io};
 
 use crate::delete::Target;
 use crate::git::git;
+use crate::rules::ENV_MARK;
 
 /// What to do about tracked files that have been changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,8 +119,10 @@ impl Selection {
 /// where those disagree is a run that reports holding something back and then deletes it.
 const VENDOR_DIR: &str = "node_modules";
 
-/// What the design's `*.env*` reduces to against a single path component.
-const ENV_MARK: &str = ".env";
+// `ENV_MARK` — what the design's `*.env*` reduces to against a single path component — lives in
+// [`crate::rules`] rather than here, because the sweep asks the same question of a gitignored
+// file it found. Same rule as `VENDOR_DIR` above: a run where the two doors disagreed would
+// report holding an env file back through one and delete it through the other.
 
 /// Which of the three classes an entry falls in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

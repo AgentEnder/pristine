@@ -11,11 +11,20 @@
 # Fields:
 #   id           stable identifier. A user rule with the same id REPLACES the built-in one.
 #   ecosystem    human name for the ecosystem, and the first half of the label.
-#   kind         what the directories are, from a closed vocabulary of three. The second half
-#                of the label, and the half a reader can sort, group and filter by:
+#   kind         what the directories are, from a closed vocabulary ORDERED BY WHAT IT COSTS
+#                TO LOSE. The second half of the label, and the half a reader can sort, group
+#                and filter by:
+#                  "unrecoverable" nothing brings it back — secrets, keys, credentials
 #                  "dependencies"  installed third-party code — `node_modules`, `.venv`
 #                  "build"         compiled output — `target`, `bin`, `obj`, `dist`
-#                  "cache"         regenerated automatically, cheapest to lose — `__pycache__`
+#                  "cache"         regenerated automatically — `__pycache__`
+#                  "noise"         nothing will miss it — logs, `.DS_Store`
+#                No shipped rule uses "unrecoverable" or "noise": those are what the name of a
+#                gitignored FILE can say, and a marker proves a project's type rather than
+#                that a directory is the only copy of something. A user rule naming a
+#                `secrets/` directory may use it, and that directory then gets the whole
+#                safety inversion — never swept up by a mark on a parent, never removed by a
+#                script that did not pass `--unrecoverable`.
 #                A RULE WHOSE TARGETS DO NOT ALL SHARE ONE KIND IS TWO RULES. That is why
 #                `python` and `python-caches` are separate, and why Gradle's `build` and
 #                `.gradle` are: one rule covering both could label only one of them honestly.

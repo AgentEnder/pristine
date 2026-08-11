@@ -44,6 +44,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row as TableRow, Table, Wrap};
 
+use crate::rules::Kind;
+
 use super::keymap::help;
 use super::state::{Answer, Mark, Pending, Roll, View, plural};
 use super::treemap;
@@ -282,11 +284,38 @@ fn confirming(frame: &mut Frame, view: &mut View) -> (Rect, [Rect; 2]) {
             Style::default().fg(Color::Cyan),
         ));
     }
+    let unrecoverable = pending.unrecoverable();
+    if unrecoverable > 0 {
+        // The one line on this screen that is not about bytes. Everything else in a batch is
+        // regenerable — a cache is free, an output is a compile, dependencies are a fetch — so
+        // "this cannot be undone" in the title is, for every other row, undone by waiting for a
+        // rebuild. These are the rows where it is literally true, and a reader who marked one
+        // by accident has exactly one place left to notice.
+        lines.push(Line::styled(
+            format!(
+                "{} of them {} — {}. Listed first, and `space` takes one out.",
+                unrecoverable,
+                if unrecoverable == 1 { "is" } else { "are" },
+                Kind::Unrecoverable.cost_said()
+            ),
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
 
     // The box is as tall as it needs to be and no taller than the frame, with the listing
     // taking whatever the fixed lines leave: a batch of four should not be drawn in a box
     // sized for eight thousand.
-    let said = u16::try_from(lines.len()).unwrap_or(4);
+    //
+    // Counted in **drawn** lines rather than in written ones, and that is a correctness fix
+    // rather than a tidying one: these lines wrap, so a warning longer than the box was being
+    // given one row and silently losing its tail — and the tail is the half that says deleting
+    // takes the hidden entries anyway. The one warning here that has no bound on its length is
+    // the one naming the view, since a lens that names its axes is as long as its axes are.
+    let inner_width = usize::from(LISTING.min(frame.area().width).saturating_sub(2));
+    let drawn_lines: usize = lines.iter().map(|line| wrapped_rows(line, inner_width)).sum();
+    let said = u16::try_from(drawn_lines).unwrap_or(4);
     let wanted = u16::try_from(pending.entries().len()).unwrap_or(u16::MAX);
     let area = centred(
         frame.area(),
@@ -363,10 +392,23 @@ fn entries(pending: &Pending, width: u16) -> Vec<Line<'static>> {
             ),
             Span::styled(
                 format!("{:<tail$}", shorten(&entry.path, tail)),
-                if here {
-                    Style::default().add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
+                {
+                    // The group heading names the kind on the first line of a run only, so a
+                    // reader who has scrolled into the middle of a long unrecoverable group
+                    // would otherwise have nothing on the line telling them what it is. Red
+                    // here and cyan for a refusal is the tree's own division: a refusal is the
+                    // safety model working, and this is the safety model being overruled.
+                    let style = if entry.kept.is_none() && entry.kind == Some(Kind::Unrecoverable)
+                    {
+                        Style::default().fg(Color::Red)
+                    } else {
+                        Style::default()
+                    };
+                    if here {
+                        style.add_modifier(Modifier::BOLD)
+                    } else {
+                        style
+                    }
                 },
             ),
         ];
@@ -1025,6 +1067,38 @@ fn help_page() -> Text<'static> {
 }
 
 /// A box of this size in the middle of `area`, clamped to fit.
+/// How many rows one wrapped line of the confirmation will take in a box `width` wide.
+///
+/// Greedy word wrap, which is what `Wrap { trim: true }` does, because the alternative is to
+/// hand a wrapping paragraph a fixed one-row-per-line box and lose whatever does not fit — and
+/// what does not fit is the end of the sentence, which is where the consequence is. Erring
+/// upward is a blank row inside a box; erring downward is a warning cut in half.
+fn wrapped_rows(line: &Line<'_>, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    let text: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+    let mut rows = 1;
+    let mut used = 0;
+    for word in text.split_whitespace() {
+        let len = word.chars().count();
+        if used == 0 {
+            used = len;
+        } else if used + 1 + len <= width {
+            used += 1 + len;
+        } else {
+            rows += 1;
+            used = len;
+        }
+        // A word longer than the box is broken across rows rather than dropped.
+        while used > width {
+            rows += 1;
+            used -= width;
+        }
+    }
+    rows
+}
+
 fn centred(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
@@ -1557,9 +1631,18 @@ mod tests {
             &[],
         );
         let box_text = painted(&mut view, 100, 24).join("\n");
+        // Read across the wrap, because the warning genuinely wraps: it names the view, and a
+        // view that has to spell out its axes is as long as its axes are. The box is sized in
+        // *drawn* rows for exactly that reason, so what this checks is that the end of the
+        // sentence — the half that carries the consequence — survived.
+        let unwrapped = box_text
+            .replace('│', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
 
-        assert!(box_text.contains("out of sight under"), "{box_text}");
-        assert!(box_text.contains("deleting takes it anyway"), "{box_text}");
+        assert!(unwrapped.contains("out of sight under"), "{box_text}");
+        assert!(unwrapped.contains("deleting takes it anyway"), "{box_text}");
         let frame = painted(&mut view, 100, 24);
         let listed = row_with(&frame, "/scan/nx/node_modules");
         assert!(listed.contains("hidden"), "{listed}");

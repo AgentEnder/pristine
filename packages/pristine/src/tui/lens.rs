@@ -8,8 +8,9 @@
 //! - **Tier** — whether a claim is one a *rule* named ([`Tier::Named`]) or one only the
 //!   gitignore fallback found ([`Tier::Ignored`]). "all-ignored" is a statement about this axis
 //!   and nothing else.
-//! - **Kind** — the closed vocabulary #623 established: [`Kind::Dependencies`],
-//!   [`Kind::Build`], [`Kind::Cache`]. "vendor" is a statement about this one.
+//! - **Kind** — the closed vocabulary #623 established and #652 extended at both ends, ordered
+//!   by what it costs to lose: [`Kind::Unrecoverable`], [`Kind::Dependencies`], [`Kind::Build`],
+//!   [`Kind::Cache`], [`Kind::Noise`]. "vendor" is a statement about this one.
 //!
 //! Modelled as four opaque modes, "show me every cache that a rule named" is not expressible
 //! and never becomes expressible without a fifth mode. Modelled as two axes it already is, and
@@ -37,6 +38,20 @@
 //! age floor was resolved against — "silently keeps" is "silently deletes" seen from the other
 //! side. What makes it honest rather than silent is that the count it hides is on the header,
 //! beside the number it qualifies, from the first frame. See [`super::state::View::out_of_view`].
+//!
+//! # Gitignored FILES are a third axis, not a third tier
+//!
+//! A gitignored file is claimed by tier two, so the obvious home for it is a third value on the
+//! tier axis — and that does not survive the presets. Every step of `f`'s cycle moves exactly
+//! one axis, and `all` would then have to widen the tier axis *and* the kind axis in one step
+//! to reach files. The `/` pattern already had this shape and was settled the same way: it
+//! decides what is on screen, it is orthogonal to both axes, and no preset touches it.
+//!
+//! So files get an axis and a key of their own, `i`, and the request's actual sentence — that
+//! ignored files be includable and excludable independently of ignored directories — falls
+//! out of that rather than being arranged for. It starts **off**, because a real `~/repos`
+//! holds tens of thousands of them; what makes that honest is the same thing that makes
+//! `default` honest, a count of what is out of view on the header from the first frame.
 //!
 //! # The pattern is part of the lens
 //!
@@ -67,13 +82,26 @@ pub enum Tier {
 }
 
 impl Tier {
-    /// Which tier claimed this hit.
+    /// Which member of the tier axis judges this hit, or `None` when the **files** axis does.
+    ///
+    /// An `Option` rather than a third value, and that shape is the finding rather than a
+    /// detail. A gitignored file is claimed by tier two, so a three-valued tier reads
+    /// naturally — but it would then have to move when [`Preset::All`] widens, and every
+    /// preset moves exactly one axis per step. Files are therefore orthogonal to both axes,
+    /// exactly as the `/` pattern is, and this says so by declining to answer rather than by
+    /// answering `Ignored` and leaving a caller to remember not to ask.
+    ///
+    /// It also no longer reads the *kind*, which it used to: a kind used to imply a rule, and
+    /// since a gitignored file can carry one it does not.
     #[must_use]
-    pub fn of(hit: &Hit) -> Self {
-        match hit.kind() {
+    pub fn of(hit: &Hit) -> Option<Self> {
+        if hit.is_ignored_file() {
+            return None;
+        }
+        Some(match hit.rule() {
             Some(_) => Self::Named,
             None => Self::Ignored,
-        }
+        })
     }
 }
 
@@ -155,17 +183,25 @@ impl Tiers {
 
 /// Which kinds are on screen.
 ///
-/// Spelled as three named booleans rather than as a bitset, because there are exactly three of
-/// them and a closed vocabulary is the one place where writing the members out is shorter than
-/// the machinery for not writing them out.
+/// Spelled as one named boolean per member rather than as a bitset, because the vocabulary is
+/// closed and a member that arrived without being written out here is a member no key could
+/// reach — which is #626's own finding, that a model whose expressiveness no interface exposes
+/// has not been built yet.
+// One bool per member of a closed vocabulary is the shape, not an accident of it: the lint is
+// about a struct that has grown flags, and this is a set over five known things.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct Kinds {
+    /// Things nothing brings back.
+    pub unrecoverable: bool,
     /// Installed third-party code.
     pub dependencies: bool,
     /// Compiled output.
     pub build: bool,
     /// Regenerated automatically.
     pub cache: bool,
+    /// Logs and the cruft an operating system leaves behind.
+    pub noise: bool,
 }
 
 impl Kinds {
@@ -173,9 +209,11 @@ impl Kinds {
     #[must_use]
     pub const fn all() -> Self {
         Self {
+            unrecoverable: true,
             dependencies: true,
             build: true,
             cache: true,
+            noise: true,
         }
     }
 
@@ -184,9 +222,11 @@ impl Kinds {
     #[must_use]
     pub const fn none() -> Self {
         Self {
+            unrecoverable: false,
             dependencies: false,
             build: false,
             cache: false,
+            noise: false,
         }
     }
 
@@ -194,9 +234,11 @@ impl Kinds {
     #[must_use]
     pub const fn only(kind: Kind) -> Self {
         Self {
+            unrecoverable: matches!(kind, Kind::Unrecoverable),
             dependencies: matches!(kind, Kind::Dependencies),
             build: matches!(kind, Kind::Build),
             cache: matches!(kind, Kind::Cache),
+            noise: matches!(kind, Kind::Noise),
         }
     }
 
@@ -204,9 +246,11 @@ impl Kinds {
     #[must_use]
     pub const fn has(self, kind: Kind) -> bool {
         match kind {
+            Kind::Unrecoverable => self.unrecoverable,
             Kind::Dependencies => self.dependencies,
             Kind::Build => self.build,
             Kind::Cache => self.cache,
+            Kind::Noise => self.noise,
         }
     }
 
@@ -214,16 +258,25 @@ impl Kinds {
     #[must_use]
     pub const fn toggling(mut self, kind: Kind) -> Self {
         match kind {
+            Kind::Unrecoverable => self.unrecoverable = !self.unrecoverable,
             Kind::Dependencies => self.dependencies = !self.dependencies,
             Kind::Build => self.build = !self.build,
             Kind::Cache => self.cache = !self.cache,
+            Kind::Noise => self.noise = !self.noise,
         }
         self
     }
 
     /// The kinds on screen, named, or `none` when the axis is empty.
+    ///
+    /// The full set says `every kind` rather than listing five words, and that is the honest
+    /// spelling as well as the short one: this line sits on a header and inside a confirmation
+    /// warning, and an axis that is not narrowing anything should not take a line to say so.
     #[must_use]
     pub fn label(self) -> String {
+        if self == Self::all() {
+            return "every kind".to_owned();
+        }
         let said: Vec<&str> = Kind::ALL
             .into_iter()
             .filter(|&kind| self.has(kind))
@@ -327,7 +380,11 @@ impl Preset {
             Self::Default => "only what a rule named — the gitignored tier is hidden",
             Self::Dependencies => "only installed dependencies a rule named",
             Self::AllIgnored => "installed dependencies, and the gitignored tier beside them",
-            Self::All => "everything the scan found",
+            // Not "everything the scan found", which it was and no longer is: gitignored files
+            // are an axis no preset touches, so this is everything on the two axes it moves.
+            // A view that overstated itself here would be the "silently keeps" failure wearing
+            // the label of its opposite.
+            Self::All => "every directory the scan found — `i` adds gitignored files",
         }
     }
 
@@ -361,6 +418,8 @@ impl fmt::Display for Preset {
 pub struct Lens {
     tiers: Tiers,
     kinds: Kinds,
+    /// Whether gitignored **files** are on screen. See [`Lens::files`].
+    files: bool,
     /// The `/` prompt's regex over the whole path, when there is one.
     pattern: Option<Regex>,
 }
@@ -377,6 +436,7 @@ impl PartialEq for Lens {
     fn eq(&self, other: &Self) -> bool {
         self.tiers == other.tiers
             && self.kinds == other.kinds
+            && self.files == other.files
             && self.pattern.as_ref().map(Regex::as_str) == other.pattern.as_ref().map(Regex::as_str)
     }
 }
@@ -391,6 +451,7 @@ impl std::hash::Hash for Lens {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.tiers.hash(state);
         self.kinds.hash(state);
+        self.files.hash(state);
         self.pattern.as_ref().map(Regex::as_str).hash(state);
     }
 }
@@ -403,6 +464,11 @@ impl Lens {
         Self {
             tiers,
             kinds,
+            // Off, which is the request's own answer and the header's job to declare. A real
+            // `~/repos` holds tens of thousands of gitignored files, and a sweep that showed
+            // them unasked would bury the 40 GB `node_modules` this tool exists to find under
+            // `.DS_Store` rows.
+            files: false,
             pattern: None,
         }
     }
@@ -451,6 +517,33 @@ impl Lens {
         self
     }
 
+    /// Whether gitignored files are on screen.
+    ///
+    /// # Why an axis of its own rather than a third tier
+    ///
+    /// A gitignored file *is* a tier-two claim, so a third value on the tier axis is the first
+    /// idea and it does not survive the presets. Each step of `f`'s cycle moves exactly one
+    /// axis, and `all` — "everything the scan found" — would have to widen the tier axis and
+    /// the kind axis together to reach files. The `/` pattern already had this shape and was
+    /// resolved the same way: it decides what is on screen, it is orthogonal to both axes, and
+    /// **no preset touches it**. Files are the same, which also means turning them on is not
+    /// undone by cycling the view.
+    ///
+    /// It is independently reachable, which is what the request asked for in so many words:
+    /// `i` toggles this and nothing else, so gitignored files come and go without disturbing
+    /// gitignored directories.
+    #[must_use]
+    pub fn files(&self) -> bool {
+        self.files
+    }
+
+    /// The same lens showing, or not showing, gitignored files. Both other axes untouched.
+    #[must_use]
+    pub fn with_files(mut self, files: bool) -> Self {
+        self.files = files;
+        self
+    }
+
     /// Which preset this lens sits on, if it sits on one.
     ///
     /// Unambiguous, because the four presets occupy four distinct points — which is what the
@@ -458,8 +551,9 @@ impl Lens {
     /// which step of the cycle the reader took to get here. A lens the axis keys built lands
     /// off all four and says so.
     ///
-    /// The pattern is deliberately not consulted: it narrows *whatever the axes left*, so
-    /// `dependencies` with a pattern over it is still `dependencies`.
+    /// The pattern is deliberately not consulted, and neither is the files axis: both narrow
+    /// or widen *whatever the two axes left*, so `dependencies` with a pattern over it and
+    /// files showing beside it is still `dependencies`.
     #[must_use]
     pub fn preset(&self) -> Option<Preset> {
         Preset::ALL
@@ -467,10 +561,19 @@ impl Lens {
             .find(|preset| preset.axes() == (self.tiers, self.kinds))
     }
 
-    /// How the footer spells the two axes when the reader has moved off every preset.
+    /// How the footer spells the axes when the reader has moved off every preset.
+    ///
+    /// The files axis is named only when it is *on*, and that asymmetry is deliberate: off is
+    /// where every view starts, so saying it everywhere would spend a third of the line on the
+    /// absence of something. When it is on it changes what a row means, so it is said.
     #[must_use]
     pub fn axes_label(&self) -> String {
-        format!("{} · {}", self.tiers.label(), self.kinds.label())
+        let axes = format!("{} · {}", self.tiers.label(), self.kinds.label());
+        if self.files {
+            format!("{axes} · files")
+        } else {
+            axes
+        }
     }
 
     /// The pattern in force, if any.
@@ -481,22 +584,34 @@ impl Lens {
 
     /// Whether this lens hides nothing at all, which is the fast path the whole front end
     /// takes when a reader has not narrowed anything.
+    ///
+    /// Note that no preset reaches it: `all` widens both axes and leaves files where the
+    /// reader put them, so a run that has never pressed `i` is narrowed however far `f` has
+    /// been cycled. That is what the header's out-of-view count is for.
     #[must_use]
     pub fn is_everything(&self) -> bool {
-        self.tiers == Tiers::both() && self.kinds == Kinds::all() && self.pattern.is_none()
+        self.tiers == Tiers::both()
+            && self.kinds == Kinds::all()
+            && self.files
+            && self.pattern.is_none()
     }
 
     /// Whether this claim is on screen.
     ///
-    /// The two axes are visibly independent here, which is the whole reason for the shape: a
-    /// hit's kind decides which axis judges it, and neither axis knows about the other.
+    /// The three axes are visibly independent here, which is the whole reason for the shape.
+    /// **Where a claim came from** decides one of them — a rule, the gitignore fallback, or the
+    /// fallback on a file — and **what it is** decides the kind axis, whoever found it. That
+    /// second half is what lets `.env` files be narrowed to on their own without a mode
+    /// anybody had to anticipate, and it leaves the tier-two *directory* judged by the tier
+    /// axis and never by the kind axis, since it has no kind to judge.
     #[must_use]
     pub fn matches(&self, hit: &Hit) -> bool {
-        let by_axes = match hit.kind() {
-            Some(kind) => self.tiers.has(Tier::Named) && self.kinds.has(kind),
-            None => self.tiers.has(Tier::Ignored),
+        let by_source = match Tier::of(hit) {
+            Some(tier) => self.tiers.has(tier),
+            None => self.files,
         };
-        by_axes && self.says_yes_to(&hit.path.to_string_lossy())
+        let by_kind = hit.kind().is_none_or(|kind| self.kinds.has(kind));
+        by_source && by_kind && self.says_yes_to(&hit.path.to_string_lossy())
     }
 
     /// Whether the pattern, if there is one, accepts this path.
@@ -524,7 +639,7 @@ impl Lens {
 #[cfg(test)]
 mod tests {
     use super::{Kinds, Lens, Preset, Tier, Tiers};
-    use crate::fixture::{gitignored, of_kind};
+    use crate::fixture::{gitignored, gitignored_file, of_kind};
     use crate::rules::Kind;
     use regex::Regex;
 
@@ -716,7 +831,7 @@ mod tests {
         assert!(!lens.is_everything());
         assert_eq!(
             lens.describe(),
-            "named + gitignored · dependencies + build + cache · /nx"
+            "named + gitignored · every kind · /nx"
         );
     }
 
@@ -733,11 +848,99 @@ mod tests {
     }
 
     #[test]
-    fn a_hits_tier_is_read_off_whether_anything_named_it() {
+    fn a_hits_tier_is_read_off_whether_a_rule_named_it_and_never_off_its_kind() {
+        // It used to be read off the kind, and it cannot be any more: a gitignored FILE
+        // carries one. Reading the claim is what keeps `.env` out of the *named* tier while
+        // still letting the kind axis narrow to it.
         assert_eq!(
             Tier::of(&of_kind("/scan/a/target", Kind::Build)),
-            Tier::Named
+            Some(Tier::Named)
         );
-        assert_eq!(Tier::of(&gitignored("/scan/a/dist")), Tier::Ignored);
+        assert_eq!(Tier::of(&gitignored("/scan/a/dist")), Some(Tier::Ignored));
+        assert_eq!(
+            Tier::of(&gitignored_file(
+                "/scan/a/.env",
+                Some(Kind::Unrecoverable)
+            )),
+            None,
+            "a file is judged by the files axis, and the tier axis declines to answer"
+        );
+    }
+
+    #[test]
+    fn a_gitignored_file_is_off_screen_until_its_own_key_says_otherwise() {
+        // The request's whole sentence, as one assertion: includable and excludable
+        // independently of ignored directories. A real `~/repos` holds tens of thousands of
+        // these, so no preset may drag them in and none may push them out.
+        let env = gitignored_file("/scan/a/.env", Some(Kind::Unrecoverable));
+        let dir = gitignored("/scan/a/dist");
+
+        for preset in Preset::ALL {
+            assert!(
+                !Lens::showing(preset).matches(&env),
+                "{preset} showed a gitignored file"
+            );
+        }
+
+        let showing = Lens::showing(Preset::Default).with_files(true);
+        assert!(showing.matches(&env));
+        assert!(
+            !showing.matches(&dir),
+            "turning files on must not turn the gitignored TIER on"
+        );
+
+        let tier_only = Lens::of(Tiers::ignored(), Kinds::none());
+        assert!(tier_only.matches(&dir));
+        assert!(
+            !tier_only.matches(&env),
+            "turning the gitignored tier on must not turn files on"
+        );
+    }
+
+    #[test]
+    fn the_files_axis_is_carried_through_every_preset_the_way_the_pattern_is() {
+        // Orthogonal means orthogonal: `f` moves the two axes and leaves this alone, exactly
+        // as it leaves the `/` pattern alone. Anything else and turning files on would be
+        // undone by a keystroke about something else.
+        let showing = Lens::showing(Preset::Default).with_files(true);
+        assert!(showing.files());
+        for preset in Preset::ALL {
+            let cycled = Lens::showing(preset).with_files(true);
+            assert!(cycled.files(), "{preset}");
+            assert_eq!(cycled.preset(), Some(preset), "{preset}");
+        }
+    }
+
+    #[test]
+    fn the_kind_axis_judges_a_file_because_a_file_has_a_kind() {
+        // What the vocabulary's two new members are *for*: "show me every unrecoverable file"
+        // is a question the axes can already answer, without a mode anybody had to anticipate.
+        let env = gitignored_file("/scan/a/.env", Some(Kind::Unrecoverable));
+        let log = gitignored_file("/scan/a/build.log", Some(Kind::Noise));
+        let scratch = gitignored_file("/scan/a/dump.sql", None);
+
+        let precious = Lens::of(Tiers::named(), Kinds::only(Kind::Unrecoverable)).with_files(true);
+        assert!(precious.matches(&env));
+        assert!(!precious.matches(&log));
+        assert!(
+            precious.matches(&scratch),
+            "a file with no kind has nothing for the kind axis to refuse, exactly as a \
+             tier-two directory does not"
+        );
+    }
+
+    #[test]
+    fn nothing_is_everything_until_the_files_axis_is_on_too() {
+        // The fast path has to mean what it says. `all` is not everything any more, because
+        // an axis it does not touch is still narrowing.
+        assert!(!Lens::showing(Preset::All).is_everything());
+        assert!(Lens::showing(Preset::All).with_files(true).is_everything());
+    }
+
+    #[test]
+    fn the_footer_says_the_files_axis_only_when_it_is_on() {
+        let off = Lens::of(Tiers::named(), Kinds::only(Kind::Cache));
+        assert_eq!(off.axes_label(), "named · cache");
+        assert_eq!(off.with_files(true).axes_label(), "named · cache · files");
     }
 }

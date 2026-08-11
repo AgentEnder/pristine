@@ -46,7 +46,13 @@ use crate::tree::Tree;
 /// nothing whatever about what put it there, so it says exactly that. See [`IgnoredClaim`].
 pub const UNLABELLED: &str = "Gitignored, kind unknown";
 
-/// Why a directory is reclaimable, and what is known about it.
+/// Why something is reclaimable, and what is known about it.
+///
+/// Three variants rather than two because a *file* is genuinely a third thing rather than a
+/// directory with a smaller number on it: it has no subtree, so prune-on-match does not apply
+/// to it, the size floor does not apply to it, and it is never unpriced. Spelled as a variant
+/// so that every consumer is made to say what it does about one — the enum being exhaustive is
+/// what found the places that had quietly assumed a claim was a directory.
 #[derive(Debug, Clone)]
 pub enum Claim {
     /// Tier one: a marker-anchored rule recognised the project and named this directory as its
@@ -54,6 +60,8 @@ pub enum Claim {
     Rule(RuleClaim),
     /// Tier two: nothing in the ruleset knows this directory, but git does.
     Ignored(IgnoredClaim),
+    /// Tier two, on a leaf: a gitignored file.
+    IgnoredFile(IgnoredFileClaim),
 }
 
 /// A claim made by the curated ruleset.
@@ -77,17 +85,35 @@ pub struct IgnoredClaim {
     pub work_tree: PathBuf,
 }
 
-/// One reclaimable directory.
+/// A claim on a gitignored **file**.
+///
+/// The one tier-two claim that can say what it found, and only because a file's *name* is
+/// sometimes evidence where a directory's never is. `.env` is the only copy of something and
+/// `.DS_Store` is the copy of nothing, so the two ends of [`Kind`]'s cost axis are reachable
+/// from a name alone — and the middle three, which are statements about how something was
+/// produced, are not.
+#[derive(Debug, Clone)]
+pub struct IgnoredFileClaim {
+    /// The git work tree whose ignore stack and index justified the claim.
+    pub work_tree: PathBuf,
+    /// What the name says this is, or `None` when it says nothing. See
+    /// [`Kind::of_ignored_file`].
+    pub kind: Option<Kind>,
+}
+
+/// One reclaimable thing: a directory, or — when the walk was asked for them — a gitignored
+/// file.
 #[derive(Debug, Clone)]
 pub struct Hit {
-    /// The directory itself.
+    /// The path itself.
     pub path: PathBuf,
     /// Which tier claimed it, and everything that tier knows.
     pub claim: Claim,
     /// What is known about the size. For a tier-one claim, [`Size::Unmeasured`] unless a
     /// breakdown was asked for, because measuring means enumerating the subtree the scan
-    /// deliberately pruned at. A tier-two claim always carries a real number: it could not have
-    /// been claimed without a full pass over it, so there was nothing left to save.
+    /// deliberately pruned at. A tier-two claim always carries a real number: a directory
+    /// could not have been claimed without a full pass over it, so there was nothing left to
+    /// save, and a *file* is one `lstat` the walk had already done.
     pub size: Size,
     /// The directory's own mtime. The best single proxy for "do I still need this".
     pub modified: Option<SystemTime>,
@@ -112,17 +138,31 @@ impl Hit {
         match &self.claim {
             Claim::Rule(claim) => Cow::Owned(claim.rule.label()),
             Claim::Ignored(_) => Cow::Borrowed(UNLABELLED),
+            // The same sentence a directory gets when nothing named it, deliberately: the tier
+            // knows the file is disposable and knows nothing about what wrote it.
+            Claim::IgnoredFile(claim) => match claim.kind {
+                Some(kind) => Cow::Owned(format!("Gitignored, {}", kind.short())),
+                None => Cow::Borrowed(UNLABELLED),
+            },
         }
     }
 
-    /// What kind of artefact this is, or `None` when only git knows the directory at all.
+    /// What kind of artefact this is, or `None` when nothing knows what it is.
     ///
     /// The half of a label a machine can act on, which is what the closed vocabulary bought:
     /// "show me every cache" is a question the front end can answer, and the `None` is not a
     /// gap to be filled in but the tier-two claim's own content — see [`IgnoredClaim`].
+    ///
+    /// **A kind no longer implies a rule.** A gitignored file can carry one, read off its name
+    /// by [`Kind::of_ignored_file`], so "which tier claimed this" is [`Hit::is_ignored_file`]
+    /// and [`Hit::rule`] rather than "does it have a kind".
     #[must_use]
     pub fn kind(&self) -> Option<Kind> {
-        self.rule().map(|rule| rule.kind)
+        match &self.claim {
+            Claim::Rule(claim) => Some(claim.rule.kind),
+            Claim::Ignored(_) => None,
+            Claim::IgnoredFile(claim) => claim.kind,
+        }
     }
 
     /// The rule that claimed this directory, or `None` when no rule did.
@@ -130,8 +170,28 @@ impl Hit {
     pub fn rule(&self) -> Option<&Rule> {
         match &self.claim {
             Claim::Rule(claim) => Some(&claim.rule),
-            Claim::Ignored(_) => None,
+            Claim::Ignored(_) | Claim::IgnoredFile(_) => None,
         }
+    }
+
+    /// Whether this claim is a gitignored file rather than a directory.
+    ///
+    /// The one question the front end asks about the *shape* of a candidate, because a file is
+    /// a different job from the one the sweep does — see [`crate::tui::lens`], where it is an
+    /// axis of its own rather than a third value on the tier axis.
+    #[must_use]
+    pub fn is_ignored_file(&self) -> bool {
+        matches!(self.claim, Claim::IgnoredFile(_))
+    }
+
+    /// Whether losing this cannot be undone by waiting for a rebuild.
+    ///
+    /// The one predicate the safety inversion turns on, asked in one place so that the tree,
+    /// the confirmation and the command line cannot come to three different answers. See
+    /// [`Kind::Unrecoverable`].
+    #[must_use]
+    pub fn is_unrecoverable(&self) -> bool {
+        self.kind() == Some(Kind::Unrecoverable)
     }
 }
 
@@ -207,6 +267,9 @@ pub struct WalkOutcome {
 }
 
 /// A configured scan of one tree.
+// A builder's options are independent switches by construction, which is what the lint is
+// warning about everywhere it is not one.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct Walker {
     root: PathBuf,
@@ -217,6 +280,7 @@ pub struct Walker {
     same_file_system: bool,
     size_mode: SizeMode,
     fallback: bool,
+    ignored_files: bool,
     min_size: u64,
 }
 
@@ -238,6 +302,7 @@ impl Walker {
             same_file_system: true,
             size_mode: SizeMode::default(),
             fallback: true,
+            ignored_files: false,
             min_size: DEFAULT_MIN_SIZE,
         }
     }
@@ -285,10 +350,29 @@ impl Walker {
         self
     }
 
-    /// The size floor a tier-two claim must clear, [`DEFAULT_MIN_SIZE`] by default.
+    /// Whether tier two also claims gitignored **files**. Off by default.
     ///
-    /// It applies to tier two only. A rule that names a directory has already said the
-    /// directory is output, and an empty `node_modules` is still a `node_modules`.
+    /// Off rather than on because it is a different job from the one the sweep does, and the
+    /// difference is not a matter of degree: clearing fifty env files reclaims kilobytes, so
+    /// the value is hygiene rather than space and a list sorted by size is the wrong place to
+    /// discover it. A real `~/repos` holds tens of thousands of them, and an unasked-for sweep
+    /// would bury a 40 GB `node_modules` under `.DS_Store` rows.
+    ///
+    /// It costs an ignore query and an index lookup per file the walk sees, which the walk was
+    /// previously getting for free by refusing to judge files at all — so it is opt-in in the
+    /// library as well as on the command line.
+    #[must_use]
+    pub fn ignored_files(mut self, ignored_files: bool) -> Self {
+        self.ignored_files = ignored_files;
+        self
+    }
+
+    /// The size floor a tier-two **directory** must clear, [`DEFAULT_MIN_SIZE`] by default.
+    ///
+    /// It applies to tier-two directories only. A rule that names a directory has already said
+    /// the directory is output, and an empty `node_modules` is still a `node_modules` — and a
+    /// gitignored file is not on the list for its size in the first place, so a floor stated in
+    /// bytes has nothing to say about one.
     #[must_use]
     pub fn min_size(mut self, min_size: u64) -> Self {
         self.min_size = min_size;
@@ -337,7 +421,7 @@ impl Walker {
     {
         let fallback = self
             .fallback
-            .then(|| Fallback::new(&self.root, self.min_size));
+            .then(|| Fallback::new(&self.root, self.min_size, self.ignored_files));
         let scan = Scan {
             root: self.root.as_path(),
             detector: self.ruleset.detector(),
@@ -347,6 +431,7 @@ impl Walker {
             errors: Mutex::new(Vec::new()),
             hits: AtomicUsize::new(0),
             fallback_hits: AtomicUsize::new(0),
+            file_hits: AtomicUsize::new(0),
             holding_a_checkout: AtomicUsize::new(0),
             reclaimed: AtomicU64::new(0),
             unmeasured: AtomicUsize::new(0),
@@ -403,6 +488,7 @@ impl Walker {
             Some(fallback) => {
                 let (report, mut inert) = fallback.finish(
                     fallback_hits,
+                    scan.file_hits.load(Ordering::Relaxed),
                     scan.holding_a_checkout.load(Ordering::Relaxed),
                 );
                 errors.append(&mut inert);
@@ -505,6 +591,7 @@ struct Scan<'a, F> {
     errors: Mutex<Vec<WalkError>>,
     hits: AtomicUsize,
     fallback_hits: AtomicUsize,
+    file_hits: AtomicUsize,
     holding_a_checkout: AtomicUsize,
     reclaimed: AtomicU64,
     unmeasured: AtomicUsize,
@@ -537,27 +624,11 @@ where
         let Some(file_type) = entry.file_type() else {
             return WalkState::Continue;
         };
-        // Symlinks stay in the running for Bazel's `bazel-*`, which are links.
-        if !file_type.is_dir() && !file_type.is_symlink() {
+        // Everything that is not a directory is a leaf: a plain file, and a symlink, which
+        // stays in the running for Bazel's `bazel-*` as well.
+        let leaf = !file_type.is_dir();
+        let Some(claim) = self.judge(tier_two, &entry, leaf) else {
             return WalkState::Continue;
-        }
-
-        // Tier one first, and tier one prunes. That is what enforces tier two's fourth
-        // condition, and it is why a gitignored `node_modules` keeps its `pnpm install`
-        // instead of becoming an anonymous pile of bytes.
-        let claim = if let Some(rule) = self.detector.detect(entry.path(), self.root, entry.depth())
-        {
-            Claim::Rule(rule)
-        } else {
-            // Tier two judges directories only. A symlink holds nothing, and its bytes live
-            // outside the tree.
-            let judged = tier_two
-                .filter(|_| file_type.is_dir())
-                .and_then(|tier_two| tier_two.judge(entry.path()));
-            match judged {
-                Some(ignored) => Claim::Ignored(ignored),
-                None => return WalkState::Continue,
-            }
         };
 
         let metadata = match entry.metadata() {
@@ -595,11 +666,25 @@ where
                 // reclaimable subdirectories under it that do not.
                 None => return WalkState::Continue,
             },
+            // Always priced, and no floor. One `lstat` — which the walk has already done — is
+            // the exact and complete answer for a leaf in constant time, so a file never enters
+            // the unpriced state a tier-one directory lives in and the pricing pool never has
+            // to grow a branch for one. The floor is deliberately not applied: it exists to
+            // keep a small ignored *directory* off a list sorted by size, which is not why a
+            // 40-byte `.env` is on it.
+            Claim::IgnoredFile(_) => self.measurer.measure(entry.path(), &metadata).size,
         };
 
         self.hits.fetch_add(1, Ordering::Relaxed);
-        if matches!(claim, Claim::Ignored(_)) {
-            self.fallback_hits.fetch_add(1, Ordering::Relaxed);
+        match &claim {
+            Claim::Rule(_) => {}
+            Claim::Ignored(_) => {
+                self.fallback_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            Claim::IgnoredFile(_) => {
+                self.fallback_hits.fetch_add(1, Ordering::Relaxed);
+                self.file_hits.fetch_add(1, Ordering::Relaxed);
+            }
         }
         match size.bytes() {
             Some(bytes) => {
@@ -609,6 +694,14 @@ where
                 self.unmeasured.fetch_add(1, Ordering::Relaxed);
             }
         }
+        // The whole thesis, in one line: what we have claimed, we do not enumerate. A leaf is
+        // the one claim that says nothing by it — there is no subtree to prune — so it says
+        // `Continue` rather than leaning on `Skip` happening to be a no-op on a file.
+        let after = if leaf {
+            WalkState::Continue
+        } else {
+            WalkState::Skip
+        };
         let path = entry.into_path();
         let queued = queued.then(|| path.clone());
         (self.on_found)(Found::Claim(Hit {
@@ -633,8 +726,48 @@ where
             }
         }
 
-        // The whole thesis, in one line: what we have claimed, we do not enumerate.
-        WalkState::Skip
+        after
+    }
+
+    /// Which tier, if either, claims this entry — and for a leaf, what its name says it is.
+    ///
+    /// Tier one is asked first, and tier one prunes. That ordering *is* tier two's fourth
+    /// condition, "no tier-one rule already claimed it": there is no separate check for it
+    /// anywhere and there does not need to be.
+    ///
+    /// A leaf reaches tier two only when the fallback was asked for files. Asking that of the
+    /// **fallback** rather than of the file type is what keeps a walk that did not want them
+    /// exactly as cheap as it was — no ignore query and no index lookup per file — while
+    /// leaving the symlink path alone, since a symlink has always been offered to tier one for
+    /// Bazel's sake.
+    fn judge(
+        &self,
+        tier_two: Option<&mut crate::fallback::Thread<'_>>,
+        entry: &DirEntry,
+        leaf: bool,
+    ) -> Option<Claim> {
+        let wanted = tier_two
+            .as_ref()
+            .is_some_and(|tier_two| tier_two.claims_files());
+        if leaf && !wanted && entry.file_type().is_some_and(|kind| !kind.is_symlink()) {
+            return None;
+        }
+        if let Some(rule) = self.detector.detect(entry.path(), self.root, entry.depth()) {
+            return Some(Claim::Rule(rule));
+        }
+        let work_tree = tier_two
+            .filter(|_| !leaf || wanted)
+            .and_then(|tier_two| tier_two.judge(entry.path(), !leaf))?;
+        Some(if leaf {
+            Claim::IgnoredFile(IgnoredFileClaim {
+                work_tree,
+                // Off the name, which is all a file offers — and all it needs to offer, since
+                // the two ends of the cost axis are the only ones a name can reach.
+                kind: entry.file_name().to_str().and_then(Kind::of_ignored_file),
+            })
+        } else {
+            Claim::Ignored(IgnoredClaim { work_tree })
+        })
     }
 
     /// The one pass tier two needs over a candidate, and the three ways it can refuse.

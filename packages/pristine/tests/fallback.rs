@@ -15,7 +15,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-use pristine::{Claim, Found, Hit, Ruleset, Size, SizeMode, Walker};
+use pristine::{Claim, Found, Hit, Kind, Ruleset, Size, SizeMode, Walker};
 use tempfile::TempDir;
 
 /// Comfortably over the floor the tests set, and nowhere near the 10 MiB default, so a test
@@ -658,4 +658,255 @@ fn the_rollup_tree_carries_tier_two_claims_alongside_tier_one() {
         tree.node(sediment).reclaimable + tree.node(modules).reclaimable
     );
     assert_eq!(tree.reclaimable(), outcome.reclaimable_bytes);
+}
+
+// ---------------------------------------------------------------------------------------
+// Gitignored FILES.
+//
+// A different job from the rest of the tier, which is what most of these are about: the size
+// floor does not reach them, they are never unpriced, and a walk that did not ask for them
+// must behave exactly as it did before. The safety half — that an unrecoverable one is never
+// swept up by a mark on a parent and never removed by a script that did not name the flag —
+// is in `tui::state` and `tests/cli.rs`, because it is about what is done with a claim rather
+// than about finding one.
+// ---------------------------------------------------------------------------------------
+
+/// A walker that claims gitignored files as well as directories.
+fn with_files(root: &Path) -> Walker {
+    walker(root).ignored_files(true)
+}
+
+/// A repository whose `.gitignore` hides an env file, a log and a directory under the floor.
+fn repo_with_ignored_files() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    init_repo(tmp.path());
+    fs::write(tmp.path().join(".gitignore"), ".env*\n*.log\nscraps/\n").unwrap();
+    write(&tmp.path().join(".env"), 40);
+    write(&tmp.path().join(".env.local"), 40);
+    write(&tmp.path().join("build.log"), 40);
+    // Under the floor on purpose: a directory this small is not worth a row, and the files
+    // beside it are — which is the whole distinction.
+    write(&tmp.path().join("scraps/leftover.bin"), 16);
+    touch(&tmp.path().join("kept.txt"));
+    git(tmp.path(), &["add", "kept.txt", ".gitignore"]);
+    tmp
+}
+
+#[test]
+fn a_gitignored_file_is_invisible_until_the_walk_is_asked_for_files() {
+    // The bug this exists to fix, and its other half: a walk that did not ask is unchanged.
+    let tmp = repo_with_ignored_files();
+
+    assert!(
+        claimed(tmp.path()).is_empty(),
+        "a default sweep claims no files, and `scraps/` is under the floor"
+    );
+
+    let mut found: Vec<String> = scan_with(&with_files(tmp.path()))
+        .iter()
+        .map(|hit| {
+            hit.path
+                .strip_prefix(tmp.path())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        [".env", ".env.local", "build.log", "scraps/leftover.bin"]
+    );
+}
+
+#[test]
+fn a_directory_the_floor_refused_is_descended_into_and_its_files_claimed_one_by_one() {
+    // The consequence of the floor and prune-on-match meeting, pinned deliberately because it
+    // reads as a surprise otherwise. An ignored directory OVER the floor is claimed and never
+    // descended into, so its contents are one row. One UNDER it is refused, the walk goes in —
+    // as it already did, since a rule may still match deeper — and every ignored file inside is
+    // a candidate on its own.
+    //
+    // Which is the behaviour worth having: a `.env` parked in a small ignored directory is
+    // exactly the thing this feature exists to surface, and it is found here and covered by
+    // the directory's own claim in the other case. What it costs is that the floor stops
+    // thinning that one subtree, which is why it is a test rather than a footnote.
+    let tmp = TempDir::new().unwrap();
+    init_repo(tmp.path());
+    fs::write(tmp.path().join(".gitignore"), "small/\nbig/\n").unwrap();
+    write(&tmp.path().join("small/.env"), 40);
+    write(&tmp.path().join("big/.env"), 40);
+    write(&tmp.path().join("big/blob.bin"), OVER);
+
+    let mut found: Vec<String> = scan_with(&with_files(tmp.path()))
+        .iter()
+        .map(|hit| {
+            hit.path
+                .strip_prefix(tmp.path())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    found.sort();
+    assert_eq!(found, ["big", "small/.env"]);
+}
+
+#[test]
+fn the_size_floor_does_not_reach_a_file() {
+    // The floor is about rows on a list sorted by size: an ignored directory under it is not
+    // worth one. A 40-byte `.env` is worth one for a reason that has nothing to do with its
+    // size, so the floor has nothing to say about it — proved against a floor far above every
+    // file in the fixture, with `scraps/` failing the same floor to show it is still in force
+    // where it belongs.
+    let tmp = repo_with_ignored_files();
+
+    let hits = scan_with(&with_files(tmp.path()).min_size(1024 * 1024));
+
+    assert_eq!(hits.len(), 4, "{hits:?}");
+    assert!(
+        hits.iter()
+            .all(|hit| hit.size.bytes().unwrap() < 1024 * 1024),
+        "every one of these is far below the floor it was found under"
+    );
+    assert!(
+        !hits.iter().any(|hit| hit.path.ends_with("scraps")),
+        "the floor still keeps a small ignored DIRECTORY off the list"
+    );
+}
+
+#[test]
+fn a_file_is_always_priced_even_on_a_scan_that_prices_nothing_else() {
+    // One `lstat` is the exact answer in constant time, so a file never enters the unpriced
+    // state a tier-one directory lives in — and the pricing pool never has to grow a branch
+    // for one. Asserted beside a tier-one claim on the same default scan, which is a dash.
+    let tmp = repo_with_ignored_files();
+    touch(&tmp.path().join("app/package.json"));
+    write(&tmp.path().join("app/node_modules/dep/index.js"), OVER);
+
+    let hits = scan_with(&with_files(tmp.path()).size_mode(SizeMode::Skip));
+
+    let env = hits.iter().find(|hit| hit.path.ends_with(".env")).unwrap();
+    assert!(env.size.bytes().is_some(), "a file arrived unpriced");
+    let modules = hits
+        .iter()
+        .find(|hit| hit.path.ends_with("node_modules"))
+        .unwrap();
+    assert_eq!(
+        modules.size,
+        Size::Unmeasured,
+        "a default scan still prices no tier-one directory"
+    );
+}
+
+#[test]
+fn a_files_kind_is_read_off_its_name_and_says_what_losing_it_costs() {
+    let tmp = repo_with_ignored_files();
+
+    let hits = scan_with(&with_files(tmp.path()));
+    let kind_of = |name: &str| {
+        hits.iter()
+            .find(|hit| hit.path.ends_with(name))
+            .unwrap_or_else(|| panic!("no claim for {name}"))
+            .kind()
+    };
+
+    assert_eq!(kind_of(".env"), Some(Kind::Unrecoverable));
+    assert_eq!(kind_of(".env.local"), Some(Kind::Unrecoverable));
+    assert_eq!(kind_of("build.log"), Some(Kind::Noise));
+    let env = hits.iter().find(|hit| hit.path.ends_with(".env")).unwrap();
+    assert_eq!(env.label(), "Gitignored, unrecoverable");
+    assert!(env.is_ignored_file());
+    assert!(env.is_unrecoverable());
+    assert!(env.rule().is_none(), "no rule named it, and none could");
+}
+
+#[test]
+fn a_gitignored_file_whose_name_says_nothing_is_still_claimed_and_still_unnamed() {
+    // The tier-two asymmetry, in a file's clothes: git knows the file is disposable and
+    // nothing knows what it is. Claiming only the names in a table would make the feature a
+    // pattern list rather than a tier.
+    let tmp = TempDir::new().unwrap();
+    init_repo(tmp.path());
+    fs::write(tmp.path().join(".gitignore"), "dump.sql\n").unwrap();
+    write(&tmp.path().join("dump.sql"), 4096);
+
+    let hits = scan_with(&with_files(tmp.path()));
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].kind(), None);
+    assert_eq!(hits[0].label(), "Gitignored, kind unknown");
+    assert!(hits[0].is_ignored_file());
+}
+
+#[test]
+fn a_tracked_file_matching_an_ignore_pattern_is_never_claimed() {
+    // The safety property, on the shape where it is easiest to get wrong. `git add -f` on an
+    // ignored path is ordinary — a committed `.env.example`, a checked-in log — and the index
+    // is the only thing that knows. It is an exact-path question for a file rather than a
+    // prefix one, which is the lookup a directory-only tier never had to get right.
+    let tmp = TempDir::new().unwrap();
+    init_repo(tmp.path());
+    fs::write(tmp.path().join(".gitignore"), "*.env\n").unwrap();
+    write(&tmp.path().join("committed.env"), 40);
+    write(&tmp.path().join("scratch.env"), 40);
+    git(tmp.path(), &["add", "-f", "committed.env"]);
+
+    let hits = scan_with(&with_files(tmp.path()));
+
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].path, tmp.path().join("scratch.env"));
+}
+
+#[test]
+fn a_file_inside_a_claimed_directory_is_not_claimed_again() {
+    // Prune-on-match is what stops the feature turning one 40 GB `node_modules` into four
+    // hundred thousand rows. It is not a new rule — a claimed directory is never descended
+    // into — but it is the one this change could most easily have broken, since a file is
+    // exactly what lives under a pruned directory.
+    let tmp = TempDir::new().unwrap();
+    init_repo(tmp.path());
+    fs::write(tmp.path().join(".gitignore"), "node_modules/\n").unwrap();
+    touch(&tmp.path().join("package.json"));
+    write(&tmp.path().join("node_modules/dep/.env"), 40);
+    write(&tmp.path().join("node_modules/dep/index.js"), OVER);
+
+    let hits = scan_with(&with_files(tmp.path()));
+
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].path, tmp.path().join("node_modules"));
+}
+
+#[test]
+fn a_file_a_pattern_only_matches_as_a_directory_is_left_alone() {
+    // git's own matcher answers differently for a file and a directory — `scraps/` matches
+    // only the directory — so the walk has to tell it which it is asking about. Passing the
+    // wrong one claims files a `.gitignore` never mentioned, which is the failure this whole
+    // tier is built to avoid.
+    let tmp = TempDir::new().unwrap();
+    init_repo(tmp.path());
+    fs::write(tmp.path().join(".gitignore"), "scraps/\n").unwrap();
+    // A FILE named `scraps`, beside a directory the same pattern does claim.
+    write(&tmp.path().join("scraps"), 40);
+
+    let hits = scan_with(&with_files(tmp.path()));
+
+    assert!(hits.is_empty(), "{hits:?}");
+}
+
+#[test]
+fn the_report_says_whether_files_were_looked_for_at_all() {
+    // "There were none" and "nobody looked" are opposite facts and they look identical
+    // without something that says which — this report's founding rule, applied to the second
+    // question it now answers.
+    let tmp = repo_with_ignored_files();
+
+    let quiet = walker(tmp.path()).run(|_| {});
+    assert!(!quiet.fallback.files_enabled);
+    assert_eq!(quiet.fallback.files, 0);
+
+    let asked = with_files(tmp.path()).run(|_| {});
+    assert!(asked.fallback.files_enabled);
+    assert_eq!(asked.fallback.files, 4);
+    assert_eq!(asked.fallback.hits, 4);
 }

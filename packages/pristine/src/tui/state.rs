@@ -359,6 +359,19 @@ impl Pending {
         self.entries.iter().filter(|entry| entry.hidden).count()
     }
 
+    /// How many lines of this batch are things nothing brings back.
+    ///
+    /// Counted over the lines that are actually going to be removed, refusals excluded: a
+    /// directory the safety model is leaving standing is not one this warning is about, and
+    /// counting it would put a red line over a batch that takes nothing precious.
+    #[must_use]
+    pub fn unrecoverable(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.kept.is_none() && entry.kind == Some(Kind::Unrecoverable))
+            .count()
+    }
+
     /// How many the safety model will leave standing.
     #[must_use]
     pub fn kept(&self) -> usize {
@@ -672,8 +685,21 @@ fn tally(
                         here.visible = roll;
                     }
                     let deepest = sparing.last().copied();
+                    // **A bulk mark never sweeps in something nothing brings back.** Every
+                    // other claim here is regenerable — that is the whole content of the kind
+                    // vocabulary — so `space` on a parent taking its entire subtree is a
+                    // reader saying "reclaim these bytes", and a reader reclaiming 40 GB is
+                    // not thinking about the `.env` three levels down. Marking one has to be
+                    // the deliberate, individual act of putting the cursor on its own row, so
+                    // the mark has to be AT this node rather than above it.
+                    //
+                    // Expressed on the mark's depth, which is exactly what "individual" means
+                    // once marks are subtree roots: `at == depth` is a mark on this claim.
+                    let deliberate = !hit.is_unrecoverable();
                     let chosen = covering.iter().any(|&(at, mark)| {
-                        deepest.is_none_or(|spared| at > spared) && mark.matches(hit)
+                        deepest.is_none_or(|spared| at > spared)
+                            && (deliberate || at == depth)
+                            && mark.matches(hit)
                     });
                     // The deleter's two phases come off the selection at different moments,
                     // and both timings are load-bearing. A target part way through is a
@@ -1046,6 +1072,20 @@ impl View {
         };
         view.sync();
         view
+    }
+
+    /// Opens the view with gitignored files on screen, as `--ignored-files` asks for.
+    ///
+    /// The walk claims them either way — see [`super::spawn_walk`] — so this decides only where
+    /// the lens starts. It exists because a flag that reads "claim gitignored files" and then
+    /// does nothing a reader can see is a flag that has lied about itself: the two front ends
+    /// have to mean the same thing by it, and in the tree "show me these" is what it means.
+    #[must_use]
+    pub fn showing_files(mut self) -> Self {
+        self.lens = self.lens.with_files(true);
+        self.stale = true;
+        self.sync();
+        self
     }
 
     // ---- what the workers report ------------------------------------------------------
@@ -2064,6 +2104,7 @@ impl View {
             Action::Spare => self.spare_entry(),
             Action::CyclePreset(turn) => self.cycle_preset(turn),
             Action::CycleTiers => self.cycle_tiers(),
+            Action::ToggleFiles => self.toggle_files(),
             Action::ToggleKind(kind) => self.toggle_kind(kind),
             Action::Cursor(motion) => self.move_cursor(motion),
             Action::ScrollRows(motion) => self.scroll_rows(motion),
@@ -2241,7 +2282,14 @@ impl View {
         self.off_the_presets();
     }
 
-    /// `d` `b` `c`: one member of the kind axis, on its own.
+    /// `i`: gitignored files, on their own.
+    fn toggle_files(&mut self) {
+        let files = !self.lens.files();
+        self.lens = self.lens.clone().with_files(files);
+        self.off_the_presets();
+    }
+
+    /// `u` `d` `b` `c` `n`: one member of the kind axis, on its own.
     fn toggle_kind(&mut self, kind: Kind) {
         let kinds = self.lens.kinds().toggling(kind);
         self.lens = self.lens.clone().with_kinds(kinds);
@@ -2999,12 +3047,10 @@ fn descends_from(tree: &Tree, id: NodeId, root: NodeId) -> bool {
 /// that says only that git knows about it, which is the one they will want to read most
 /// carefully and so the one that should not be scrolled past on the way in.
 fn kind_order(kind: Option<Kind>) -> usize {
-    match kind {
-        Some(Kind::Dependencies) => 0,
-        Some(Kind::Build) => 1,
-        Some(Kind::Cache) => 2,
-        None => 3,
-    }
+    // Read off the vocabulary's own cost ordering rather than written out again, so the
+    // confirmation groups the expensive end first without this file having a second opinion
+    // about which end that is. A claim nothing named sorts last, after every kind.
+    kind.map_or(Kind::ALL.len(), Kind::cost)
 }
 
 /// `1 directory`, `4 directories`.
@@ -3019,7 +3065,7 @@ mod tests {
         Action, Answer, Effect, Mark, Motion, Notice, Overlay, Planned, Preset, Turn, View,
     };
     use crate::delete::{Refusal, Refused};
-    use crate::fixture::{gitignored, hit, of_kind};
+    use crate::fixture::{gitignored, gitignored_file, hit, of_kind};
     use crate::rules::Kind;
     use crate::size::Size;
     use crate::tree::{Order, Sort, Tree};
@@ -3620,7 +3666,7 @@ mod tests {
         );
         assert_eq!(
             view.lens().describe(),
-            "named · dependencies + build + cache · /nx"
+            "named · every kind · /nx"
         );
     }
 
@@ -3631,8 +3677,9 @@ mod tests {
         // keystroke can ask for it is a model with a claim it cannot cash. `d` and `b` take the
         // other two kinds off `default`, and what is left is exactly that view.
         let mut view = mixed();
-        view.apply(Action::ToggleKind(Kind::Dependencies));
-        view.apply(Action::ToggleKind(Kind::Build));
+        for kind in Kind::ALL.into_iter().filter(|&kind| kind != Kind::Cache) {
+            view.apply(Action::ToggleKind(kind));
+        }
 
         assert_eq!(view.preset(), None, "a hand-built view is not a preset");
         assert_eq!(view.view_label(), "named · cache");
@@ -3692,8 +3739,12 @@ mod tests {
         // `dependencies` is on `dependencies`, and the footer should say so rather than
         // spelling out axes that have a name.
         let mut view = mixed();
-        view.apply(Action::ToggleKind(Kind::Build));
-        view.apply(Action::ToggleKind(Kind::Cache));
+        for kind in Kind::ALL
+            .into_iter()
+            .filter(|&kind| kind != Kind::Dependencies)
+        {
+            view.apply(Action::ToggleKind(kind));
+        }
         assert_eq!(view.preset(), Some(Preset::Dependencies));
         assert_eq!(view.view_label(), "dependencies");
 
@@ -5405,6 +5456,167 @@ mod tests {
             Some("holds a git checkout")
         );
         assert_eq!(view.kept_reason(at(&view, "/scan/nx/node_modules")), None);
+    }
+
+    // ---- the safety inversion ---------------------------------------------------------
+
+    /// A tree with an unrecoverable file parked under a directory worth deleting for its bytes.
+    ///
+    /// The shape the whole rule is about: a reader marks `nx` to get 200 bytes back and is not
+    /// thinking about the `.env` two levels down.
+    fn with_an_env_file() -> View {
+        let mut tree = Tree::new("/scan");
+        tree.insert(sized(
+            of_kind("/scan/nx/node_modules", Kind::Dependencies),
+            200,
+        ));
+        tree.insert(sized(
+            gitignored_file("/scan/nx/app/.env", Some(Kind::Unrecoverable)),
+            40,
+        ));
+        tree.insert(sized(
+            gitignored_file("/scan/nx/app/build.log", Some(Kind::Noise)),
+            10,
+        ));
+        let mut view = View::new(tree);
+        view.viewport(40);
+        // Showing files, because a rule about what a mark takes has to be tested on a view
+        // that can see what it is taking.
+        view.apply(Action::ToggleFiles);
+        view
+    }
+
+    #[test]
+    fn a_run_that_asked_for_files_on_the_command_line_opens_showing_them() {
+        // The two front ends have to mean the same thing by `--ignored-files`. The walk claims
+        // files either way, so without this the flag would be a silent no-op in the tree —
+        // which is worse than not having it, because it reads as a request that was honoured.
+        let mut tree = Tree::new("/scan");
+        tree.insert(sized(
+            gitignored_file("/scan/nx/app/.env", Some(Kind::Unrecoverable)),
+            40,
+        ));
+
+        let mut shut = View::new(tree);
+        shut.viewport(40);
+        assert_eq!(shut.total().claims, 0);
+        assert_eq!(shut.out_of_view(), 1);
+
+        let mut open = View::new({
+            let mut tree = Tree::new("/scan");
+            tree.insert(sized(
+                gitignored_file("/scan/nx/app/.env", Some(Kind::Unrecoverable)),
+                40,
+            ));
+            tree
+        })
+        .showing_files();
+        open.viewport(40);
+        assert_eq!(open.total().claims, 1);
+        assert_eq!(open.out_of_view(), 0);
+    }
+
+    #[test]
+    fn a_mark_on_a_parent_never_sweeps_in_something_nothing_brings_back() {
+        // The safety inversion, and the reason it cannot ride the same path as everything
+        // else: a cache is free, an output is a compile, dependencies are a fetch — and this
+        // is the one row where being wrong cannot be undone by waiting for a rebuild. `space`
+        // on a directory means "reclaim these bytes", not "and the only copy of my secrets".
+        let mut view = with_an_env_file();
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Mark);
+        view.sync();
+
+        assert_eq!(
+            batched(&view),
+            [
+                PathBuf::from("/scan/nx/app/build.log"),
+                PathBuf::from("/scan/nx/node_modules"),
+            ],
+            "a bulk mark took the env file"
+        );
+        // The counter and the batch are one traversal, so the number a reader is shown agrees
+        // with what the deed would take.
+        assert_eq!(view.marked().claims, 2);
+        assert_eq!(view.marked().bytes, 210);
+    }
+
+    #[test]
+    fn marking_the_row_itself_is_how_something_unrecoverable_gets_into_a_batch() {
+        // The other half, and the half that keeps the rule from being a refusal: it is not
+        // undeletable, it is undeletable *by accident*. Putting the cursor on the row is the
+        // deliberate individual act the design asks for.
+        let mut view = with_an_env_file();
+        point_at(&mut view, "/scan/nx/app/.env");
+        view.apply(Action::Mark);
+        view.sync();
+
+        assert_eq!(batched(&view), [PathBuf::from("/scan/nx/app/.env")]);
+        assert_eq!(view.marked().claims, 1);
+    }
+
+    #[test]
+    fn a_mark_that_arrives_over_an_env_file_later_still_does_not_take_it() {
+        // Marks resolve on demand as the scan streams claims in, which is what makes "mark
+        // this directory" mean the directory rather than the rows found so far. That is
+        // exactly the door an unrecoverable file could arrive through after the decision was
+        // made, so the rule has to hold at resolution time and not only at the keystroke.
+        let mut view = with_an_env_file();
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Mark);
+        view.sync();
+        let before = view.marked().claims;
+
+        view.found(sized(
+            gitignored_file("/scan/nx/deep/id_rsa", Some(Kind::Unrecoverable)),
+            8,
+        ));
+        view.found(sized(of_kind("/scan/nx/deep/dist", Kind::Build), 5));
+        view.sync();
+
+        assert_eq!(
+            view.marked().claims,
+            before + 1,
+            "only the build directory joined the batch"
+        );
+        assert!(!batched(&view).contains(&PathBuf::from("/scan/nx/deep/id_rsa")));
+    }
+
+    #[test]
+    fn an_unrecoverable_entry_is_countable_on_the_confirmation() {
+        // The confirmation is the last place a reader can change their mind, so what it holds
+        // has to be distinguishable *there* rather than only styled differently in the tree.
+        let mut view = with_an_env_file();
+        view.asking(
+            &[
+                Planned::at("/scan/nx/app/.env", Size::Measured(40)),
+                Planned::at("/scan/nx/node_modules", Size::Measured(200)),
+            ],
+            &[],
+        );
+
+        let pending = view.pending().expect("the box is up");
+        assert_eq!(pending.unrecoverable(), 1);
+        // Listed first, because the vocabulary is ordered by what it costs to lose and the
+        // listing groups by that order.
+        assert_eq!(pending.entries()[0].path, PathBuf::from("/scan/nx/app/.env"));
+        assert_eq!(pending.entries()[0].kind, Some(Kind::Unrecoverable));
+    }
+
+    #[test]
+    fn a_refused_unrecoverable_entry_is_not_what_the_warning_is_about() {
+        // A line the safety model is leaving standing is not a line this warning is about,
+        // and counting it would put a red sentence over a batch that takes nothing precious.
+        let mut view = with_an_env_file();
+        view.asking(
+            &[Planned::at("/scan/nx/node_modules", Size::Measured(200))],
+            &[Refused {
+                path: PathBuf::from("/scan/nx/app/.env"),
+                reason: Refusal::HoldsCheckout,
+            }],
+        );
+
+        assert_eq!(view.pending().expect("the box is up").unrecoverable(), 0);
     }
 
     /// The batch, as paths, for the tests that are about *what* is in it.

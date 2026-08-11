@@ -34,7 +34,8 @@ pub enum Anchor {
     Ancestor,
 }
 
-/// What a reclaimable directory *is*, from a vocabulary of three.
+/// What a reclaimable thing *is*, from a closed vocabulary **ordered by what it costs to
+/// lose**.
 ///
 /// The vocabulary is closed on purpose, and it is the half of a label that a machine can act
 /// on: a kind sorts, groups and filters, so "show me every cache" is a question the front end
@@ -44,34 +45,161 @@ pub enum Anchor {
 /// genuinely for. A cache is free, an output is a compile, dependencies are a network fetch —
 /// and unlike a command string, that reading holds without knowing anything about the machine
 /// it would be paid on.
+///
+/// # The ordering is the point, and it is [`Kind::ALL`]
+///
+/// The three middle members were already ordered — what was fetched, what was compiled, what
+/// will come back on its own — and [`Kind::ALL`] is now that ordering made explicit, with a
+/// member at each extreme:
+///
+/// | | cost to lose |
+/// |---|---|
+/// | [`Unrecoverable`](Self::Unrecoverable) | **nothing brings it back** |
+/// | [`Dependencies`](Self::Dependencies) | a network fetch |
+/// | [`Build`](Self::Build) | a compile |
+/// | [`Cache`](Self::Cache) | it returns on its own |
+/// | [`Noise`](Self::Noise) | nothing will miss it |
+///
+/// Everything else in the crate reads the order off `ALL` rather than restating it, so the
+/// confirmation groups the expensive end first and the front end derives a key per member.
+///
+/// # [`Unrecoverable`](Self::Unrecoverable) inverts the whole premise, and so is handled apart
+///
+/// Everything else pristine removes is regenerable — that is what the vocabulary above says,
+/// member by member. An unrecoverable thing is the opposite, and nothing brings it back: it is
+/// the one row in a list where being wrong cannot be undone by waiting for a rebuild. So it is
+/// never swept up by a mark on a parent, never removed by a script that did not ask for it by
+/// name, and named on the confirmation as its own group. See [`Kind::of_ignored_file`],
+/// [`super::tui::state::View::batch`] and the command line's `--unrecoverable`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
+    /// Something nothing regenerates: an `.env`, a private key, a `credentials` file.
+    ///
+    /// A rule may declare it — a `secrets/` directory somebody's own ruleset names is exactly
+    /// as unrecoverable as a `.env` — but nothing in the shipped ruleset does, because the
+    /// evidence a marker-anchored rule offers is "this project is of that type" rather than
+    /// "this file is the only copy".
+    Unrecoverable,
     /// Installed third-party code: `node_modules`, `.venv`, `vendor`.
     Dependencies,
     /// Compiled output: `target`, `bin`, `obj`, `dist`.
     Build,
-    /// Regenerated automatically, and the cheapest of the three to lose: `__pycache__`,
-    /// `.nx/cache`, `.gradle`, `.ipynb_checkpoints`.
+    /// Regenerated automatically: `__pycache__`, `.nx/cache`, `.gradle`, `.ipynb_checkpoints`.
     Cache,
+    /// Written by something nobody asked, and read by nothing: `*.log`, `.DS_Store`,
+    /// `Thumbs.db`. The cheapest thing here to lose.
+    Noise,
 }
 
+/// What `*.env*` reduces to against a single path component.
+///
+/// Shared with [`crate::repo`], which asks the same question of a `git clean` entry. A run where
+/// the two disagreed would report holding an env file back through one door and delete it
+/// through the other.
+pub(crate) const ENV_MARK: &str = ".env";
+
+/// Names that mean "nothing brings this back", matched whole against a lowercased file name.
+const UNRECOVERABLE_NAMES: [&str; 5] = [".npmrc", "credentials", "id_rsa", "id_ecdsa", "id_ed25519"];
+
+/// Suffixes that mean the same. `.pem` is a private key far more often than it is anything
+/// else, and the times it is a certificate it is still not something a rebuild produces.
+const UNRECOVERABLE_SUFFIXES: [&str; 1] = [".pem"];
+
+/// Names nothing will miss, matched whole.
+const NOISE_NAMES: [&str; 2] = [".ds_store", "thumbs.db"];
+
+/// Suffixes nothing will miss.
+const NOISE_SUFFIXES: [&str; 1] = [".log"];
+
 impl Kind {
-    /// The whole vocabulary, in the order a reader meets it: what was fetched, what was
-    /// compiled, what will come back on its own.
+    /// The whole vocabulary, **in order of what it costs to lose**: what nothing brings back,
+    /// what was fetched, what was compiled, what will come back on its own, what nothing will
+    /// miss.
     ///
     /// Being able to enumerate it is half of what "closed" buys — the front end derives a key
-    /// and a help sentence per kind from this rather than listing them again, so a fourth kind
-    /// would arrive already filterable.
-    pub const ALL: [Self; 3] = [Self::Dependencies, Self::Build, Self::Cache];
+    /// and a help sentence per kind from this rather than listing them again, and the
+    /// confirmation's grouping is this order, so a sixth kind would arrive already filterable
+    /// and already sorted.
+    pub const ALL: [Self; 5] = [
+        Self::Unrecoverable,
+        Self::Dependencies,
+        Self::Build,
+        Self::Cache,
+        Self::Noise,
+    ];
+
+    /// Where this kind sits on the cost axis, counting from the expensive end.
+    ///
+    /// Read off [`Kind::ALL`] rather than written out a second time, because a listing that
+    /// grouped in one order while the help page named them in another would be two claims
+    /// about one vocabulary.
+    #[must_use]
+    pub fn cost(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|&kind| kind == self)
+            .unwrap_or(Self::ALL.len())
+    }
+
+    /// What the name of a gitignored **file** says it is, or `None` when the name says
+    /// nothing.
+    ///
+    /// This is a claim about a name and not about contents, which is why the two ends of the
+    /// vocabulary are the only ones it can reach: `.env` and `id_rsa` are the only copy of
+    /// something, `*.log` and `.DS_Store` are the copy of nothing. A name that says neither
+    /// gets `None` and reads as the tier-two directory claim already does — git knows the file
+    /// is disposable and nothing knows what it is.
+    ///
+    /// Matched against the lowercased name, because `.DS_Store` and `Thumbs.db` are written
+    /// both ways by the systems that create them and the case is not information.
+    #[must_use]
+    pub fn of_ignored_file(name: &str) -> Option<Self> {
+        let name = name.to_ascii_lowercase();
+        // The expensive end is asked first, and that ordering is the safety property rather
+        // than a tidiness one: a name that could be read either way — `.env.log` — is the one
+        // where being wrong in the cheap direction is the failure that cannot be undone.
+        if name.contains(ENV_MARK)
+            || UNRECOVERABLE_NAMES.contains(&name.as_str())
+            || UNRECOVERABLE_SUFFIXES
+                .iter()
+                .any(|suffix| name.ends_with(suffix))
+        {
+            return Some(Self::Unrecoverable);
+        }
+        if NOISE_NAMES.contains(&name.as_str())
+            || NOISE_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
+        {
+            return Some(Self::Noise);
+        }
+        None
+    }
 
     /// One word, for somewhere with no room for the whole label.
     #[must_use]
     pub fn short(self) -> &'static str {
         match self {
+            Self::Unrecoverable => "unrecoverable",
             Self::Dependencies => "dependencies",
             Self::Build => "build",
             Self::Cache => "cache",
+            Self::Noise => "noise",
+        }
+    }
+
+    /// What losing one of these costs, said out loud.
+    ///
+    /// The vocabulary's whole content in one sentence per member, which is what the help page
+    /// and the confirmation print. `Unrecoverable` is not decoration and a reader has to be
+    /// able to find out what it means without reading this file.
+    #[must_use]
+    pub fn cost_said(self) -> &'static str {
+        match self {
+            Self::Unrecoverable => "nothing brings this back",
+            Self::Dependencies => "a network fetch brings this back",
+            Self::Build => "a compile brings this back",
+            Self::Cache => "this comes back on its own",
+            Self::Noise => "nothing will miss this",
         }
     }
 }
@@ -79,9 +207,11 @@ impl Kind {
 impl fmt::Display for Kind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::Unrecoverable => "Unrecoverable",
             Self::Dependencies => "Dependencies",
             Self::Build => "Build Artifacts",
             Self::Cache => "Cache",
+            Self::Noise => "Noise",
         })
     }
 }
@@ -346,6 +476,92 @@ mod tests {
         // One ecosystem, two kinds, two rules — the split the vocabulary makes explicit.
         assert_eq!(labelled("python"), "Python Dependencies");
         assert_eq!(labelled("python-caches"), "Python Cache");
+    }
+
+    #[test]
+    fn the_vocabulary_is_ordered_by_what_it_costs_to_lose() {
+        // The ordering is the thing worth more than the individual patterns: everything else
+        // reads the cost axis off `ALL`, so this is where it is pinned. Unrecoverable is the
+        // expensive end and noise is the cheap one, with the three regenerable kinds between
+        // them in the order the design has always named them.
+        assert_eq!(
+            Kind::ALL.map(Kind::short),
+            [
+                "unrecoverable",
+                "dependencies",
+                "build",
+                "cache",
+                "noise"
+            ]
+        );
+        assert!(Kind::Unrecoverable.cost() < Kind::Dependencies.cost());
+        assert!(Kind::Dependencies.cost() < Kind::Build.cost());
+        assert!(Kind::Build.cost() < Kind::Cache.cost());
+        assert!(Kind::Cache.cost() < Kind::Noise.cost());
+    }
+
+    #[test]
+    fn a_name_that_is_the_only_copy_of_something_is_unrecoverable() {
+        for name in [
+            ".env",
+            ".env.local",
+            "prod.env",
+            ".env.production.local",
+            "server.pem",
+            "id_rsa",
+            "id_ed25519",
+            ".npmrc",
+            "credentials",
+        ] {
+            assert_eq!(
+                Kind::of_ignored_file(name),
+                Some(Kind::Unrecoverable),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_nothing_will_miss_is_noise_whichever_way_the_system_spelled_it() {
+        // Both systems that write these write them inconsistently, and the case is not
+        // information — a `.DS_STORE` that read as "kind unknown" would be the same file
+        // sorted somewhere else for no reason a reader could see.
+        for name in [
+            "build.log",
+            ".DS_Store",
+            ".ds_store",
+            "Thumbs.db",
+            "thumbs.db",
+        ] {
+            assert_eq!(Kind::of_ignored_file(name), Some(Kind::Noise), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_name_that_could_be_read_either_way_is_read_as_the_expensive_one() {
+        // `.env.log` matches both tables. Being wrong toward "noise" is the one mistake here
+        // that cannot be undone by waiting for a rebuild, so the expensive end is asked first.
+        assert_eq!(
+            Kind::of_ignored_file(".env.log"),
+            Some(Kind::Unrecoverable)
+        );
+    }
+
+    #[test]
+    fn a_name_that_says_nothing_gets_no_kind() {
+        // The tier-two claim's own content, in a file's clothes: git knows it is disposable
+        // and nothing knows what it is. Note `environment` and `logic`, which the substring
+        // and suffix tests must not reach.
+        for name in ["dump.sql", "environment", "logic", "scratch", "envoy.yaml"] {
+            assert_eq!(Kind::of_ignored_file(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn every_kind_says_what_losing_it_costs() {
+        for kind in Kind::ALL {
+            assert!(!kind.cost_said().is_empty(), "{kind}");
+        }
     }
 
     #[test]

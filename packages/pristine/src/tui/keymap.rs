@@ -171,11 +171,18 @@ pub enum Action {
     /// named" is a combination the model can hold and no reader can ask for, which is not what
     /// "stays expressible" can mean.
     CycleTiers,
-    /// `d` `b` `c` — turn one **kind** on or off, leaving the other two and the tier axis
+    /// `i` — show or hide gitignored **files**, leaving both other axes exactly as they were.
+    ///
+    /// Its own key rather than a value on the tier axis, for the reason [`super::lens::Lens::files`]
+    /// gives: a preset moves one axis per step and `all` would have to move two to reach files.
+    /// The request asked for exactly this — includable and excludable independently of ignored
+    /// directories — so the key is the feature rather than a convenience over it.
+    ToggleFiles,
+    /// `u` `d` `b` `c` `n` — turn one **kind** on or off, leaving the others and the tier axis
     /// exactly as they were.
     ///
-    /// One key per member rather than a cycle, because a set of three has eight states and a
-    /// cycle through eight is a key nobody can aim.
+    /// One key per member rather than a cycle, because a set of five has thirty-two states and
+    /// a cycle through thirty-two is a key nobody can aim.
     ToggleKind(Kind),
     /// A printable character, while the prompt has it.
     ///
@@ -425,9 +432,11 @@ fn tree_keys() -> Vec<Binding> {
             Surface::Tree,
             &[key(kind_key(kind))],
             match kind {
+                Kind::Unrecoverable => "show or hide what nothing brings back",
                 Kind::Dependencies => "show or hide installed dependencies",
                 Kind::Build => "show or hide compiled output",
                 Kind::Cache => "show or hide caches",
+                Kind::Noise => "show or hide logs and system cruft",
             },
             Action::ToggleKind(kind),
         ));
@@ -570,6 +579,12 @@ fn tree_verbs() -> Vec<Binding> {
             &[key('t')],
             "which tiers are shown, on its own: named, both, gitignored",
             Action::CycleTiers,
+        ),
+        bind(
+            Tree,
+            &[key('i')],
+            "show or hide gitignored files, on their own",
+            Action::ToggleFiles,
         ),
         bind(Tree, &[key('s')], "the next sort key", Action::CycleSort),
         bind(
@@ -793,9 +808,13 @@ fn confirm_keys() -> Vec<Binding> {
 /// — and a `match` rather than a table, so a fourth kind cannot arrive without one.
 const fn kind_key(kind: Kind) -> char {
     match kind {
+        Kind::Unrecoverable => 'u',
         Kind::Dependencies => 'd',
         Kind::Build => 'b',
         Kind::Cache => 'c',
+        // Not the initial: `n` rather than the `l` of "logs", because `l` is the tree's own
+        // right-hand motion and a key cannot be two things.
+        Kind::Noise => 'n',
     }
 }
 
