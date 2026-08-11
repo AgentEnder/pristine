@@ -72,7 +72,8 @@ pub mod tui;
 pub mod walk;
 
 pub use delete::{
-    Deleter, Failure, Plan, PlanTarget, Planner, Refusal, Refused, Removal, Removed, Target,
+    Deleter, Failure, Freeing, Plan, PlanTarget, Planner, Refusal, Refused, Removal, Removed, Step,
+    Target,
 };
 pub use fallback::{DEFAULT_MIN_SIZE, FallbackReport};
 pub use git::{GitError, WorkTree};

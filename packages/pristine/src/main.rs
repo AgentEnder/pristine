@@ -442,6 +442,10 @@ fn run(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::error::Er
         // pool has drained, so nothing here is racing it.
         .run(|found| match found {
             Found::Claim(hit) => lock(&hits).push(hit),
+            // "A thread is inside this one right now" is a fact about a screen that is
+            // repainting. This front end paints once, at the end, by which time it is not a
+            // fact about anything.
+            Found::Pricing(_) => {}
             Found::Priced(priced) => {
                 lock(&sizes).insert(priced.path, priced.size);
             }

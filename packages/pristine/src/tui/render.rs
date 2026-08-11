@@ -12,7 +12,10 @@
 //!
 //! The size column has a fifth state the other tools never needed: **unpriced**. A claim is
 //! recorded without being measured unless somebody asks, so `0 B` and "nobody has looked" are
-//! different facts about a row, and a dash is what keeps them apart.
+//! different facts about a row, and a dash is what keeps them apart. It has a sixth as well,
+//! which is the one that moves: a claim a pricing thread is *inside at this instant* draws a
+//! shimmer through that dash rather than the dash. The pool is bounded, so however many rows
+//! shimmer is however many threads are working, and that is a number worth being able to see.
 //!
 //! # The layout is stated once and read twice
 //!
@@ -22,6 +25,16 @@
 //! at. So the tree's columns come out of one [`columns`] call that both lays the table out
 //! and answers the hit test, and a row's own cells — the mark box, the indent, the expander —
 //! are spelled by the constants [`name`] draws them with.
+//!
+//! # Nothing here decides what moves, only how it looks
+//!
+//! Every animated value is asked for by name — [`View::drawn`], [`View::freshness`],
+//! [`View::is_pricing`] — and the view has already advanced them all once for this frame. So
+//! this file has no clock in it and no state between frames, and the drawing stays a pure
+//! function of the view, which is what keeps it assertable against a [`TestBackend`] one
+//! property at a time.
+//!
+//! [`TestBackend`]: ratatui::backend::TestBackend
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
@@ -37,18 +50,27 @@ use crate::size::human;
 use crate::tree::{NodeId, Order, Sort};
 use crate::walk::WalkError;
 
-/// Bytes the size column is given. Enough for `1023.9 GiB`.
-const SIZE: u16 = 11;
+/// Bytes the size column is given. Exactly `> 1023.9 GiB`, which is the widest a rolled-up
+/// lower bound gets.
+const SIZE: u16 = 12;
 /// Cells for `3 months`.
 const AGE: u16 = 9;
 /// Cells for the label, when the terminal is wide enough to carry one. Enough for the longest
-/// the shipped ruleset composes, `Haskell / Stack Build Artifacts`.
+/// the shipped ruleset composes, `Haskell / Stack Build Artifacts`, and for the other thing
+/// this column carries: the reason a removal left a directory standing.
 const LABEL: u16 = 31;
 /// Below this the label column is dropped: a path a reader cannot read is worse than a name
 /// they can get at by selecting the row.
-const NARROW: u16 = 90;
+const NARROW: u16 = 94;
 /// The blank cells between two columns.
 const SPACING: u16 = 2;
+/// How many cells the pricing shimmer travels across, in place of the dash.
+const SHIMMER: usize = 5;
+/// The eight steps a partial mark is filled to, one per eighth.
+///
+/// Never empty and never full: an empty box is [`Mark::None`] and a full one is [`Mark::All`],
+/// so a partial row is always somewhere strictly in between and the glyph says where.
+const BLOCKS: [&str; 7] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇"];
 
 /// The cells `[x]` occupies — the mark box, and the whole of what a press can aim at.
 const BOX: usize = 3;
@@ -293,15 +315,18 @@ fn buttons(frame: &mut Frame, area: Rect, chosen: Answer) -> [Rect; 2] {
 
 /// The line across the top: where the scan is, what it has found, and whether it is done.
 fn headline(view: &View, errors: &[WalkError]) -> Paragraph<'static> {
-    let total = view.total();
+    let total = view.drawn_total();
     let mut spans = vec![
         Span::styled(
             format!(" {} ", view.tree().root_path().display()),
             Style::default().add_modifier(Modifier::BOLD),
         ),
+        // The drawn total rather than the true one, so it climbs as the scan finds and falls
+        // as a removal frees. Which of the two it is doing is the one thing this line cannot
+        // say in words and can say by moving.
         Span::raw(format!(
             " {} reclaimable in {} ",
-            human(total.bytes),
+            total.label(),
             plural(total.claims, "directory", "directories")
         )),
     ];
@@ -459,25 +484,29 @@ fn tree(view: &View, at: Columns, height: usize) -> Table<'static> {
         .take(height)
         .map(|(index, row)| {
             let node = view.tree().node(row.id);
-            let roll = view.roll(row.id);
             let selected = view.cursor() == Some(index);
             let mut cells = vec![
                 Cell::from(Line::from(name(view, row.id, row.depth))),
-                Cell::from(Text::from(roll.label()).alignment(Alignment::Right)),
+                Cell::from(size_of(view, row.id)),
                 Cell::from(Text::from(age(node.modified)).alignment(Alignment::Right)),
             ];
             if wide {
-                cells.push(Cell::from(Span::styled(
-                    label(view, row.id),
-                    Style::default().fg(Color::DarkGray),
-                )));
+                cells.push(aside(view, row.id));
             }
             let style = if selected {
                 Style::default()
                     .bg(Color::Rgb(48, 48, 64))
                     .add_modifier(Modifier::BOLD)
+            } else if view.is_spent(row.id) {
+                // Emptied, and on its way out — dimmed only once its number has reached zero,
+                // never while it is still falling. A row dimmed throughout would be saying
+                // "this is over" during the seconds it is actually happening, which is the
+                // opposite of what the falling number is for. Dim rather than struck through
+                // or coloured: the directory is gone and the row is a receipt now, so it
+                // should recede rather than compete.
+                Style::default().fg(Color::DarkGray)
             } else {
-                Style::default()
+                arrival(view, row.id)
             };
             TableRow::new(cells).style(style)
         })
@@ -504,38 +533,150 @@ fn tree(view: &View, at: Columns, height: usize) -> Table<'static> {
 /// believes is a click that selects where it meant to mark.
 fn name(view: &View, id: NodeId, depth: usize) -> Vec<Span<'static>> {
     let node = view.tree().node(id);
-    let (marker, colour) = match view.mark_of(id) {
-        Mark::None => ("[ ] ", Color::DarkGray),
-        // A partial state is what makes the rollup worth marking on: it is how an ancestor
-        // says "some of this is spoken for" without being opened.
-        Mark::Partial => ("[~] ", Color::Yellow),
-        Mark::All => ("[x] ", Color::Green),
-    };
-    let expander = if view.tree().children(id).is_empty() {
-        "  "
-    } else if view.is_expanded(id) {
-        "▾ "
-    } else {
-        "▸ "
-    };
     let name = if node.parent.is_none() {
         node.path.display().to_string()
     } else {
         node.name.to_string_lossy().into_owned()
     };
     vec![
-        Span::styled(marker, Style::default().fg(colour)),
+        marker(view, id),
+        // Spelled with [`INDENT`] rather than a literal pair of spaces, because [`zone_at`]
+        // resolves a press by that same constant: an indent drawn a cell wider than the hit
+        // test believes is a click that lands on the row beside the one it aimed at.
         Span::raw(" ".repeat(INDENT * depth)),
-        Span::raw(expander),
+        Span::raw(if view.tree().children(id).is_empty() {
+            "  "
+        } else if view.is_expanded(id) {
+            "▾ "
+        } else {
+            "▸ "
+        }),
         Span::styled(
             name,
-            if node.hit.is_some() {
+            if view.kept_reason(id).is_some() {
+                // A directory the safety model refused. Distinct, and deliberately not red:
+                // this is the tool working, and teaching a reader to read correct behaviour
+                // as a failure is worse than not marking it at all.
+                Style::default().fg(Color::Cyan)
+            } else if node.hit.is_some() {
                 Style::default().fg(Color::White)
             } else {
                 Style::default().fg(Color::Rgb(150, 160, 180))
             },
         ),
     ]
+}
+
+/// The mark box: empty, full, or a block filled to the marked share of the subtree.
+///
+/// The fractional block is what makes a partial ancestor worth reading rather than merely
+/// noticing. `[~]` says "some of this"; `[▆]` says most of the bytes under here are spoken
+/// for, which is a real number in one character and the thing a reader needs in order to
+/// decide whether opening the row is worth it.
+fn marker(view: &View, id: NodeId) -> Span<'static> {
+    let (glyph, colour) = match view.mark_of(id) {
+        Mark::None => ("[ ] ".to_owned(), Color::DarkGray),
+        Mark::Partial => {
+            #[expect(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a share in 0..1 scaled to one of seven glyphs, clamped either side"
+            )]
+            let step = (view.share(id) * BLOCKS.len() as f64)
+                .round()
+                .clamp(1.0, 7.0) as usize;
+            (format!("[{}] ", BLOCKS[step - 1]), Color::Yellow)
+        }
+        Mark::All => ("[x] ".to_owned(), Color::Green),
+    };
+    let style = if view.is_cascading(id) {
+        // The mark passing through on its way up. Reversed rather than merely brighter,
+        // because it is on screen for a sixth of a second and has to be caught rather than
+        // studied.
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(colour)
+    };
+    Span::styled(glyph, style)
+}
+
+/// The size column, which is where most of the movement is.
+///
+/// Three states rather than the two a listing has. A claim a pricing thread is inside right
+/// now gets the shimmer; everything else gets its number, climbing toward the truth, with a
+/// `>` in front of it while any of what it is summing is still unpriced.
+fn size_of(view: &View, id: NodeId) -> Text<'static> {
+    if view.is_pricing(id) {
+        let lit = view.shimmer(SHIMMER);
+        return Text::from(Line::from(
+            (0..SHIMMER)
+                .map(|cell| {
+                    if cell == lit {
+                        Span::styled(
+                            "━",
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        Span::styled("─", Style::default().fg(Color::Rgb(70, 78, 92)))
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ))
+        .alignment(Alignment::Right);
+    }
+    let roll = view.drawn(id);
+    let style = if roll.unpriced > 0 && roll.bytes > 0 {
+        // A floor is a different kind of number from a total, and it reads as one.
+        Style::default().fg(Color::Rgb(150, 160, 180))
+    } else {
+        Style::default()
+    };
+    Text::from(Line::styled(roll.label(), style)).alignment(Alignment::Right)
+}
+
+/// The last column: what brings this row back, or why a removal left it standing.
+///
+/// The refusal wins, because it is the newer and the more surprising fact. A reader who marked
+/// forty directories and got thirty-eight needs to see which two on the rows themselves — the
+/// footer has one line and it has already moved on to the next thing.
+fn aside(view: &View, id: NodeId) -> Cell<'static> {
+    match view.kept_reason(id) {
+        Some(reason) => Cell::from(Span::styled(
+            format!("kept — {reason}"),
+            Style::default().fg(Color::Cyan),
+        )),
+        None => Cell::from(Span::styled(
+            label(view, id),
+            Style::default().fg(Color::DarkGray),
+        )),
+    }
+}
+
+/// How lit a row is because the walk has just found it.
+///
+/// A decaying wash rather than a permanent colour, and it is the alternative to a scrolling
+/// log: the eye is drawn to what is new without the tree having to give up being a tree. It
+/// fades on a square root rather than linearly, so it holds long enough to be *looked at*
+/// after it is noticed instead of already going by the time the eye lands.
+fn arrival(view: &View, id: NodeId) -> Style {
+    let lit = view.freshness(id);
+    if lit <= 0.0 {
+        return Style::default();
+    }
+    let lit = lit.sqrt();
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a channel scaled by a factor between zero and one, clamped by construction"
+    )]
+    let channel = |peak: f64| (peak * lit).round() as u8;
+    Style::default().bg(Color::Rgb(channel(26.0), channel(62.0), channel(44.0)))
 }
 
 /// What this row is, when anything knows.
@@ -572,11 +713,37 @@ fn age(modified: Option<std::time::SystemTime>) -> String {
 
 /// The line across the bottom: what is marked, or what just happened.
 fn status(view: &View) -> Paragraph<'static> {
+    // The freed counter outlives the notice, because it is the answer to the question the
+    // reader who walked away came back for. It is also the *other* of the two numbers a
+    // removal moves — the header falls, this rises — and the pair of them is the whole payoff
+    // of the one irreversible thing this tool does. Nothing decorates it.
+    let freed = view.has_freed().then(|| {
+        Span::styled(
+            format!("· freed {} ", human(view.drawn_freed())),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+    });
+    let said = Style::default().fg(Color::Black).bg(Color::Yellow);
+    // Where the deleter is, which the freed counter beside it cannot say: bytes report how
+    // much has gone and nothing about how much is left, so a count against the batch's own
+    // size is what tells a third of the way through from nearly finished.
+    //
+    // **Beside a notice rather than instead of one.** The only thing that speaks while a
+    // removal is running is `q`, which is held back until the batch finishes and says so — and
+    // a reader who pressed a key and got nothing back has no way to tell a refusal from a
+    // terminal that stopped listening.
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if let Some(removing) = view.removing() {
+        spans.push(Span::styled(format!(" {} ", removing.label()), said));
+    }
     if let Some(notice) = view.notice() {
-        return Paragraph::new(Line::from(Span::styled(
-            format!(" {notice} "),
-            Style::default().fg(Color::Black).bg(Color::Yellow),
-        )));
+        spans.push(Span::styled(format!(" {notice} "), said));
+    }
+    if !spans.is_empty() {
+        spans.extend(freed);
+        return Paragraph::new(Line::from(spans));
     }
     let marked = view.marked();
     let mut spans = vec![Span::styled(
@@ -589,6 +756,7 @@ fn status(view: &View) -> Paragraph<'static> {
                 .add_modifier(Modifier::BOLD)
         },
     )];
+    spans.extend(freed);
     if view.is_deleting() {
         spans.push(Span::styled(
             "· deleting ",
@@ -868,14 +1036,32 @@ fn zone_at(at: Columns, depth: usize, x: u16) -> Zone {
 #[cfg(test)]
 mod tests {
     use super::{INDENT, MARKER, Placed, Spot, Zone, draw, hit as press_on};
+    use crate::delete::{Refusal, Refused};
     use crate::fixture::{hit, priced};
     use crate::size::Size;
     use crate::tree::{Order, Tree};
     use crate::tui::keymap::{Action, Motion};
+    use crate::tui::moving::COUNT_UP;
     use crate::tui::state::{Answer, Pending, View};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Position;
+    use std::path::Path;
+
+    /// Opens every row. Twice, because the root starts open and the first `*` closes it.
+    fn open_everything(view: &mut View) {
+        view.apply(Action::Cursor(Motion::Top));
+        view.apply(Action::ToggleSubtree);
+        view.apply(Action::ToggleSubtree);
+    }
+
+    /// The one drawn line holding `needle`.
+    fn row_with<'a>(frame: &'a [String], needle: &str) -> &'a str {
+        frame
+            .iter()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no row mentions {needle}: {frame:#?}"))
+    }
 
     /// Everything the frame drew, one line per row, trailing blanks trimmed.
     fn painted(view: &mut View, width: u16, height: u16) -> Vec<String> {
@@ -958,7 +1144,7 @@ mod tests {
     }
 
     #[test]
-    fn an_ancestor_of_a_mark_is_drawn_partial() {
+    fn an_ancestor_of_a_mark_is_drawn_as_a_block_filled_to_the_marked_share() {
         let mut view = view();
         view.apply(Action::Cursor(Motion::Down));
         view.apply(Action::Expand);
@@ -966,11 +1152,19 @@ mod tests {
         view.apply(Action::Mark);
         let frame = painted(&mut view, 100, 8);
 
+        // One of the root's two claims is marked, and the other has no price, so the share is
+        // stated in claims: half, which is the fourth of seven blocks. A bare `[~]` would say
+        // "some of this" and stop there; the glyph says how much, which is what a reader
+        // deciding whether to open the row actually needs.
+        //
+        // Found rather than indexed: the heading is a line of the body, so the root row is no
+        // longer whichever line the frame happens to put second.
         let root = frame
             .iter()
             .find(|line| line.starts_with('[') && line.contains("/scan"))
             .unwrap_or_else(|| panic!("{frame:#?}"));
-        assert!(root.contains("[~]"), "{frame:#?}");
+        assert!(root.contains("[▄]"), "{frame:#?}");
+        assert!(!root.contains("[x]"), "{frame:#?}");
     }
 
     #[test]
@@ -1259,6 +1453,118 @@ mod tests {
         // And the reader can always say no.
         view.apply(Action::ToggleMap);
         assert_eq!(frame_of(&mut view, 140, 30).1.map, None);
+    }
+
+    #[test]
+    fn a_claim_a_pricing_thread_is_inside_shimmers_where_its_dash_would_be() {
+        let mut tree = Tree::new("/scan");
+        tree.insert(hit("/scan/one/node_modules", Size::Unmeasured, 0));
+        tree.insert(hit("/scan/two/target", Size::Unmeasured, 0));
+        let mut view = View::new(tree);
+        open_everything(&mut view);
+        view.pricing(Path::new("/scan/one/node_modules"));
+        let frame = painted(&mut view, 100, 10);
+
+        // Exactly as many rows shimmer as the pool has threads working, which is the honest
+        // reading of "which of these dashes is being worked on right now". The other is
+        // queued, and a dash that will be measured in four minutes is a different fact about
+        // a row from one being measured this instant.
+        assert!(row_with(&frame, "node_modules").contains('━'), "{frame:#?}");
+        let queued = row_with(&frame, "target");
+        assert!(queued.contains('—'), "{frame:#?}");
+        assert!(!queued.contains('━'), "{frame:#?}");
+    }
+
+    #[test]
+    fn an_ancestor_that_is_still_being_priced_draws_its_number_as_a_floor() {
+        let mut tree = Tree::new("/scan");
+        tree.insert(priced("/scan/nx/a/node_modules", 2 * 1024 * 1024));
+        tree.insert(hit("/scan/nx/b/target", Size::Unmeasured, 0));
+        let mut view = View::new(tree);
+        let frame = painted(&mut view, 100, 10);
+
+        // `2.0 MiB` on its own would be wrong in the one direction a cleaner must not be
+        // wrong in. The `>` is true every moment it is up and costs nothing.
+        assert!(row_with(&frame, "nx").contains("> 2.0 MiB"), "{frame:#?}");
+    }
+
+    #[test]
+    fn a_directory_a_removal_left_standing_is_marked_calmly_rather_than_as_an_error() {
+        let mut view = view();
+        view.refused(&[Refused {
+            path: "/scan/old/target".into(),
+            reason: Refusal::HoldsCheckout,
+        }]);
+        open_everything(&mut view);
+        let frame = painted(&mut view, 110, 10);
+
+        // The safety model refusing a subtree is the tool working. It says which directory
+        // and why, on the row, where the footer's count cannot.
+        let kept = row_with(&frame, "target");
+        assert!(kept.contains("kept — holds a git checkout"), "{frame:#?}");
+        // And it does not take the row the regeneration command would have had, on a row
+        // that has one — the newer and stranger fact wins.
+        assert!(
+            !row_with(&frame, "node_modules").contains("kept"),
+            "{frame:#?}"
+        );
+    }
+
+    #[test]
+    fn the_footer_says_where_the_deleter_is_and_not_only_what_it_has_given_back() {
+        let mut view = view();
+        view.ask(Pending {
+            targets: vec![
+                "/scan/nx/node_modules".into(),
+                "/scan/old/target".into(),
+                "/scan/gone".into(),
+                "/scan/also-gone".into(),
+            ],
+            bytes: 2 * 1024 * 1024,
+            unpriced: 0,
+            kept: Vec::new(),
+            answer: Answer::Delete,
+        });
+        view.apply(Action::Answer);
+        view.removed(Path::new("/scan/nx/node_modules"), 1024 * 1024, true);
+        view.swept();
+        view.animate(std::time::Instant::now());
+        let frame = painted(&mut view, 100, 8);
+
+        // A running byte total says how much has gone and nothing about how much is left, so
+        // a reader cannot tell a third of the way through from nearly finished. The count
+        // against the batch's own size can, and it is beside the bytes rather than instead of
+        // them: the pair is what somebody who walked away comes back to read.
+        assert!(
+            frame[7].contains("removing 1 of 4 directories"),
+            "{frame:#?}"
+        );
+        assert!(frame[7].contains("25%"), "{frame:#?}");
+        assert!(frame[7].contains("freed 1.0 MiB"), "{frame:#?}");
+
+        // And the one thing that speaks while a removal runs still gets through. `q` is held
+        // back until the batch finishes; a reader who pressed it and saw nothing change would
+        // have no way to tell a refusal from a terminal that had stopped listening.
+        view.apply(Action::Quit);
+        let frame = painted(&mut view, 100, 8);
+        assert!(frame[7].contains("removing 1 of 4"), "{frame:#?}");
+        assert!(frame[7].contains("the removal has to finish"), "{frame:#?}");
+    }
+
+    #[test]
+    fn the_footer_keeps_the_freed_total_after_the_notice_has_moved_on() {
+        let mut view = view();
+        view.deleted(
+            "removed 2.0 MiB from 1 directory".to_owned(),
+            2 * 1024 * 1024,
+        );
+        view.animate(std::time::Instant::now() + COUNT_UP * 8);
+        let frame = painted(&mut view, 100, 8);
+
+        // The number the reader who walked away came back for. It outlives the notice
+        // because the notice is about what just happened and this is about the session.
+        assert!(frame[7].contains("removed 2.0 MiB"), "{frame:#?}");
+        assert!(frame[7].contains("freed 2.0 MiB"), "{frame:#?}");
     }
 
     #[test]
