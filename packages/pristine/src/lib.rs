@@ -19,7 +19,9 @@
 //! A scan does not measure what it claims. Pruning at `node_modules` and then walking it to
 //! size it would give back the cost the pruning saved, so sizes arrive as
 //! [`Size::Unmeasured`] until a caller asks for a breakdown with
-//! [`SizeMode::Breakdown`](size::SizeMode::Breakdown).
+//! [`SizeMode::Breakdown`](size::SizeMode::Breakdown) — which costs an order of magnitude more
+//! than the scan it prices. [`SizeMode::BreakdownUnder`](size::SizeMode::BreakdownUnder) buys
+//! the same answer for one subtree at that subtree's price, and is what a TUI drill-in runs.
 //!
 //! Detection is marker-anchored and never name-anchored: a rule is "a directory named
 //! `target` whose parent holds a `Cargo.toml`", never "a directory named `target`".

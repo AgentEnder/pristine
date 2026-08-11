@@ -251,7 +251,7 @@ impl Walker {
         let scan = Scan {
             root: self.root.as_path(),
             detector: self.ruleset.detector(),
-            measurer: Measurer::new(self.size_mode).same_file_system(self.same_file_system),
+            measurer: Measurer::new(self.size_mode.clone()).same_file_system(self.same_file_system),
             min_size: self.min_size,
             on_hit,
             errors: Mutex::new(Vec::new()),

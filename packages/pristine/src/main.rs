@@ -12,6 +12,11 @@
 //! - A tier that could not run says `inert` rather than printing nothing, because silence is
 //!   indistinguishable from a clean result and the two mean opposite things.
 //! - `--min-size` is a flag a person can type rather than a builder method.
+//! - So is `--breakdown`. "How much do I get back" is the headline question, and leaving the
+//!   sizing modes reachable only from the library made the answer unavailable at any price.
+//!   `--breakdown-under <PATH>` is the same answer for one subtree, at that subtree's cost.
+//! - A listing with a dash on it says what the dash means and which flag removes it. A count
+//!   of unpriced claims with no way to act on it is a puzzle rather than a report.
 //!
 //! Properties of the run:
 //!
@@ -50,7 +55,7 @@ use pristine::delete::confirm;
 use pristine::repo::{Class, Repo, Reset, Selected, Selection};
 use pristine::{
     DEFAULT_MIN_SIZE, Deleter, Enumeration, FallbackReport, Hit, Plan, Planner, Removal, Ruleset,
-    Size, Target, WalkOutcome, Walker,
+    Size, SizeMode, Target, WalkOutcome, Walker,
 };
 
 /// A language-agnostic reclaimable-space finder and cleaner.
@@ -108,6 +113,23 @@ struct Sweep {
     )]
     min_size: u64,
 
+    /// Put a number on every claim, by walking each one.
+    ///
+    /// A scan does not do this unasked, and the reason is not caution: there is no recursive
+    /// directory size on any platform this runs on, so a price is a full enumeration of the
+    /// subtree the scan just pruned at. Measured over one real `~/repos`: 4.6 s and 14.0 GiB
+    /// priced without it, 55.8 s and 165.1 GiB with.
+    #[arg(long, conflicts_with = "breakdown_under")]
+    breakdown: bool,
+
+    /// Put a number on the claims under PATH only, and leave the rest of the scan unpriced.
+    ///
+    /// The whole scan still runs and every claim is still listed — this buys a price for one
+    /// subtree at that subtree's cost, rather than making the answer to "how much is in here"
+    /// cost a walk of everything. PATH must be inside the scan root.
+    #[arg(long, value_name = "PATH")]
+    breakdown_under: Option<PathBuf>,
+
     /// Remove everything the scan found, after showing the plan and asking.
     #[arg(long)]
     delete: bool,
@@ -133,6 +155,47 @@ struct Sweep {
     /// backup volume that happens to be mounted inside it.
     #[arg(long, value_name = "BOOL", default_value_t = true, action = ArgAction::Set)]
     one_file_system: bool,
+}
+
+impl Sweep {
+    /// How hard the scan should work for each claim's size.
+    ///
+    /// Unpriced is the default and stays the default. What the two flags buy is that the
+    /// product's headline question — how much do I get back — is answerable at all, at a price
+    /// the user picks: everything, or one subtree.
+    fn size_mode(&self) -> Result<SizeMode, String> {
+        match &self.breakdown_under {
+            Some(scope) => Ok(SizeMode::BreakdownUnder(anchor(&self.root, scope)?)),
+            None if self.breakdown => Ok(SizeMode::Breakdown),
+            None => Ok(SizeMode::Skip),
+        }
+    }
+}
+
+/// Spells `scope` the way the walk will spell the hits it is compared against.
+///
+/// The comparison is by path, and a hit carries the scan root exactly as it was typed: point
+/// pristine at `.` and every hit begins `./`. So neither side can simply be resolved. Both are
+/// resolved *here*, only to work out where the scope sits inside the root, and the answer is
+/// then re-anchored onto the root as given.
+///
+/// Getting this wrong is silent and it fails in the direction that reads as good news: a scope
+/// that matches no hit prices nothing, and a listing of dashes looks exactly like a subtree
+/// with nothing in it. A scope that resolves outside the scan is refused for the same reason.
+fn anchor(root: &Path, scope: &Path) -> Result<PathBuf, String> {
+    let resolved_root = std::fs::canonicalize(root)
+        .map_err(|err| format!("the scan root {}: {err}", root.display()))?;
+    let resolved_scope = std::fs::canonicalize(scope)
+        .map_err(|err| format!("--breakdown-under {}: {err}", scope.display()))?;
+    let relative = resolved_scope.strip_prefix(&resolved_root).map_err(|_| {
+        format!(
+            "--breakdown-under {} is not inside the scan root {}; it prices a subtree of the \
+             scan, not a second tree",
+            scope.display(),
+            root.display()
+        )
+    })?;
+    Ok(root.join(relative))
 }
 
 /// Repo mode's arguments.
@@ -289,6 +352,7 @@ fn run(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::error::Er
     let outcome = Walker::new(&cli.root, ruleset)
         .same_file_system(cli.one_file_system)
         .min_size(cli.min_size)
+        .size_mode(cli.size_mode()?)
         .run(|hit| lock(&hits).push(hit));
 
     let mut hits = hits.into_inner().unwrap_or_else(PoisonError::into_inner);
@@ -308,6 +372,7 @@ fn run(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::error::Er
             writeln!(out, "{}", row(hit, &cli.root))?;
         }
         writeln!(out, "{}", summary(&hits))?;
+        report_unpriced(out, unpriced(&hits))?;
         report_fallback(out, &outcome.fallback)?;
         report_scan(out, &outcome)?;
         return Ok(whole);
@@ -321,6 +386,9 @@ fn run(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::error::Er
         .older_than(cli.older_than)
         .plan(hits.iter().map(Target::from));
     write_plan(out, &plan, DIRECTORY)?;
+    // Said here rather than inside `write_plan`, which repo mode shares: repo mode prices
+    // nothing and has no breakdown flag, so pointing its reader at one would be a dead end.
+    report_unpriced(out, plan.unpriced())?;
     // Beside the plan for the same reason it sits beside the listing, and with more at stake:
     // a tier that went inert is a tier whose findings are missing from what is about to be
     // removed, and a plan that did not say so would read as the whole of what is reclaimable.
@@ -689,11 +757,33 @@ fn row(hit: &Hit, root: &Path) -> String {
 /// What the scan found, across both tiers.
 fn summary(hits: &[Hit]) -> String {
     let priced: u64 = hits.iter().filter_map(|hit| hit.size.bytes()).sum();
-    let unpriced = hits.iter().filter(|hit| hit.size.bytes().is_none()).count();
     format!(
-        "\n{} reclaimable, {} priced, {unpriced} not priced",
+        "\n{} reclaimable, {} priced, {} not priced",
         plural(hits.len(), DIRECTORY),
         human(priced),
+        unpriced(hits),
+    )
+}
+
+/// How many claims nothing has looked inside.
+fn unpriced(hits: &[Hit]) -> usize {
+    hits.iter().filter(|hit| hit.size.bytes().is_none()).count()
+}
+
+/// What the dash means, and the two ways to turn it into a number.
+///
+/// "20 not priced" with no way to act on it is a puzzle rather than a report — the same rule
+/// repo mode's `excluded:` lines follow, where a count is always printed with the flag that
+/// releases it. Nothing is said when everything was priced, because then there is no dash on
+/// screen to explain.
+fn report_unpriced(out: &mut impl Write, unpriced: usize) -> std::io::Result<()> {
+    if unpriced == 0 {
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "not priced: nothing looked inside. --breakdown prices every claim, --breakdown-under \
+         <PATH> just one subtree; both walk what they price."
     )
 }
 
@@ -952,10 +1042,14 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Mode, RepoArgs, Reset, ask, ask_reset, human, parse_duration, parse_size};
+    use super::{
+        Cli, Mode, RepoArgs, Reset, anchor, ask, ask_reset, human, parse_duration, parse_size,
+    };
     use clap::{CommandFactory, Parser};
-    use pristine::DEFAULT_MIN_SIZE;
+    use pristine::{DEFAULT_MIN_SIZE, SizeMode};
+    use std::fs;
     use std::time::Duration;
+    use tempfile::TempDir;
 
     /// The sweep's arguments off a parsed command line.
     fn sweep(args: &[&str]) -> super::Sweep {
@@ -986,6 +1080,8 @@ mod tests {
         assert!(!cli.yes, "consent is never assumed");
         assert!(cli.older_than.is_none(), "the age floor is opt-in");
         assert!(cli.one_file_system, "a mount is not crossed by default");
+        assert!(!cli.breakdown, "a scan does not enumerate what it pruned");
+        assert!(cli.breakdown_under.is_none());
     }
 
     #[test]
@@ -1002,6 +1098,71 @@ mod tests {
             "10 MiB is the documented default"
         );
         assert_eq!(sweep(&["--min-size", "512K"]).min_size, 512 * 1024);
+    }
+
+    // --------------------------------------------------------------------------------------
+    // Asking for sizes, which a scan does not volunteer.
+    // --------------------------------------------------------------------------------------
+
+    #[test]
+    fn a_scan_prices_nothing_unless_it_is_asked_to() {
+        // The default is the performance thesis: 4.6 s over one real ~/repos against 55.8 s
+        // with a full breakdown. It stays the default, and the flag is how you leave it.
+        assert_eq!(sweep(&[]).size_mode().unwrap(), SizeMode::Skip);
+        assert_eq!(
+            sweep(&["--breakdown"]).size_mode().unwrap(),
+            SizeMode::Breakdown
+        );
+    }
+
+    #[test]
+    fn the_two_breakdown_flags_do_not_both_apply() {
+        // "Price everything" and "price this subtree" are answers to the same question, and a
+        // run that took both would silently honour one of them.
+        assert!(
+            Cli::try_parse_from(["pristine", "--breakdown", "--breakdown-under", "."]).is_err()
+        );
+    }
+
+    #[test]
+    fn a_scope_is_anchored_the_way_the_walk_spells_its_hits() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("app")).unwrap();
+
+        // A hit carries the scan root exactly as it was typed, so the scope has to as well —
+        // and the two spellings differ in both directions. On macOS a temporary directory is
+        // reached through a symlink (`/var` → `/private/var`), so a resolved scope compared
+        // against unresolved hits matches nothing. Silently, which is the whole danger.
+        let resolved = fs::canonicalize(tmp.path()).unwrap();
+        assert_eq!(
+            anchor(tmp.path(), &resolved.join("app")).unwrap(),
+            tmp.path().join("app")
+        );
+
+        // ...and the other way round: a root written with a `..` in it is what every hit is
+        // prefixed with, so that is what the scope has to be prefixed with too.
+        let awkward = tmp.path().join("app/..");
+        assert_eq!(
+            anchor(&awkward, &tmp.path().join("app")).unwrap(),
+            awkward.join("app")
+        );
+    }
+
+    #[test]
+    fn a_scope_that_is_not_in_the_scan_is_refused_rather_than_pricing_nothing() {
+        // Both of these would otherwise match no claim and produce a listing of dashes, which
+        // reads exactly like "this subtree is worth nothing".
+        let tmp = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+
+        assert!(
+            anchor(tmp.path(), elsewhere.path()).is_err(),
+            "another tree"
+        );
+        assert!(
+            anchor(tmp.path(), &tmp.path().join("typo")).is_err(),
+            "a path that is not there"
+        );
     }
 
     // --------------------------------------------------------------------------------------
