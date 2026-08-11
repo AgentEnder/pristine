@@ -730,10 +730,12 @@ fn a_forty_byte_env_file_clears_a_floor_that_keeps_out_a_directory_beside_it() {
 }
 
 #[test]
-fn delete_yes_leaves_behind_what_nothing_brings_back_and_names_the_flag() {
-    // The script's door, and the reason it needs its own key. Everything else `--delete` takes
-    // is regenerable; this is not, and a script that did not say the word must not find that
-    // out afterwards. Same shape as `pristine repo`, which already requires `--env`.
+fn delete_yes_removes_a_precious_file_without_a_second_flag() {
+    // **`--ignored-files` is the whole door.** A script that asked to find these asked to find
+    // them, and a second flag over the top would be the special deletion path the design
+    // explicitly refuses: `Kind` names what a thing is and gates nothing. What keeps a `.env`
+    // safe from a run that did not want it is the flag above — without it the file is never a
+    // claim at all, which the first test in this group pins.
     let tmp = repo_with_ignored_files();
 
     let out = succeeds(
@@ -741,36 +743,30 @@ fn delete_yes_leaves_behind_what_nothing_brings_back_and_names_the_flag() {
         &["--min-size=100M", "--ignored-files", "--delete", "--yes"],
     );
 
-    assert!(out.contains("held back"), "{out}");
-    assert!(out.contains("--unrecoverable"), "{out}");
-    assert!(tmp.path().join(".env").exists(), "{out}");
-    // The rest of the batch still happened: held back, not refused.
+    assert!(!tmp.path().join(".env").exists(), "{out}");
     assert!(!tmp.path().join("build.log").exists(), "{out}");
+    // No second door to name, so nothing may advertise one.
+    assert!(!out.contains("held back"), "{out}");
+    assert!(!out.contains("--unrecoverable"), "{out}");
 }
 
 #[test]
-fn the_flag_is_what_lets_a_script_remove_one() {
+fn a_run_that_did_not_ask_for_files_leaves_a_precious_one_alone() {
+    // The other half of the same sentence, and the one carrying the safety: the default sweep
+    // never claims a `.env`, so `--delete` cannot take one. This is what the removed flag was
+    // reaching for, expressed where the design puts it — in what the run can see.
     let tmp = repo_with_ignored_files();
 
-    let out = succeeds(
-        tmp.path(),
-        &[
-            "--min-size=100M",
-            "--ignored-files",
-            "--delete",
-            "--yes",
-            "--unrecoverable",
-        ],
-    );
+    let out = succeeds(tmp.path(), &["--min-size=100M", "--delete", "--yes"]);
 
-    assert!(!out.contains("held back"), "{out}");
-    assert!(!tmp.path().join(".env").exists(), "{out}");
+    assert!(tmp.path().join(".env").exists(), "{out}");
+    assert!(tmp.path().join("build.log").exists(), "{out}");
 }
 
 #[test]
-fn a_dry_run_says_what_it_would_hold_back_before_anything_is_at_stake() {
-    // A preview that omitted the held-back half would read as a plan that takes everything,
-    // which is the one reading of `--dry-run` that costs somebody something.
+fn a_dry_run_names_the_precious_file_it_is_about_to_take() {
+    // A preview has to show the row that would surprise somebody. It is on the plan like any
+    // other target rather than in a held-back postscript, because that is what will happen.
     let tmp = repo_with_ignored_files();
 
     let out = succeeds(
@@ -778,7 +774,7 @@ fn a_dry_run_says_what_it_would_hold_back_before_anything_is_at_stake() {
         &["--min-size=100M", "--ignored-files", "--dry-run"],
     );
 
-    assert!(out.contains("held back"), "{out}");
     assert!(out.contains(".env"), "{out}");
+    assert!(!out.contains("held back"), "{out}");
     assert!(tmp.path().join(".env").exists());
 }

@@ -184,15 +184,6 @@ impl Hit {
         matches!(self.claim, Claim::IgnoredFile(_))
     }
 
-    /// Whether losing this cannot be undone by waiting for a rebuild.
-    ///
-    /// The one predicate the safety inversion turns on, asked in one place so that the tree,
-    /// the confirmation and the command line cannot come to three different answers. See
-    /// [`Kind::Unrecoverable`].
-    #[must_use]
-    pub fn is_unrecoverable(&self) -> bool {
-        self.kind() == Some(Kind::Unrecoverable)
-    }
 }
 
 /// What a walk reports, as it happens.

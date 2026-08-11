@@ -225,19 +225,26 @@ knows; a gitignored file can say more, because its *name* is sometimes evidence 
 `id_rsa` are the only copy of something, `.DS_Store` and `*.log` are the copy of nothing. The
 asymmetry against a named row is the point: it tells you which deletions are cheap.
 
-### `Unrecoverable` inverts the premise, so it does not ride the same path
+### What separates a secret from a cache is which lens shows it
 
-Everything else here is regenerable — that is the whole content of the vocabulary above. An
-`Unrecoverable` file is the opposite: it is the one row in the list where being wrong cannot be
-undone by waiting for a rebuild. So:
+An `Unrecoverable` file inverts the premise of everything else here: nothing brings it back. The
+safety that follows from it lives in **what a view shows**, and nowhere else — there is no special
+deletion path, no extra confirmation and no second flag:
 
-- **A mark on a parent never sweeps one in.** `space` on a directory takes its whole subtree, and
-  someone reclaiming 40 GB is not thinking about the `.env` three levels down. Marking one is
-  putting the cursor on its own row — a deliberate, individual act.
-- **The confirmation says so.** The batch is listed with the unrecoverable entries first, counted
-  in a line of their own, and each one can be taken out with `space`.
-- **`--delete` leaves them standing** and names `--unrecoverable`, the flag that releases them —
-  the same door `pristine repo` already puts in front of `--env`.
+- **Nothing shows one unless you ask.** A sweep does not claim a gitignored file without
+  `--ignored-files`, and no lens displays one until `i` says so. That toggle is the gate, exactly
+  as `default` already hides the gitignored tier. A narrowed view never keeps something back
+  quietly: the header counts what is out of sight, from the first frame.
+- **A mark then behaves normally.** `space` on a directory takes its whole subtree, precious rows
+  included — a mark is a statement about a subtree and the partial-mark glyph on an ancestor has
+  to stay a true reading of it. Marks carry the lens they were made through, so widening the view
+  later never reaches back and adds one.
+- **The confirmation still names them.** The batch is listed with the unrecoverable entries first,
+  counted in a line of their own, and each one can be taken out with `space` — the same key that
+  drops any other line.
+
+The label is doing naming, not gating: `Unrecoverable` on a row tells you what you are looking at
+and changes what no key does.
 
 There is deliberately no field for the command that rebuilds a directory. `npm install` is a guess
 about a package manager nothing checked — the repo may use pnpm or yarn — and half the ruleset could

@@ -149,16 +149,6 @@ struct Sweep {
     #[arg(long)]
     ignored_files: bool,
 
-    /// Allow removal of files nothing brings back: `*.env*`, `*.pem`, `id_rsa`, `.npmrc`,
-    /// `credentials`.
-    ///
-    /// Everything else pristine removes is regenerable — a cache is free, an output is a
-    /// compile, dependencies are a fetch — and these are the opposite. So `--delete` leaves
-    /// them standing and says which ones it left, on the same rule `pristine repo` already
-    /// follows with `--env`: a script's door has to be opened deliberately.
-    #[arg(long)]
-    unrecoverable: bool,
-
     /// Put a number on every claim, by walking each one.
     ///
     /// A scan does not do this unasked, and the reason is not caution: there is no recursive
@@ -505,24 +495,17 @@ fn run(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::error::Er
         return Ok(whole);
     }
 
-    // The safety inversion, and the one place the batch path enforces it. Everything else on
-    // this plan is regenerable; an unrecoverable file is not, and a script that did not say
-    // the word does not get to find that out afterwards. Held back rather than refused
-    // outright, so `--delete` still does the job it was asked for — and named, with the flag
-    // that releases it, on the rule repo mode already follows.
-    let (hits, precious): (Vec<Hit>, Vec<Hit>) = hits
-        .into_iter()
-        .partition(|hit| cli.unrecoverable || !hit.is_unrecoverable());
-    // Both tiers' hits go into one plan. Tier two is not a second pass and not a second
-    // planner: by the time the walk has returned, which tier claimed a directory is a fact
-    // about how it was found and no longer a fact about how it is removed.
+    // Both tiers' hits go into one plan, and every kind with them. `--ignored-files` is the
+    // door a precious file comes through, and there is not a second one behind it: a `Kind`
+    // names what a thing is rather than deciding what a verb does, so nothing here partitions
+    // the plan by it. A run that did not ask for files never claimed one, which is where the
+    // safety lives.
     let plan = Planner::new(&cli.root)
         .one_file_system(cli.one_file_system)
         .older_than(cli.older_than)
         .plan(hits.iter().map(Target::from));
     let unit = noun(&hits);
     write_plan(out, &plan, unit)?;
-    report_unrecoverable(out, &precious, &cli.root)?;
     // Said here rather than inside `write_plan`, which repo mode shares: repo mode prices
     // nothing and has no breakdown flag, so pointing its reader at one would be a dead end.
     report_unpriced(out, plan.unpriced())?;
@@ -912,29 +895,6 @@ fn noun(hits: &[Hit]) -> Noun {
     } else {
         DIRECTORY
     }
-}
-
-/// What `--delete` left standing because nothing brings it back, and the flag that releases it.
-///
-/// Named one by one rather than counted, and that is the difference between a report and a
-/// number: these are the rows where being wrong cannot be undone by waiting for a rebuild, so a
-/// reader deciding whether to pass the flag has to be able to see what passing it would take.
-fn report_unrecoverable(out: &mut impl Write, held: &[Hit], root: &Path) -> std::io::Result<()> {
-    if held.is_empty() {
-        return Ok(());
-    }
-    writeln!(
-        out,
-        "\nheld back — nothing brings these back, and --unrecoverable is what releases them:"
-    )?;
-    for hit in held {
-        writeln!(
-            out,
-            "  {}",
-            hit.path.strip_prefix(root).unwrap_or(&hit.path).display()
-        )?;
-    }
-    Ok(())
 }
 
 /// How many claims nothing has looked inside.

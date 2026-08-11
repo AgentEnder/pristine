@@ -817,7 +817,6 @@ fn a_files_kind_is_read_off_its_name_and_says_what_losing_it_costs() {
     let env = hits.iter().find(|hit| hit.path.ends_with(".env")).unwrap();
     assert_eq!(env.label(), "Gitignored, unrecoverable");
     assert!(env.is_ignored_file());
-    assert!(env.is_unrecoverable());
     assert!(env.rule().is_none(), "no rule named it, and none could");
 }
 

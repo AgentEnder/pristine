@@ -22,9 +22,9 @@
 #                No shipped rule uses "unrecoverable" or "noise": those are what the name of a
 #                gitignored FILE can say, and a marker proves a project's type rather than
 #                that a directory is the only copy of something. A user rule naming a
-#                `secrets/` directory may use it, and that directory then gets the whole
-#                safety inversion — never swept up by a mark on a parent, never removed by a
-#                script that did not pass `--unrecoverable`.
+#                `secrets/` directory may use it. A kind NAMES what a thing is and changes
+#                what no verb does, so that directory is marked and removed like any other —
+#                what keeps something precious off a screen is the lens, not its label.
 #                A RULE WHOSE TARGETS DO NOT ALL SHARE ONE KIND IS TWO RULES. That is why
 #                `python` and `python-caches` are separate, and why Gradle's `build` and
 #                `.gradle` are: one rule covering both could label only one of them honestly.

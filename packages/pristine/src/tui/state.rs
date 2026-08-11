@@ -685,21 +685,21 @@ fn tally(
                         here.visible = roll;
                     }
                     let deepest = sparing.last().copied();
-                    // **A bulk mark never sweeps in something nothing brings back.** Every
-                    // other claim here is regenerable — that is the whole content of the kind
-                    // vocabulary — so `space` on a parent taking its entire subtree is a
-                    // reader saying "reclaim these bytes", and a reader reclaiming 40 GB is
-                    // not thinking about the `.env` three levels down. Marking one has to be
-                    // the deliberate, individual act of putting the cursor on its own row, so
-                    // the mark has to be AT this node rather than above it.
+                    // **A mark is a statement about a subtree, and it has no exceptions.**
+                    // Every claim under it that the mark's own lens accepts is covered,
+                    // whatever kind it is. An earlier pass excepted [`Kind::Unrecoverable`]
+                    // unless the mark sat at the claim's exact depth, and that was wrong twice:
+                    // the fractional glyph on an ancestor reads as the share of the subtree
+                    // that is spoken for, so a mark quietly skipping descendants makes it
+                    // describe a set nobody can see — and the exception had no spelling
+                    // anywhere a reader could find it.
                     //
-                    // Expressed on the mark's depth, which is exactly what "individual" means
-                    // once marks are subtree roots: `at == depth` is a mark on this claim.
-                    let deliberate = !hit.is_unrecoverable();
+                    // What keeps something precious out of a bulk mark is upstream of here and
+                    // needs nothing added: a mark carries the lens it was made through, and no
+                    // lens shows gitignored files until `i` says so. Seeing one at all is the
+                    // deliberate act; after that it is a row like any other.
                     let chosen = covering.iter().any(|&(at, mark)| {
-                        deepest.is_none_or(|spared| at > spared)
-                            && (deliberate || at == depth)
-                            && mark.matches(hit)
+                        deepest.is_none_or(|spared| at > spared) && mark.matches(hit)
                     });
                     // The deleter's two phases come off the selection at different moments,
                     // and both timings are load-bearing. A target part way through is a
@@ -5458,13 +5458,14 @@ mod tests {
         assert_eq!(view.kept_reason(at(&view, "/scan/nx/node_modules")), None);
     }
 
-    // ---- the safety inversion ---------------------------------------------------------
+    // ---- what shows a precious file, and what a mark then takes -------------------------
 
     /// A tree with an unrecoverable file parked under a directory worth deleting for its bytes.
     ///
-    /// The shape the whole rule is about: a reader marks `nx` to get 200 bytes back and is not
-    /// thinking about the `.env` two levels down.
-    fn with_an_env_file() -> View {
+    /// The shape the whole rule is about: a reader marks `nx` to get 200 bytes back, and whether
+    /// the `.env` two levels down goes with it is decided by one thing only — whether the view
+    /// they marked through was showing it.
+    fn tree_with_an_env_file() -> Tree {
         let mut tree = Tree::new("/scan");
         tree.insert(sized(
             of_kind("/scan/nx/node_modules", Kind::Dependencies),
@@ -5478,7 +5479,12 @@ mod tests {
             gitignored_file("/scan/nx/app/build.log", Some(Kind::Noise)),
             10,
         ));
-        let mut view = View::new(tree);
+        tree
+    }
+
+    /// The same tree, on a view that has been told to show files.
+    fn with_an_env_file() -> View {
+        let mut view = View::new(tree_with_an_env_file());
         view.viewport(40);
         // Showing files, because a rule about what a mark takes has to be tested on a view
         // that can see what it is taking.
@@ -5517,35 +5523,61 @@ mod tests {
     }
 
     #[test]
-    fn a_mark_on_a_parent_never_sweeps_in_something_nothing_brings_back() {
-        // The safety inversion, and the reason it cannot ride the same path as everything
-        // else: a cache is free, an output is a compile, dependencies are a fetch — and this
-        // is the one row where being wrong cannot be undone by waiting for a rebuild. `space`
-        // on a directory means "reclaim these bytes", not "and the only copy of my secrets".
+    fn a_mark_on_a_parent_takes_every_visible_claim_under_it_precious_ones_included() {
+        // **A mark is a statement about a subtree**, and there is no exception to it. An
+        // earlier pass excepted the unrecoverable kind unless the mark sat at its exact depth,
+        // which is the thing this asserts is gone: it would make the ancestor's fractional
+        // glyph describe a set nobody could see, and the mark model would need a rule with no
+        // visible spelling. What keeps a `.env` out of a batch is the lens — see the test
+        // below — and once it is on screen it is a row like any other.
         let mut view = with_an_env_file();
         point_at(&mut view, "/scan/nx");
         view.apply(Action::Mark);
         view.sync();
 
+        let mut took = batched(&view);
+        took.sort();
         assert_eq!(
-            batched(&view),
+            took,
             [
+                PathBuf::from("/scan/nx/app/.env"),
                 PathBuf::from("/scan/nx/app/build.log"),
                 PathBuf::from("/scan/nx/node_modules"),
-            ],
-            "a bulk mark took the env file"
+            ]
         );
         // The counter and the batch are one traversal, so the number a reader is shown agrees
-        // with what the deed would take.
-        assert_eq!(view.marked().claims, 2);
-        assert_eq!(view.marked().bytes, 210);
+        // with what the deed would take — the env file's 40 bytes included.
+        assert_eq!(view.marked().claims, 3);
+        assert_eq!(view.marked().bytes, 250);
     }
 
     #[test]
-    fn marking_the_row_itself_is_how_something_unrecoverable_gets_into_a_batch() {
-        // The other half, and the half that keeps the rule from being a refusal: it is not
-        // undeletable, it is undeletable *by accident*. Putting the cursor on the row is the
-        // deliberate individual act the design asks for.
+    fn the_lens_a_mark_was_made_through_is_the_only_thing_holding_a_precious_file_back() {
+        // **The whole safety design, as one assertion.** A run opens with files off, so a
+        // reader who never pressed `i` cannot see a `.env` — and because a mark carries the
+        // lens it was made through (#626), widening the view afterwards does not reach back
+        // and add one. That is the same lever `default` already pulls on the gitignored tier,
+        // and it is the reason no second flag and no special deletion path are needed.
+        let mut view = View::new(tree_with_an_env_file());
+        view.viewport(40);
+        point_at(&mut view, "/scan/nx");
+        view.apply(Action::Mark);
+        view.sync();
+
+        assert_eq!(batched(&view), [PathBuf::from("/scan/nx/node_modules")]);
+
+        view.apply(Action::ToggleFiles);
+        view.sync();
+        assert_eq!(
+            batched(&view),
+            [PathBuf::from("/scan/nx/node_modules")],
+            "widening the view changed what an existing mark covers"
+        );
+    }
+
+    #[test]
+    fn a_precious_row_marked_on_its_own_is_an_ordinary_row() {
+        // Same keys, same rules: the label names what the thing is and gates nothing.
         let mut view = with_an_env_file();
         point_at(&mut view, "/scan/nx/app/.env");
         view.apply(Action::Mark);
@@ -5556,11 +5588,11 @@ mod tests {
     }
 
     #[test]
-    fn a_mark_that_arrives_over_an_env_file_later_still_does_not_take_it() {
+    fn a_precious_claim_arriving_under_a_mark_later_joins_it_like_any_other() {
         // Marks resolve on demand as the scan streams claims in, which is what makes "mark
-        // this directory" mean the directory rather than the rows found so far. That is
-        // exactly the door an unrecoverable file could arrive through after the decision was
-        // made, so the rule has to hold at resolution time and not only at the keystroke.
+        // this directory" mean the directory rather than the rows found so far. A claim of any
+        // kind arriving under it is therefore covered on arrival — that is what the reader
+        // asked for, and singling one kind out of it would be the exception this no longer has.
         let mut view = with_an_env_file();
         point_at(&mut view, "/scan/nx");
         view.apply(Action::Mark);
@@ -5574,12 +5606,8 @@ mod tests {
         view.found(sized(of_kind("/scan/nx/deep/dist", Kind::Build), 5));
         view.sync();
 
-        assert_eq!(
-            view.marked().claims,
-            before + 1,
-            "only the build directory joined the batch"
-        );
-        assert!(!batched(&view).contains(&PathBuf::from("/scan/nx/deep/id_rsa")));
+        assert_eq!(view.marked().claims, before + 2);
+        assert!(batched(&view).contains(&PathBuf::from("/scan/nx/deep/id_rsa")));
     }
 
     #[test]

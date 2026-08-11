@@ -63,14 +63,24 @@ pub enum Anchor {
 /// Everything else in the crate reads the order off `ALL` rather than restating it, so the
 /// confirmation groups the expensive end first and the front end derives a key per member.
 ///
-/// # [`Unrecoverable`](Self::Unrecoverable) inverts the whole premise, and so is handled apart
+/// # A kind NAMES, it does not gate
 ///
-/// Everything else pristine removes is regenerable — that is what the vocabulary above says,
-/// member by member. An unrecoverable thing is the opposite, and nothing brings it back: it is
-/// the one row in a list where being wrong cannot be undone by waiting for a rebuild. So it is
-/// never swept up by a mark on a parent, never removed by a script that did not ask for it by
-/// name, and named on the confirmation as its own group. See [`Kind::of_ignored_file`],
-/// [`super::tui::state::View::batch`] and the command line's `--unrecoverable`.
+/// [`Unrecoverable`](Self::Unrecoverable) inverts the premise of the rest of the vocabulary —
+/// nothing brings it back — and it is tempting to make the code treat it apart: skip it in a
+/// bulk mark, put a second flag in front of deleting one. **That was built and then removed,
+/// and the reason is worth keeping.** A mark is a statement about a subtree, and the fractional
+/// glyph on an ancestor is a true reading of how much of it is spoken for; a mark that silently
+/// skipped some descendants would make that glyph describe a set no reader can see, and the
+/// exception would live nowhere a reader could find it.
+///
+/// So the safety is carried entirely by **what a view shows**, which is a lever the front end
+/// already had: no lens shows gitignored files until `i` says so, no sweep claims one until
+/// `--ignored-files` says so, and a mark carries the lens it was made through. Seeing a `.env`
+/// at all is the deliberate act. After that it is a row like any other — same keys, same rules,
+/// one confirmation that lists the whole batch with the expensive end first.
+///
+/// What the kind still does is *name* the thing, which is what a label has been for since the
+/// regeneration command was deleted. See [`Kind::of_ignored_file`] and [`super::tui::lens`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
