@@ -41,8 +41,13 @@
 //! spike asked it by squarifying the whole thing and comparing, which cost 467 µs on a frame
 //! where nothing had happened — 200× what the animation beside it spends to answer the same
 //! question, paid forever, on a pane showing the picture it showed last frame. Reading the
-//! inputs instead costs 34 ns: a [`Tree::stamp`](crate::tree::Tree::stamp) for the mapped
-//! subtree, and a hash of the handful of values the reader controls.
+//! inputs instead costs **50 ns**: a [`View::map_stamp`](super::state::View::map_stamp) for
+//! the mapped subtree, and a hash of the handful of values the reader controls.
+//!
+//! That stamp is **lens-aware**, and it has to be. A run opens on a view that hides the
+//! gitignored tier, so tier-two claims stream in under the very directory the map is of while
+//! changing not one rectangle; answering each of those with the tree's own stamp would be a
+//! megabyte down the pty to redraw the picture already on it.
 //!
 //! Taking the picture **down** is not a redraw and is never throttled — see
 //! [`tiles::mappable`].
@@ -146,8 +151,8 @@ pub struct Screen<W: Write> {
     /// row, what is marked, what the filter shows, how big the pane. Changes to this are
     /// never throttled.
     steering: u64,
-    /// Which change to the mapped subtree the picture on screen was drawn from. See
-    /// [`crate::tree::Tree::stamp`].
+    /// What the mapped subtree was showing when the picture went up. See
+    /// [`View::map_stamp`].
     arriving: u64,
     /// When the image was last written.
     since: Option<Instant>,
@@ -223,7 +228,9 @@ impl<W: Write> Screen<W> {
             pane.cells,
             pane.cell,
         ));
-        let arriving = view.tree().stamp(root);
+        // The map's own stamp and not the tree's: the tree's is lens-blind, and a run opens on
+        // a view that hides a whole tier. See [`View::map_stamp`].
+        let arriving = view.map_stamp(root);
         let steered = steering != self.steering;
         let settled = self
             .since
@@ -326,7 +333,7 @@ fn fingerprint(of: &impl Hash) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{MIN_WIDTH, Pane, SETTLE, Screen, kitty, paint, tiles};
-    use crate::fixture::{hit, priced};
+    use crate::fixture::{gitignored, hit, priced};
     use crate::size::Size;
     use crate::tree::Tree;
     use crate::tui::keymap::{Action, Motion};
@@ -337,11 +344,20 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
+    /// A view with the map turned on, which is the only kind that draws one.
+    ///
+    /// Said out loud in every fixture here rather than defaulted, because it is what decides
+    /// whether [`View::map_stamp`] has its lens-aware table behind it or falls back to the
+    /// tree's lens-blind one — so a test that left it off would be asserting about a run
+    /// nobody has.
     fn view() -> View {
         let mut tree = Tree::new("/scan");
         tree.insert(priced("/scan/nx/node_modules", 8 * 1024 * 1024));
         tree.insert(priced("/scan/pua/target", 2 * 1024 * 1024));
-        View::new(tree)
+        let mut view = View::new(tree);
+        view.allow_maps(true);
+        view.sync();
+        view
     }
 
     fn pane() -> Pane {
@@ -431,6 +447,8 @@ mod tests {
         tree.insert(priced("/scan/nx/node_modules", 8 * 1024 * 1024));
         tree.insert(hit("/scan/pua/target", Size::Unmeasured, 0));
         let mut view = View::new(tree);
+        view.allow_maps(true);
+        view.sync();
         let mut screen = screen();
         let now = Instant::now();
         screen.show(&view, pane(), now).unwrap();
@@ -461,6 +479,8 @@ mod tests {
         let mut tree = Tree::new("/scan");
         tree.insert(priced("/scan/only/node_modules", 8 * 1024 * 1024));
         let mut view = View::new(tree);
+        view.allow_maps(true);
+        view.sync();
         let mut screen = screen();
         let now = Instant::now();
         view.animate(now);
@@ -497,6 +517,8 @@ mod tests {
         tree.insert(priced("/scan/here/two/node_modules", 2 * 1024 * 1024));
         tree.insert(priced("/scan/there/target", 1024));
         let mut view = View::new(tree);
+        view.allow_maps(true);
+        view.sync();
         view.apply(Action::Cursor(Motion::Down));
         let here = view
             .tree()
@@ -571,6 +593,59 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_the_view_hides_arriving_under_the_mapped_directory_is_not_a_redraw() {
+        // The lens-blind half of the tree's own stamp, and the case a run meets from its
+        // first frame: `default` hides the gitignored tier, so tier-two claims stream in
+        // under the very directory the map is of while changing not one rectangle. Answering
+        // each of those is a megabyte down the pty to redraw the picture already on it.
+        let mut tree = Tree::new("/scan");
+        tree.insert(priced("/scan/here/one/node_modules", 4 * 1024 * 1024));
+        tree.insert(priced("/scan/here/two/node_modules", 2 * 1024 * 1024));
+        let mut view = View::new(tree);
+        view.allow_maps(true);
+        view.sync();
+        view.apply(Action::Cursor(Motion::Down));
+        let here = view
+            .tree()
+            .find(std::path::Path::new("/scan/here"))
+            .unwrap();
+        assert_eq!(tiles::focus(&view), Some(here));
+
+        let mut screen = screen();
+        let now = Instant::now();
+        screen.show(&view, pane(), now).unwrap();
+        let first = screen.sink().len();
+        let was = view.roll(here);
+
+        // Inside the mapped directory, and enormous — but the view a run opens on does not
+        // show the gitignored tier, so the map has nothing to say about it.
+        let mut unseen = gitignored("/scan/here/three/vendor");
+        unseen.size = Size::Measured(64 * 1024 * 1024);
+        view.found(unseen);
+        view.sync();
+        assert_eq!(
+            view.roll(here),
+            was,
+            "the fixture no longer makes the point — the claim has to be invisible"
+        );
+
+        screen.show(&view, pane(), now + SETTLE).unwrap();
+        assert_eq!(
+            screen.sink().len(),
+            first,
+            "a claim the view hides redrew a map that cannot draw it"
+        );
+
+        // …and the moment the reader widens the view to include it, it is a new picture.
+        view.apply(Action::CycleTiers);
+        screen.show(&view, pane(), now + SETTLE).unwrap();
+        assert!(
+            screen.sink().len() > first,
+            "the map never caught up with the view widening"
+        );
+    }
+
+    #[test]
     fn narrowing_the_view_by_kind_redraws_the_map_it_narrows() {
         // The lens is more than its `/` pattern: what [`View::roll`] counts is the tier and
         // kind axes as well, so a rectangle's area is theirs too. A fingerprint that watched
@@ -579,6 +654,8 @@ mod tests {
         tree.insert(priced("/scan/a/node_modules", 8 * 1024 * 1024));
         tree.insert(priced("/scan/b/target", 2 * 1024 * 1024));
         let mut view = View::new(tree);
+        view.allow_maps(true);
+        view.sync();
         let mut screen = screen();
         let now = Instant::now();
         screen.show(&view, pane(), now).unwrap();
@@ -603,6 +680,8 @@ mod tests {
         tree.insert(hit("/scan/going/node_modules", Size::Unmeasured, 0));
         tree.insert(hit("/scan/staying/target", Size::Unmeasured, 0));
         let mut view = View::new(tree);
+        view.allow_maps(true);
+        view.sync();
         let mut screen = screen();
         let now = Instant::now();
         view.animate(now);
@@ -782,7 +861,13 @@ mod tests {
             ));
         }
         let mut view = View::new(tree);
+        view.allow_maps(true);
+        view.sync();
         view.viewport(50);
+        // As a run that draws one has it, so the still frame below is measured against the
+        // lens-aware stamp rather than the fallback. See [`View::map_stamp`].
+        view.allow_maps(true);
+        view.sync();
         println!("claims: {}", view.total().claims);
 
         // 44 columns of a 120-column window, 34 rows, at a retina Ghostty's 9×19 px cell.
