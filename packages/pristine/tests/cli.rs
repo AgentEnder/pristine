@@ -662,3 +662,123 @@ fn asking_for_the_listing_at_a_terminal_is_a_flag_rather_than_a_redirect() {
         succeeds(tmp.path(), &[])
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// Gitignored files, and the script's door.
+// ---------------------------------------------------------------------------------------
+
+/// A repository with an env file, a log and a gitignored directory, all ignored.
+fn repo_with_ignored_files() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    init_repo(tmp.path());
+    fs::write(tmp.path().join(".gitignore"), ".env\n*.log\nsediment/\n").unwrap();
+    write(&tmp.path().join(".env"), 40);
+    write(&tmp.path().join("build.log"), 40);
+    write(&tmp.path().join("sediment/blob.bin"), OVER);
+    tmp
+}
+
+/// The path column of every claim in a listing.
+///
+/// Parsed rather than searched for, because the two facts that matter here are next to each
+/// other in the text: `sediment` the directory is *not* claimed, and `sediment/blob.bin` is —
+/// and a `contains` cannot tell those apart.
+fn claimed_paths(listing: &str) -> Vec<String> {
+    listing
+        .lines()
+        .filter(|line| line.contains("  Gitignored"))
+        .filter_map(|line| line.split_whitespace().nth(2).map(str::to_owned))
+        .collect()
+}
+
+#[test]
+fn a_listing_leaves_gitignored_files_out_until_the_flag_asks_for_them() {
+    let tmp = repo_with_ignored_files();
+    let floor = format!("--min-size={OVER}");
+
+    let quiet = succeeds(tmp.path(), &[&floor]);
+    assert!(!quiet.contains(".env"), "{quiet}");
+    // …and it says so, on the rule a count is always printed with the flag that releases it:
+    // "there were none" and "nobody looked" are opposite facts.
+    assert!(quiet.contains("--ignored-files"), "{quiet}");
+
+    let asked = succeeds(tmp.path(), &[&floor, "--ignored-files"]);
+    assert!(asked.contains(".env"), "{asked}");
+    assert!(asked.contains("Gitignored, unrecoverable"), "{asked}");
+    assert!(asked.contains("Gitignored, noise"), "{asked}");
+    // Rows are paths rather than directories once a file can be one of them.
+    assert!(asked.contains("3 paths reclaimable"), "{asked}");
+}
+
+#[test]
+fn a_forty_byte_env_file_clears_a_floor_that_keeps_out_a_directory_beside_it() {
+    // The floor is about rows on a list sorted by size. A 40-byte `.env` is worth a row for a
+    // reason that has nothing to do with its size, so the flag that finds it is not also
+    // subject to the flag that thins the list. `sediment` the directory is refused by the
+    // floor and descended into, so what appears is the file inside it rather than the
+    // directory — which is the same rule, seen from the other side.
+    let tmp = repo_with_ignored_files();
+
+    let asked = succeeds(tmp.path(), &["--min-size=100M", "--ignored-files"]);
+
+    // Sorted biggest first by the listing, which is why this is not alphabetical.
+    assert_eq!(
+        claimed_paths(&asked),
+        ["sediment/blob.bin", ".env", "build.log"],
+        "{asked}"
+    );
+}
+
+#[test]
+fn delete_yes_leaves_behind_what_nothing_brings_back_and_names_the_flag() {
+    // The script's door, and the reason it needs its own key. Everything else `--delete` takes
+    // is regenerable; this is not, and a script that did not say the word must not find that
+    // out afterwards. Same shape as `pristine repo`, which already requires `--env`.
+    let tmp = repo_with_ignored_files();
+
+    let out = succeeds(
+        tmp.path(),
+        &["--min-size=100M", "--ignored-files", "--delete", "--yes"],
+    );
+
+    assert!(out.contains("held back"), "{out}");
+    assert!(out.contains("--unrecoverable"), "{out}");
+    assert!(tmp.path().join(".env").exists(), "{out}");
+    // The rest of the batch still happened: held back, not refused.
+    assert!(!tmp.path().join("build.log").exists(), "{out}");
+}
+
+#[test]
+fn the_flag_is_what_lets_a_script_remove_one() {
+    let tmp = repo_with_ignored_files();
+
+    let out = succeeds(
+        tmp.path(),
+        &[
+            "--min-size=100M",
+            "--ignored-files",
+            "--delete",
+            "--yes",
+            "--unrecoverable",
+        ],
+    );
+
+    assert!(!out.contains("held back"), "{out}");
+    assert!(!tmp.path().join(".env").exists(), "{out}");
+}
+
+#[test]
+fn a_dry_run_says_what_it_would_hold_back_before_anything_is_at_stake() {
+    // A preview that omitted the held-back half would read as a plan that takes everything,
+    // which is the one reading of `--dry-run` that costs somebody something.
+    let tmp = repo_with_ignored_files();
+
+    let out = succeeds(
+        tmp.path(),
+        &["--min-size=100M", "--ignored-files", "--dry-run"],
+    );
+
+    assert!(out.contains("held back"), "{out}");
+    assert!(out.contains(".env"), "{out}");
+    assert!(tmp.path().join(".env").exists());
+}

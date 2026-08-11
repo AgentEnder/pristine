@@ -136,6 +136,29 @@ struct Sweep {
     )]
     min_size: u64,
 
+    /// Also claim gitignored FILES, not only gitignored directories.
+    ///
+    /// A different job from the rest of the sweep, which is why it is a flag rather than the
+    /// default: clearing fifty env files reclaims kilobytes, so the value is hygiene rather
+    /// than space and the size floor above does not apply to one. A real home directory holds
+    /// tens of thousands of them, and a listing sorted by size would bury a 40 GB
+    /// `node_modules` under `.DS_Store` rows.
+    ///
+    /// The rollup tree finds them either way, so `i` can show them without running the scan
+    /// again; passing this opens the tree with them already on screen.
+    #[arg(long)]
+    ignored_files: bool,
+
+    /// Allow removal of files nothing brings back: `*.env*`, `*.pem`, `id_rsa`, `.npmrc`,
+    /// `credentials`.
+    ///
+    /// Everything else pristine removes is regenerable — a cache is free, an output is a
+    /// compile, dependencies are a fetch — and these are the opposite. So `--delete` leaves
+    /// them standing and says which ones it left, on the same rule `pristine repo` already
+    /// follows with `--env`: a script's door has to be opened deliberately.
+    #[arg(long)]
+    unrecoverable: bool,
+
     /// Put a number on every claim, by walking each one.
     ///
     /// A scan does not do this unasked, and the reason is not caution: there is no recursive
@@ -406,6 +429,7 @@ fn sweep_with(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::er
             size_mode: tui::size_mode(cli.size_mode()?),
             one_file_system: cli.one_file_system,
             older_than: cli.older_than,
+            ignored_files: cli.ignored_files,
         },
         ruleset,
     )?;
@@ -434,6 +458,7 @@ fn run(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::error::Er
     // looked across, which reads as "there was nothing over there".
     let outcome = Walker::new(&cli.root, ruleset)
         .same_file_system(cli.one_file_system)
+        .ignored_files(cli.ignored_files)
         .min_size(cli.min_size)
         .size_mode(cli.size_mode()?)
         // A claim arrives as soon as it is judged and its price arrives later, from the
@@ -480,6 +505,14 @@ fn run(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::error::Er
         return Ok(whole);
     }
 
+    // The safety inversion, and the one place the batch path enforces it. Everything else on
+    // this plan is regenerable; an unrecoverable file is not, and a script that did not say
+    // the word does not get to find that out afterwards. Held back rather than refused
+    // outright, so `--delete` still does the job it was asked for — and named, with the flag
+    // that releases it, on the rule repo mode already follows.
+    let (hits, precious): (Vec<Hit>, Vec<Hit>) = hits
+        .into_iter()
+        .partition(|hit| cli.unrecoverable || !hit.is_unrecoverable());
     // Both tiers' hits go into one plan. Tier two is not a second pass and not a second
     // planner: by the time the walk has returned, which tier claimed a directory is a fact
     // about how it was found and no longer a fact about how it is removed.
@@ -487,7 +520,9 @@ fn run(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::error::Er
         .one_file_system(cli.one_file_system)
         .older_than(cli.older_than)
         .plan(hits.iter().map(Target::from));
-    write_plan(out, &plan, DIRECTORY)?;
+    let unit = noun(&hits);
+    write_plan(out, &plan, unit)?;
+    report_unrecoverable(out, &precious, &cli.root)?;
     // Said here rather than inside `write_plan`, which repo mode shares: repo mode prices
     // nothing and has no breakdown flag, so pointing its reader at one would be a dead end.
     report_unpriced(out, plan.unpriced())?;
@@ -506,7 +541,7 @@ fn run(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::error::Er
         return Ok(whole);
     }
     if !cli.yes {
-        let question = format!("\nRemove {}?", plural(plan.targets().len(), DIRECTORY));
+        let question = format!("\nRemove {}?", plural(plan.targets().len(), unit));
         let stdin = std::io::stdin();
         if !confirm(&question, &mut stdin.lock(), out)? {
             writeln!(out, "nothing was removed")?;
@@ -515,7 +550,7 @@ fn run(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::error::Er
     }
 
     let removal = Deleter::new().remove(&plan);
-    write_removal(out, &removal, plan.root(), DIRECTORY)?;
+    write_removal(out, &removal, plan.root(), unit)?;
     for failure in &removal.failures {
         eprintln!("pristine: {}: {}", failure.path.display(), failure.message);
     }
@@ -859,10 +894,47 @@ fn summary(hits: &[Hit]) -> String {
     let priced: u64 = hits.iter().filter_map(|hit| hit.size.bytes()).sum();
     format!(
         "\n{} reclaimable, {} priced, {} not priced",
-        plural(hits.len(), DIRECTORY),
+        plural(hits.len(), noun(hits)),
         human(priced),
         unpriced(hits),
     )
+}
+
+/// What to call the things in a listing or on a plan.
+///
+/// A fact about what was found rather than a constant, which it used to be able to be: a sweep
+/// that claimed gitignored files has files in it, and calling one a directory is the kind of
+/// small lie that teaches a reader to distrust the numbers beside it. Directories stay
+/// directories whenever that is all there is, which is every run that did not ask for files.
+fn noun(hits: &[Hit]) -> Noun {
+    if hits.iter().any(Hit::is_ignored_file) {
+        PATH
+    } else {
+        DIRECTORY
+    }
+}
+
+/// What `--delete` left standing because nothing brings it back, and the flag that releases it.
+///
+/// Named one by one rather than counted, and that is the difference between a report and a
+/// number: these are the rows where being wrong cannot be undone by waiting for a rebuild, so a
+/// reader deciding whether to pass the flag has to be able to see what passing it would take.
+fn report_unrecoverable(out: &mut impl Write, held: &[Hit], root: &Path) -> std::io::Result<()> {
+    if held.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "\nheld back — nothing brings these back, and --unrecoverable is what releases them:"
+    )?;
+    for hit in held {
+        writeln!(
+            out,
+            "  {}",
+            hit.path.strip_prefix(root).unwrap_or(&hit.path).display()
+        )?;
+    }
+    Ok(())
 }
 
 /// How many claims nothing has looked inside.
@@ -911,10 +983,32 @@ fn report_fallback(out: &mut impl Write, fallback: &FallbackReport) -> std::io::
             plural(fallback.holding_a_checkout, DIRECTORY)
         )
     };
+    // What the tier did about FILES, which is a second question and looks identical to the
+    // first without something that says which: "no env files here" and "nobody looked for one"
+    // are opposite facts, so the flag is named whenever it was not passed.
+    //
+    // The noun moves with the answer. Calling four claims "directories" and then saying three
+    // of them are files is a sentence that contradicts itself, and the floor is stated beside
+    // it — which applies to the directories and to none of the files.
+    let (unit, files) = if fallback.files_enabled {
+        (
+            PATH,
+            format!(
+                ", {} of them {} the floor does not apply to",
+                fallback.files,
+                if fallback.files == 1 { "a file" } else { "files" }
+            ),
+        )
+    } else {
+        (
+            DIRECTORY,
+            " (directories only; --ignored-files claims gitignored files too)".to_owned(),
+        )
+    };
     writeln!(
         out,
-        "fallback tier: {} found in {} above a {} floor{held_back}",
-        plural(fallback.hits, DIRECTORY),
+        "fallback tier: {} found in {} above a {} floor{held_back}{files}",
+        plural(fallback.hits, unit),
         plural(fallback.work_trees, WORK_TREE),
         human(fallback.min_size),
     )
@@ -1013,9 +1107,10 @@ fn report_scan(out: &mut impl Write, outcome: &WalkOutcome) -> std::io::Result<(
 /// A noun and its plural, so a count can be read aloud.
 type Noun = (&'static str, &'static str);
 
-/// The sweep only ever claims directories.
+/// What the sweep claims unless `--ignored-files` widens it. See [`noun`].
 const DIRECTORY: Noun = ("directory", "directories");
-/// Repo mode takes whatever git lists, which is files as often as directories.
+/// Repo mode takes whatever git lists, which is files as often as directories — and so does a
+/// sweep once `--ignored-files` is on.
 const PATH: Noun = ("path", "paths");
 /// What git refuses to clean and this refuses to clean after it.
 const NESTED_REPOSITORY: Noun = ("nested repository", "nested repositories");

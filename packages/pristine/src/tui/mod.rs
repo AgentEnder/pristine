@@ -131,6 +131,12 @@ pub struct Options {
     pub one_file_system: bool,
     /// Keep anything touched more recently than this.
     pub older_than: Option<Duration>,
+    /// Whether the view opens with gitignored files on screen.
+    ///
+    /// The walk claims them whatever this says — `i` is what a reader presses, and a key that
+    /// found nothing until the scan was run again would not be one. This is only where the lens
+    /// starts, so that `--ignored-files` means the same thing here as it does to the listing.
+    pub ignored_files: bool,
 }
 
 /// What one arriving event tells the view.
@@ -506,6 +512,9 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
 ) -> io::Result<Outcome> {
     let (post, inbox) = channel();
     let mut view = View::new(Tree::new(&options.root));
+    if options.ignored_files {
+        view = view.showing_files();
+    }
     // Told once: whether a map is possible at all is a fact about the terminal, and the view
     // owns the decision that reads it. Same split as `View::viewport`.
     view.allow_maps(screen.allowed());
@@ -786,6 +795,12 @@ fn spawn_walk(options: &Options, ruleset: Arc<Ruleset>, post: Sender<Message>) -
     let walker = Walker::new(&options.root, ruleset)
         .size_mode(options.size_mode.clone())
         .same_file_system(options.one_file_system)
+        // Always claimed here, and hidden by the lens rather than by the walk. The two are
+        // different questions — whether to pay to find them, and whether to draw them — and
+        // the tree is the one front end that can answer the second per keystroke. A walk that
+        // had left them out would make `i` a key that finds nothing until the run is done
+        // again.
+        .ignored_files(true)
         .min_size(options.min_size);
     std::thread::spawn(move || {
         let reporting = post.clone();
@@ -1202,6 +1217,7 @@ mod tests {
                 size_mode: SizeMode::Skip,
                 one_file_system: true,
                 older_than: None,
+                ignored_files: false,
             },
             post,
         );
@@ -1837,6 +1853,7 @@ mod loop_tests {
                 size_mode: SizeMode::Skip,
                 one_file_system: true,
                 older_than: None,
+                ignored_files: false,
             },
             Arc::new(Ruleset::builtin().unwrap()),
         )
@@ -1925,6 +1942,7 @@ mod loop_tests {
                 size_mode: SizeMode::Skip,
                 one_file_system: true,
                 older_than: None,
+                ignored_files: false,
             },
             Arc::new(Ruleset::builtin().unwrap()),
         );
@@ -2016,6 +2034,7 @@ mod loop_tests {
                 size_mode: SizeMode::Skip,
                 one_file_system: true,
                 older_than: None,
+                ignored_files: false,
             },
             Arc::new(Ruleset::builtin().unwrap()),
         )
@@ -2089,6 +2108,7 @@ mod loop_tests {
                 size_mode: SizeMode::Skip,
                 one_file_system: true,
                 older_than: None,
+                ignored_files: false,
             },
             Arc::new(Ruleset::builtin().unwrap()),
         )
