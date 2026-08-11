@@ -770,13 +770,6 @@ pub struct View {
     /// a mark made under `named · dependencies · /nx` has to keep meaning that when any part
     /// of it changes.
     lens: Lens,
-    /// Which preset the reader last asked for, and `None` once they have moved an axis by hand.
-    ///
-    /// Remembered rather than derived, for two reasons that are really one. `all-ignored` and
-    /// `all` are the same point on the axes, so a derived name could not tell the reader which
-    /// step of the cycle they are on — and a lens the axis keys built is not a preset at all,
-    /// which the footer has to be able to say rather than rounding to the nearest one.
-    preset: Option<Preset>,
     prompt: Option<Prompt>,
     help: Option<usize>,
     pending: Option<Pending>,
@@ -876,7 +869,6 @@ impl View {
             scroll: 0,
             page: 20,
             lens: Lens::default(),
-            preset: Some(Preset::default()),
             prompt: None,
             help: None,
             pending: None,
@@ -1623,10 +1615,15 @@ impl View {
         self.lens.pattern()
     }
 
-    /// Which named view the reader is on, or `None` once they have moved an axis by hand.
+    /// Which named view the view is on, or `None` once the axis keys have taken it off all
+    /// four.
+    ///
+    /// Derived from the axes rather than remembered, which the four presets occupying four
+    /// distinct points is what buys: a reader who toggles their way onto `dependencies` is on
+    /// `dependencies`, and nothing has to keep a record of how they got there.
     #[must_use]
     pub fn preset(&self) -> Option<Preset> {
-        self.preset
+        self.lens.preset()
     }
 
     /// What the footer calls the view: a preset's name, or the two axes spelled out.
@@ -1635,7 +1632,7 @@ impl View {
     /// nearest preset — would tell the reader they are somewhere they are not.
     #[must_use]
     pub fn view_label(&self) -> String {
-        self.preset.map_or_else(
+        self.preset().map_or_else(
             || self.lens.axes_label(),
             |preset| preset.label().to_owned(),
         )
@@ -1898,7 +1895,6 @@ impl View {
         }
         if self.lens != Lens::default() {
             self.lens = Lens::default();
-            self.preset = Some(Preset::default());
             self.stale = true;
             return;
         }
@@ -1951,19 +1947,19 @@ impl View {
     /// is still in the batch, and the reader has to be able to tell that from a claim that was
     /// never found.
     fn cycle_preset(&mut self, turn: Turn) {
-        // A reader who has moved an axis by hand is not *on* a preset, so the cycle starts from
-        // the nearest one they could have been on rather than from wherever `f` last left off.
-        let at = self
-            .preset
-            .or_else(|| self.lens.preset())
-            .unwrap_or_default();
-        let next = match turn {
-            Turn::Next => at.next(),
-            Turn::Prev => at.prev(),
+        // A reader who has moved an axis by hand is not on a preset at all, so the key puts
+        // them back on the first one rather than stepping from a place they never were.
+        let next = match self.preset() {
+            Some(at) => match turn {
+                Turn::Next => at.next(),
+                Turn::Prev => at.prev(),
+            },
+            None => Preset::default(),
         };
-        let pattern = self.held_pattern().filter(|_| !next.clears_pattern());
-        self.lens = Lens::showing(next).matching(pattern);
-        self.preset = Some(next);
+        // The axes move and the `/` pattern does not. It narrows whatever the axes leave, so it
+        // is orthogonal to both of them — and a preset that quietly dropped it would be using
+        // an unrelated piece of state to mean something about the view.
+        self.lens = Lens::showing(next).matching(self.held_pattern());
         self.narrowed(format!("showing {}", next.what()));
     }
 
@@ -1987,15 +1983,9 @@ impl View {
     /// name to give — that is the whole point of the two keys, and rounding to the nearest
     /// preset would report a view the reader is not on.
     fn off_the_presets(&mut self) {
-        self.preset = self.lens.preset().filter(|preset| {
-            // A hand-edited lens that lands exactly on a preset's point is that preset, except
-            // where two presets share a point: naming one of them would be a coin toss.
-            Preset::ALL
-                .into_iter()
-                .filter(|other| other.axes() == preset.axes())
-                .count()
-                == 1
-        });
+        // Nothing to record: [`View::preset`] reads the axes, so a hand-edited lens that lands
+        // on a preset's point *is* that preset and one that does not has no name. What it says
+        // is the axes, because that is the only description a nameless view has.
         let said = self.lens.axes_label();
         self.narrowed(format!("showing {said}"));
     }
@@ -3210,8 +3200,11 @@ mod tests {
     }
 
     /// Presses `f` until the view is the one named.
+    ///
+    /// One press more than there are presets, because from a view the axis keys built the first
+    /// press lands on `default` rather than stepping from a place the reader never was.
     fn showing(view: &mut View, preset: Preset) {
-        for _ in 0..Preset::ALL.len() {
+        for _ in 0..=Preset::ALL.len() {
             if view.preset() == Some(preset) {
                 return;
             }
@@ -3249,14 +3242,16 @@ mod tests {
         assert_eq!(seen(&view), 1);
 
         view.apply(Action::CyclePreset(Turn::Next));
-        // all-ignored: the fallback tier ALONGSIDE what rules named, never instead of it.
+        // all-ignored: the TIER axis widens and the kind narrowing is RETAINED, so this is the
+        // step before it plus the gitignored tier — two claims, not five.
         assert_eq!(view.preset(), Some(Preset::AllIgnored));
-        assert_eq!(seen(&view), 5);
-        assert_eq!(view.out_of_view(), 0);
+        assert_eq!(seen(&view), 2);
 
         view.apply(Action::CyclePreset(Turn::Next));
+        // all: the kind axis widens too, which is everything.
         assert_eq!(view.preset(), Some(Preset::All));
         assert_eq!(seen(&view), 5);
+        assert_eq!(view.out_of_view(), 0);
 
         view.apply(Action::CyclePreset(Turn::Next));
         assert_eq!(view.preset(), Some(Preset::Default));
@@ -3268,18 +3263,42 @@ mod tests {
     }
 
     #[test]
-    fn all_is_the_step_that_resets_where_all_ignored_is_the_step_that_widens() {
-        // The two sit on one point of the axes — that is a property of the asked-for set, which
-        // separating the axes is what exposes. They stay two steps because the cycle was
-        // specified with four, and `all` is given the one thing its name additionally claims.
+    fn each_step_of_the_cycle_moves_one_axis_and_carries_the_other() {
+        // What makes the asked-for order a path rather than four unrelated points, seen through
+        // the keys: `dependencies` narrows the kind, `all-ignored` widens the tier and KEEPS
+        // that narrowing, and `all` widens the kind back. Four presses, four different screens.
         let mut view = mixed();
-        filter(&mut view, "nx");
-        showing(&mut view, Preset::AllIgnored);
-        assert_eq!(view.filter(), Some("nx"), "all-ignored is about the tiers");
+        let seen = |view: &View| shown_claims(view);
+
+        assert_eq!(view.view_label(), "default");
+        view.apply(Action::CyclePreset(Turn::Next));
+        assert_eq!(seen(&view), [PathBuf::from("/scan/nx/node_modules")]);
 
         view.apply(Action::CyclePreset(Turn::Next));
-        assert_eq!(view.preset(), Some(Preset::All));
-        assert_eq!(view.filter(), None, "`all` did not mean all");
+        assert_eq!(
+            seen(&view),
+            [
+                PathBuf::from("/scan/nx/node_modules"),
+                PathBuf::from("/scan/nx/out"),
+            ],
+            "all-ignored dropped the kind narrowing instead of carrying it"
+        );
+
+        view.apply(Action::CyclePreset(Turn::Next));
+        assert_eq!(view.total().claims, 5);
+    }
+
+    #[test]
+    fn no_preset_touches_the_pattern() {
+        // The pattern narrows whatever the axes leave, so it is orthogonal to both — and a
+        // preset that quietly dropped it would be using an unrelated piece of state to mean
+        // something about the view. An earlier pass did exactly that to tell two presets apart.
+        let mut view = mixed();
+        filter(&mut view, "nx");
+        for _ in 0..=Preset::ALL.len() {
+            view.apply(Action::CyclePreset(Turn::Next));
+            assert_eq!(view.filter(), Some("nx"), "{:?}", view.preset());
+        }
     }
 
     #[test]
@@ -3337,7 +3356,7 @@ mod tests {
         // The orthogonality rule does not get to be true only for the presets. An axis key is a
         // change to what is *visible*, so it must be as inert on the marks as `f` is.
         let mut view = mixed();
-        showing(&mut view, Preset::AllIgnored);
+        showing(&mut view, Preset::All);
         point_at(&mut view, "/scan");
         view.apply(Action::Mark);
         let whole = batched(&view);
@@ -3373,15 +3392,13 @@ mod tests {
         assert_eq!(view.preset(), Some(Preset::Dependencies));
         assert_eq!(view.view_label(), "dependencies");
 
-        // …except where two presets share a point, which is a coin toss rather than a name.
+        // …and one that lands nowhere near a preset says the axes instead, because that is the
+        // only description a nameless view has.
+        view.apply(Action::ToggleKind(Kind::Dependencies));
         view.apply(Action::ToggleKind(Kind::Build));
-        view.apply(Action::ToggleKind(Kind::Cache));
         view.apply(Action::CycleTiers);
         assert_eq!(view.preset(), None);
-        assert_eq!(
-            view.view_label(),
-            "named + gitignored · dependencies + build + cache"
-        );
+        assert_eq!(view.view_label(), "named + gitignored · build");
     }
 
     #[test]
@@ -3390,7 +3407,7 @@ mod tests {
         let mut view = mixed();
         // Marked through the widest view, so what follows is the whole scan being narrowed
         // around a selection rather than a selection that was never that big.
-        showing(&mut view, Preset::AllIgnored);
+        showing(&mut view, Preset::All);
         point_at(&mut view, "/scan");
         view.apply(Action::Mark);
         let whole = batched(&view);
@@ -3582,7 +3599,7 @@ mod tests {
         // Deleting acts on everything that is marked, so the number a reader checks has to
         // describe the same set. What narrowing the view changes is the count beside it.
         let mut view = mixed();
-        showing(&mut view, Preset::AllIgnored);
+        showing(&mut view, Preset::All);
         point_at(&mut view, "/scan");
         view.apply(Action::Mark);
         assert_eq!(view.marked().claims, 5);
@@ -3602,7 +3619,7 @@ mod tests {
     #[test]
     fn the_confirmation_lists_the_whole_batch_and_names_what_is_out_of_sight() {
         let mut view = mixed();
-        showing(&mut view, Preset::AllIgnored);
+        showing(&mut view, Preset::All);
         point_at(&mut view, "/scan");
         view.apply(Action::Mark);
         showing(&mut view, Preset::Dependencies);
@@ -3642,7 +3659,7 @@ mod tests {
         // The answer to a surprise has to be better than "cancel and start again" — especially
         // when the surprising row is one the current view is not even showing.
         let mut view = mixed();
-        showing(&mut view, Preset::AllIgnored);
+        showing(&mut view, Preset::All);
         point_at(&mut view, "/scan");
         view.apply(Action::Mark);
         showing(&mut view, Preset::Dependencies);

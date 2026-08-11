@@ -76,18 +76,19 @@ one.
   afterwards, because a mark is a statement about a subtree rather than about the rows that
   happened to exist when you pressed the key.
 - `f` walks four views: **default** (what a rule could put a name to), **dependencies**,
-  **all-ignored** (the gitignore fallback alongside them) and **all**. Underneath they are two
-  independent axes — which *tier*, and which *kind* — and each has a key of its own: `t` moves the
-  tier axis, and `d`, `b` and `c` toggle dependencies, build output and caches. So a combination
-  nobody anticipated is still one a reader can ask for: "every cache a rule named" is `d` then `b`
-  from the default view, and no preset has to exist for it.
+  **all-ignored** (dependencies *plus* the gitignore fallback) and **all**. Underneath they are two
+  independent axes — which *tier*, and which *kind* — and each step of the cycle moves exactly one
+  of them, carrying the other forward. Each axis also has a key of its own: `t` moves the tier
+  axis, and `d`, `b` and `c` toggle dependencies, build output and caches. So a combination nobody
+  anticipated is still one a reader can ask for: "every cache a rule named" is `d` then `b` from
+  the default view, and no preset has to exist for it.
 
   `default` narrows — it leaves out the gitignored tier — so the header says how many claims that
   is, beside the number it qualifies. A filter that is on without saying what it dropped is the
   same failure as one that silently keeps something back.
 - **Changing the view never changes what is selected**, by any of those keys. Hiding a row is not
   unselecting it, and a mark keeps meaning the view it was made through: mark a directory under
-  `dependencies`, widen to `all-ignored`, and the build artefacts beside them are still unmarked.
+  `dependencies`, widen to `all`, and the build artefacts beside them are still unmarked.
   The box on a partly-marked ancestor is filled against *the view you are looking through*, so what
   it says is a statement about this screen rather than a global fact contradicting the rows
   underneath it.

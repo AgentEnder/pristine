@@ -15,14 +15,20 @@
 //! and never becomes expressible without a fifth mode. Modelled as two axes it already is, and
 //! the presets are a convenience over the top rather than the vocabulary itself.
 //!
+//! # The presets are a path through the lattice, one axis per step
+//!
+//! `f`/`F` walk `default → dependencies → all-ignored → all`, and each step moves exactly one
+//! axis while carrying the other forward — so `all-ignored` is "what I am looking at, **plus**
+//! the gitignored tier" rather than a jump back to everything. That is what makes four names
+//! four distinct views. See [`Preset`] for the table.
+//!
 //! # Expressible has to mean expressible BY A READER
 //!
 //! Two axes inside a struct that no key can move is a model with a claim it cannot cash. So the
-//! presets are shortcuts and the axes have keys of their own: `f`/`F` walk
-//! `default → dependencies → all-ignored → all`, `t` moves the tier axis on its own, and one
-//! key per [`Kind`] toggles that member of the other. Every combination of the two is reachable
-//! — "every cache a rule named" is `f` to default, then `d` and `b` — and none of them had to be
-//! anticipated as a mode.
+//! presets are shortcuts and the axes have keys of their own: `t` moves the tier axis on its
+//! own, and one key per [`Kind`] toggles that member of the other. Every combination of the two
+//! is reachable — "every cache a rule named" is `f` to default, then `d` and `b` — and none of
+//! them had to be anticipated as a mode.
 //!
 //! # `default` narrows, so the header says what it left out
 //!
@@ -232,17 +238,27 @@ impl Kinds {
 
 /// A named point on the two axes, which is what one key cycles through.
 ///
-/// # The four asked for, in the order they were asked for
+/// # The cycle is a path through the lattice, one axis at a time
 ///
-/// `default → dependencies → all-ignored → all`, with the tier axis reading exactly as the
-/// request states it: tier one, *versus also* tier two.
+/// `default → dependencies → all-ignored → all`, and **each step moves exactly one axis while
+/// retaining the other**:
 ///
-/// [`AllIgnored`](Self::AllIgnored) and [`All`](Self::All) therefore sit on the **same point**
-/// on the two axes, and that is a property of the asked-for set rather than of this encoding —
-/// once the axes are apart, "also show the gitignored tier" and "show everything" are the same
-/// sentence. They are kept as two steps because the cycle was specified with four, and `all` is
-/// given the one thing its name additionally claims: it drops the `/` pattern as well, so it is
-/// the honest "show me everything" reset rather than a relabelling of the step before it.
+/// | | tier | kind |
+/// |---|---|---|
+/// | `default` | named | every kind |
+/// | `dependencies` | named | dependencies ← *kind narrows* |
+/// | `all-ignored` | named + gitignored ← *tier widens* | dependencies |
+/// | `all` | named + gitignored | every kind ← *kind widens* |
+///
+/// That is what makes them four distinct views rather than three wearing four names, and it is
+/// what the asked-for order is *for*: read as a path, `all-ignored` is "the view I am on, plus
+/// the gitignored tier", which is precisely the sentence the tier axis makes available.
+///
+/// An earlier pass mapped `all-ignored` and `all` to one point and told them apart by having
+/// `all` clear the `/` pattern. Adversarial review rejected that and was right twice over: it
+/// left a step of the cycle doing nothing to the axes, and it reached for the pattern — which is
+/// **orthogonal to both axes** — to manufacture a difference. The pattern is never touched by a
+/// preset now.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Preset {
     /// What a rule could put a name to: tier one, every kind. Where a run starts.
@@ -252,12 +268,13 @@ pub enum Preset {
     /// failure the age floor was already resolved against.
     #[default]
     Default,
-    /// Installed third-party code, and only that: npkill's `vendor`. One axis narrowed, the
-    /// other left exactly as `default` had it.
+    /// Installed third-party code, and only that: npkill's `vendor`. The kind axis narrowed,
+    /// the tier axis exactly as `default` had it.
     Dependencies,
-    /// Tier one **and also** tier two — the gitignore fallback alongside what rules named.
+    /// The step before it, **and also** the gitignore fallback: the tier axis widened, the kind
+    /// narrowing retained.
     AllIgnored,
-    /// Everything, full stop: both tiers, every kind, and no pattern.
+    /// Everything the scan found: both tiers, every kind.
     All,
 }
 
@@ -290,13 +307,6 @@ impl Preset {
         Self::ALL[(at + by) % Self::ALL.len()]
     }
 
-    /// Whether this preset also clears the `/` pattern. Only [`All`](Self::All) does, because
-    /// only `all` claims to be everything.
-    #[must_use]
-    pub fn clears_pattern(self) -> bool {
-        matches!(self, Self::All)
-    }
-
     /// What the footer calls this view.
     #[must_use]
     pub fn label(self) -> &'static str {
@@ -316,20 +326,22 @@ impl Preset {
         match self {
             Self::Default => "only what a rule named — the gitignored tier is hidden",
             Self::Dependencies => "only installed dependencies a rule named",
-            Self::AllIgnored => "what rules named and the gitignored tier beside it",
-            Self::All => "everything the scan found, with no pattern",
+            Self::AllIgnored => "installed dependencies, and the gitignored tier beside them",
+            Self::All => "everything the scan found",
         }
     }
 
     /// Where this preset sits on the two axes.
+    ///
+    /// One axis moves per step and the other is retained — see the type's own docs for the
+    /// table, and note that no preset touches the `/` pattern.
     #[must_use]
     pub fn axes(self) -> (Tiers, Kinds) {
         match self {
             Self::Default => (Tiers::named(), Kinds::all()),
             Self::Dependencies => (Tiers::named(), Kinds::only(Kind::Dependencies)),
-            // The same point, deliberately: see the type's own docs. `all` differs by dropping
-            // the pattern, which is a property of the *step* rather than of the axes.
-            Self::AllIgnored | Self::All => (Tiers::both(), Kinds::all()),
+            Self::AllIgnored => (Tiers::both(), Kinds::only(Kind::Dependencies)),
+            Self::All => (Tiers::both(), Kinds::all()),
         }
     }
 }
@@ -429,10 +441,13 @@ impl Lens {
 
     /// Which preset this lens sits on, if it sits on one.
     ///
-    /// **Ambiguous by construction and that is honest**: `all-ignored` and `all` are one point
-    /// on the axes, so this answers with the first of them. What the footer prints is the
-    /// preset the reader last *asked for*, which [`super::state::View`] remembers, because two
-    /// names for one view is a fact about the asked-for cycle rather than about a lens.
+    /// Unambiguous, because the four presets occupy four distinct points — which is what the
+    /// footer needs in order to name a view honestly, and it is why nothing has to remember
+    /// which step of the cycle the reader took to get here. A lens the axis keys built lands
+    /// off all four and says so.
+    ///
+    /// The pattern is deliberately not consulted: it narrows *whatever the axes left*, so
+    /// `dependencies` with a pattern over it is still `dependencies`.
     #[must_use]
     pub fn preset(&self) -> Option<Preset> {
         Preset::ALL
@@ -518,8 +533,6 @@ mod tests {
 
     #[test]
     fn the_presets_are_the_four_that_were_asked_for_in_the_order_they_were_asked_for() {
-        // `default → dependencies → all-ignored → all`, and the tier axis reads exactly as the
-        // request states it: tier one, versus ALSO tier two.
         assert_eq!(
             Preset::ALL.map(Preset::label),
             ["default", "dependencies", "all-ignored", "all"]
@@ -537,23 +550,60 @@ mod tests {
 
         // default: everything a rule could put a name to, and not the fallback tier.
         assert_eq!(shows(Preset::Default), [true, true, true, false]);
-        // dependencies: one axis narrowed, the other exactly as `default` had it.
+        // dependencies: the kind axis narrowed, the tier axis as default had it.
         assert_eq!(shows(Preset::Dependencies), [true, false, false, false]);
-        // all-ignored: the fallback tier ALONGSIDE what rules named, never instead of it.
-        assert_eq!(shows(Preset::AllIgnored), [true, true, true, true]);
+        // all-ignored: the tier axis widened, and the kind narrowing RETAINED — the fallback
+        // tier alongside what the previous step was showing rather than instead of it.
+        assert_eq!(shows(Preset::AllIgnored), [true, false, false, true]);
+        // all: the kind axis widened too, which is everything.
         assert_eq!(shows(Preset::All), [true, true, true, true]);
     }
 
     #[test]
-    fn all_ignored_and_all_are_one_view_and_all_is_the_one_that_resets() {
-        // The asked-for set has four names for three points on the axes — separating the axes
-        // is what shows that. They are kept as two steps because the cycle was specified with
-        // four, and `all` is given the one thing its name additionally claims: no pattern.
-        assert_eq!(Preset::AllIgnored.axes(), Preset::All.axes());
-        assert!(!Preset::AllIgnored.clears_pattern());
-        assert!(Preset::All.clears_pattern());
-        for preset in [Preset::Default, Preset::Dependencies] {
-            assert!(!preset.clears_pattern(), "{preset}");
+    fn the_four_presets_are_four_distinct_points_on_the_two_axes() {
+        // Four names for three points would leave a step of the cycle doing nothing, and an
+        // earlier pass had exactly that — told apart by clearing the `/` pattern, which is
+        // orthogonal to both axes and so cannot carry a difference between two views.
+        for (nth, preset) in Preset::ALL.into_iter().enumerate() {
+            for other in Preset::ALL.into_iter().skip(nth + 1) {
+                assert_ne!(preset.axes(), other.axes(), "{preset} and {other}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_step_of_the_cycle_moves_exactly_one_axis() {
+        // What makes the asked-for order a *path* rather than four unrelated points: each key
+        // press is one sentence about one axis, and the other is carried forward. That is what
+        // lets `all-ignored` mean "what I am looking at, plus the gitignored tier".
+        let mut at = Preset::Default;
+        for _ in 1..Preset::ALL.len() {
+            let next = at.next();
+            let (tiers, kinds) = at.axes();
+            let (moved_tiers, moved_kinds) = next.axes();
+            assert_ne!(
+                (tiers == moved_tiers, kinds == moved_kinds),
+                (true, true),
+                "{at} → {next} moved nothing"
+            );
+            assert!(
+                (tiers == moved_tiers) || (kinds == moved_kinds),
+                "{at} → {next} moved both axes at once"
+            );
+            at = next;
+        }
+    }
+
+    #[test]
+    fn a_preset_never_touches_the_pattern() {
+        // The pattern narrows whatever the axes leave, so it is orthogonal to both of them and
+        // no preset gets to mean anything by it. `dependencies` with a pattern over it is still
+        // `dependencies`.
+        let pattern = Regex::new("nx").expect("a literal pattern compiles");
+        for preset in Preset::ALL {
+            let lens = Lens::showing(preset).matching(Some(pattern.clone()));
+            assert_eq!(lens.pattern(), Some("nx"), "{preset}");
+            assert_eq!(lens.preset(), Some(preset), "{preset}");
         }
     }
 
@@ -647,7 +697,7 @@ mod tests {
 
     #[test]
     fn a_pattern_narrows_whatever_the_axes_left() {
-        let lens = Lens::showing(Preset::AllIgnored)
+        let lens = Lens::showing(Preset::All)
             .matching(Some(Regex::new("nx").expect("a literal pattern compiles")));
         assert!(lens.matches(&gitignored("/scan/nx/dist")));
         assert!(!lens.matches(&gitignored("/scan/pua/dist")));
