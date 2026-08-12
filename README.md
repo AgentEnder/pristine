@@ -123,9 +123,12 @@ one.
   proportional to what it is worth. `m` turns it off. It answers "where are the bytes" in one
   glance, and it is honest about what nobody has measured yet: unpriced claims are never drawn as
   small rectangles among priced ones — they get a hatched region of their own, counted in
-  directories rather than in bytes, which shrinks as the prices land. Anywhere else there is
-  simply no pane: nothing probes the terminal, nothing is sent to one that might not decode it,
-  and the tree alone is the whole interface.
+  directories rather than in bytes, which shrinks as the prices land. It also needs the terminal
+  to say how big one cell is in pixels, which **tmux and screen do not pass on** — so inside a
+  multiplexer there is no map however capable the terminal outside it is, and `m` says so rather
+  than doing nothing. Anywhere else there is simply no pane: nothing probes the terminal, nothing
+  is sent to one that might not decode it, no image is ever sized from a guess, and the tree
+  alone is the whole interface.
 - A long sweep stays readable from outside the terminal: the window title carries the live figure
   (`pristine — pricing 41%`, `pristine — freed 41.2 GiB`), the dock or taskbar carries a real
   progress bar, and a run that took long enough raises one notification if you have looked away.
