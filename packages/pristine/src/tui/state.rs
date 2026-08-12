@@ -71,6 +71,7 @@ use regex::Regex;
 use super::keymap::{Action, Motion, Overlay, Turn};
 use super::lens::{Lens, Preset};
 use super::moving::Moving;
+use super::treemap::Maps;
 use crate::delete::{Plan, Refused, Target};
 use crate::rules::Kind;
 use crate::size::{Size, human};
@@ -1014,12 +1015,13 @@ pub struct View {
 
 /// Whether the map pane is possible, and whether it is on.
 ///
-/// Two booleans rather than one, because the answer to `m` differs: a reader on a terminal
-/// that cannot draw one has to be *told* that, where a silent no-op on a documented key is
-/// the same failure shape as a mark box that cannot be pressed.
+/// The first is [`Maps`] rather than a boolean, because the answer to `m` differs by *why*: a
+/// reader on a terminal that cannot draw one has to be told which of the two reasons it is,
+/// where a silent no-op on a documented key is the same failure shape as a mark box that
+/// cannot be pressed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Map {
-    possible: bool,
+    possible: Maps,
     on: bool,
 }
 
@@ -1066,7 +1068,7 @@ impl View {
             // On wherever it is possible, which is the spike's own bet: a feature nobody
             // turns on is a feature nobody judges.
             map: Map {
-                possible: false,
+                possible: Maps::Unread,
                 on: true,
             },
         };
@@ -1554,8 +1556,27 @@ impl View {
         self.moving.is_moving()
     }
 
-    /// Whether this terminal can draw a map at all. Told once, at start-up.
-    pub fn allow_maps(&mut self, possible: bool) {
+    /// Whether this terminal can draw a map, and if not, why. Told **every frame**.
+    ///
+    /// Not once at start-up, which is what #656 was: half the answer is the pixel size in the
+    /// window, and a window can gain or lose that without the terminal changing — a tmux
+    /// client attaching, a pane moving to a display the terminal measures differently. So the
+    /// layout reads a fact that is re-taken as often as it is used.
+    ///
+    /// Which makes the early return load-bearing rather than tidy: this runs ten times a
+    /// second, and marking the view stale each time would re-fold every stamp in the tree to
+    /// learn that nothing had changed.
+    pub fn allow_maps(&mut self, possible: Maps) {
+        if self.map.possible == possible {
+            return;
+        }
+        // A map that was on the screen and cannot be now is worth one line. The reader did not
+        // ask for the columns back and nothing else on the frame explains where the picture
+        // went — which is the same courtesy `m` gives, in the one other place the answer can
+        // change out from under somebody.
+        if let (true, Some(why)) = (self.maps(), possible.why()) {
+            self.says(why);
+        }
         self.map.possible = possible;
         // Stale because the answer decides whether [`View::map_stamp`] has a table behind it,
         // and this is told to the view *after* it opened: without it the first frames of a run
@@ -1567,7 +1588,7 @@ impl View {
     /// Whether the map pane is on the screen.
     #[must_use]
     pub fn maps(&self) -> bool {
-        self.map.possible && self.map.on
+        self.map.possible.can() && self.map.on
     }
 
     /// How many rows the tree pane can draw. Set by the renderer, used by the page keys.
@@ -2143,9 +2164,11 @@ impl View {
     ///
     /// A terminal that cannot draw one is told so rather than left pressing a documented key
     /// that does nothing — the same rule as a mark box that is drawn and cannot be pressed.
+    /// **Which** reason matters: "no pixel size" is usually a multiplexer in the way and is
+    /// something the reader can do something about, where "not on the allowlist" is not.
     fn toggle_map(&mut self) {
-        if !self.map.possible {
-            self.says("this terminal does not read the graphics protocol, so there is no map");
+        if let Some(why) = self.map.possible.why() {
+            self.says(why);
             return;
         }
         self.map.on = !self.map.on;
@@ -3062,7 +3085,7 @@ pub fn plural(count: usize, one: &str, many: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Action, Answer, Effect, Mark, Motion, Notice, Overlay, Planned, Preset, Turn, View,
+        Action, Answer, Effect, Maps, Mark, Motion, Notice, Overlay, Planned, Preset, Turn, View,
     };
     use crate::delete::{Refusal, Refused};
     use crate::fixture::{gitignored, gitignored_file, hit, of_kind};
@@ -4381,6 +4404,84 @@ mod tests {
         assert_eq!(view.marked().claims, 0);
         // The bottom rung does nothing at all. `q` is the way out, and it is on the help page.
         assert_eq!(view.apply(Action::Back), Effect::None);
+    }
+
+    // ---- the map pane, and the two reasons there is not one ----------------------------
+
+    #[test]
+    fn m_on_a_terminal_that_reports_no_pixel_size_says_that_rather_than_blaming_the_protocol() {
+        // #656. Both refusals were one boolean, so the only sentence the key had was the
+        // protocol one — which is the wrong sentence inside tmux, where the terminal outside
+        // reads the protocol perfectly well and the thing in the way is the multiplexer.
+        let mut multiplexed = view();
+        multiplexed.allow_maps(Maps::Unmeasured);
+        multiplexed.apply(Action::ToggleMap);
+        let said = multiplexed.notice().unwrap();
+        assert!(said.contains("pixel size"), "{said}");
+        assert!(
+            !multiplexed.maps(),
+            "a map was turned on that cannot be drawn"
+        );
+
+        // And the other terminal still gets the other sentence.
+        let mut plain = view();
+        plain.allow_maps(Maps::Unread);
+        plain.apply(Action::ToggleMap);
+        assert_eq!(
+            plain.notice(),
+            Some("this terminal does not read the graphics protocol, so there is no map")
+        );
+    }
+
+    #[test]
+    fn a_window_that_loses_its_pixel_size_gives_the_columns_back_and_says_why() {
+        // A tmux client attaching to a session mid-run, or a window moving to a display the
+        // terminal measures differently. The answer is not a start-up constant, so the pane
+        // has to be able to go — and going without a word is the empty rectangle again, one
+        // frame later.
+        let mut view = view();
+        view.allow_maps(Maps::Can);
+        assert!(view.maps());
+
+        view.allow_maps(Maps::Unmeasured);
+        assert!(!view.maps(), "the tree is still paying for the pane");
+        assert!(view.notice().unwrap().contains("pixel size"));
+
+        // …and it comes back on its own when the window can be measured again, without the
+        // reader having to press anything: `m` is theirs, and this is not.
+        view.apply(Action::Back);
+        view.allow_maps(Maps::Can);
+        assert!(view.maps());
+        assert_eq!(
+            view.notice(),
+            None,
+            "it announced a map that is simply back"
+        );
+    }
+
+    #[test]
+    fn being_told_the_same_answer_again_is_not_news() {
+        // Told ten times a second, so saying it twice is a footer that says nothing else for
+        // the rest of the run — and marking the view stale each time is the whole tree's
+        // stamps re-folded to learn that nothing changed.
+        let mut view = view();
+        view.allow_maps(Maps::Unmeasured);
+        view.apply(Action::Back);
+        assert_eq!(view.notice(), None);
+
+        for _ in 0..10 {
+            view.allow_maps(Maps::Unmeasured);
+        }
+        assert_eq!(view.notice(), None, "it said it again");
+    }
+
+    #[test]
+    fn a_terminal_that_never_could_draw_one_says_nothing_at_start_up() {
+        // The edge and not the state: a run that opens inside tmux has lost nothing, and a
+        // footer that opens by naming a feature the reader never asked about is noise.
+        let mut view = view();
+        view.allow_maps(Maps::Unmeasured);
+        assert_eq!(view.notice(), None);
     }
 
     // ---- what the footer says, and how it stops saying it ------------------------------
@@ -5750,6 +5851,7 @@ mod scale {
     use crate::tree::{Order, Tree};
     use crate::tui::keymap::{Action, Motion, Turn};
     use crate::tui::state::View;
+    use crate::tui::treemap::Maps;
     use std::time::Instant;
 
     /// A tree shaped like the home directory the spike measured.
@@ -5894,7 +5996,7 @@ mod scale {
         // It buys the map the right to ask "has anything I draw changed" for nothing, on a
         // frame where the answer is usually no — see [`super::super::treemap`]. Off by default
         // and computed only when there is a pane, because most terminals never draw one.
-        view.allow_maps(true);
+        view.allow_maps(Maps::Can);
         let started = Instant::now();
         for tick in 601..=700u32 {
             view.found(priced(&format!("/home/repos/map{tick}/node_modules"), 1));

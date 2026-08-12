@@ -1327,6 +1327,7 @@ fn zone_at(at: Columns, depth: usize, x: u16) -> Zone {
 
 #[cfg(test)]
 mod tests {
+    use super::treemap::Maps;
     use super::{INDENT, MARKER, Placed, Spot, Zone, draw, hit as press_on};
     use crate::delete::{Refusal, Refused};
     use crate::fixture::{hit, priced};
@@ -1895,7 +1896,7 @@ mod tests {
         assert_eq!(plain.map, None);
         assert_eq!(plain.rows.width, 140);
 
-        view.allow_maps(true);
+        view.allow_maps(Maps::Can);
         let (frame, placed) = frame_of(&mut view, 140, 20);
         let map = placed.map.unwrap();
         assert!(map.width >= 32, "{map:?}");
@@ -1916,9 +1917,22 @@ mod tests {
     }
 
     #[test]
+    fn a_terminal_that_will_not_say_how_big_a_cell_is_reserves_no_pane_for_the_picture() {
+        // #656, where the layout meets it. A terminal on the allowlist inside tmux answers
+        // the window size with zero pixels, and the pane used to be reserved anyway because
+        // the layout was reading the allowlist alone — the pixel size was not asked until the
+        // image was about to be written, by which point the columns were already gone.
+        let mut view = view();
+        view.allow_maps(Maps::Unmeasured);
+        let (_, placed) = frame_of(&mut view, 140, 20);
+        assert_eq!(placed.map, None);
+        assert_eq!(placed.rows.width, 140, "the tree paid for an empty pane");
+    }
+
+    #[test]
     fn a_terminal_with_no_room_for_a_map_is_all_tree() {
         let mut view = view();
-        view.allow_maps(true);
+        view.allow_maps(Maps::Can);
         // Too narrow: the map costs the tree the columns it takes, and the tree is the
         // interface.
         assert_eq!(frame_of(&mut view, 99, 30).1.map, None);

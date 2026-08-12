@@ -95,7 +95,7 @@ use chrome::{Chrome, Decor, Status};
 use keymap::{Action, Gesture, Motion, action_for, finish};
 use render::{Placed, Spot};
 use state::{Effect, Notice, View, plural};
-use treemap::{Pane, Screen};
+use treemap::{Drawn, Maps, Pane, Screen};
 
 /// How long the loop waits on the terminal before repainting anyway.
 ///
@@ -515,10 +515,6 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
     if options.ignored_files {
         view = view.showing_files();
     }
-    // Told once: whether a map is possible at all is a fact about the terminal, and the view
-    // owns the decision that reads it. Same split as `View::viewport`.
-    view.allow_maps(screen.allowed());
-
     let walker = spawn_walk(options, ruleset, post.clone());
     let mut outcome = Outcome::default();
     // Dropped at the end of this function however it ends — the bottom of the loop, a `?`, or
@@ -568,6 +564,18 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
         deleting = view.is_deleting();
         chrome.show(Status::of(&view, outcome.freed))?;
 
+        // Both of the map's gates, in one answer, **before** the layout reads it. #656 was
+        // this asked in two places at two times: the allowlist here and the pixel size after
+        // the draw, so a terminal that passed one and failed the other had columns taken from
+        // its tree with nothing ever drawn in them. The same `cell` goes on to the pane below,
+        // so there is one reading of the window per frame and nothing to disagree with.
+        //
+        // Per frame rather than once, because only half of it is a constant: the allowlist is
+        // a fact about the program at the other end, and the pixel size is a fact about the
+        // window, which a tmux client attaching takes away mid-run.
+        let cell = cell_size(terminal);
+        view.allow_maps(screen.mapping(cell));
+
         chrome.begin_frame()?;
         // The geometry comes back out of the draw rather than being computed beside it, so a
         // press is resolved against the frame the reader is looking at. See [`Placed`].
@@ -579,12 +587,21 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
         // Inside the synchronized update, after the cells and before the frame is closed:
         // the image and the text around it have to land together or the pane tears in a way
         // a full repaint cannot fix, because ratatui will not redraw cells it did not change.
-        let mapped = map(screen, terminal, &view, &placed);
+        let mapped = map(screen, &view, &placed, cell);
         // Ended before the draw's failure is reported, never after: a terminal left inside a
         // synchronized update keeps showing the frame before last, so a `?` here would trade
         // a reported error for a screen that is silently frozen.
         let ended = chrome.end_frame();
-        drawn.and(mapped).and(ended)?;
+        let shown = drawn.and(mapped)?;
+        ended?;
+        // The screen has actually tried to draw, where the layout only asked — so when the two
+        // disagree the screen is believed. It cannot happen from the reading above, and that
+        // is the point: if a later change ever puts the two gates back out of step, the pane
+        // comes off the next frame with a sentence under it, instead of being an empty
+        // rectangle nobody can explain. That silence is the whole of what #656 was.
+        if let Drawn::Cannot(why) = shown {
+            view.allow_maps(why);
+        }
 
         // A quit that was held back while a removal ran, now that it is over. Checked here
         // rather than where the key was pressed, because what the key produced was a promise
@@ -669,38 +686,54 @@ fn drive<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
     Ok(outcome)
 }
 
+/// What one cell of this terminal measures in pixels, or `None` when it will not say.
+///
+/// **A terminal that refuses `TIOCGWINSZ`, or fills its pixel fields with zeros, is not an
+/// error.** The whole feature is an enhancement, so every way it can fail has to end in there
+/// being no picture rather than in a run that stops — which is why this is read with `ok()`
+/// where nearly every other call in this file carries a `?`.
+///
+/// Zeros are `None` and never `Some((0, 0))`, because they are an *absent* measurement rather
+/// than a small one, and the only two things to do with an absent cell size are to say so or
+/// to guess. Guessing draws an image at the wrong scale over the text it is meant to sit
+/// beside, which is the same class of wrong as pricing a directory nobody measured.
+fn cell_size<B: ratatui::backend::Backend<Error = io::Error>>(
+    terminal: &mut Terminal<B>,
+) -> Option<(u16, u16)> {
+    let window = terminal.backend_mut().window_size().ok()?;
+    let (across, down) = (window.columns_rows.width, window.columns_rows.height);
+    if across == 0 || down == 0 {
+        return None;
+    }
+    let cell = (window.pixels.width / across, window.pixels.height / down);
+    (cell.0 > 0 && cell.1 > 0).then_some(cell)
+}
+
 /// Puts the treemap on the frame that has just been drawn, or takes it off.
 ///
 /// Three reasons it comes off, and they are all "the map cannot be right", not "the map is
 /// not wanted": there is no pane on this frame, an overlay is over the place it would go, or
 /// the terminal will not say how big a cell is.
 ///
-/// **A terminal that refuses `TIOCGWINSZ` is not an error.** The whole feature is an
-/// enhancement, so every way it can fail has to end in there being no picture rather than in
-/// a run that stops — which is why the size is read with `ok()` where nearly every other
-/// call in this file carries a `?`.
-fn map<B: ratatui::backend::Backend<Error = io::Error>, W: Write>(
+/// `cell` is the same reading the layout was gated on this frame — see [`cell_size`] — rather
+/// than a second call to the terminal. Two readings are two answers that can differ, and a
+/// pane sized from one while the decision to reserve it was taken on the other is #656 again
+/// in a smaller window.
+fn map<W: Write>(
     screen: &mut Screen<W>,
-    terminal: &mut Terminal<B>,
     view: &View,
     placed: &Placed,
-) -> io::Result<()> {
+    cell: Option<(u16, u16)>,
+) -> io::Result<Drawn> {
     // An overlay is drawn by ratatui *as cells*, and the image sits above them — so a help
     // page over the map would be a help page behind it. The picture goes away instead.
     let Some(cells) = placed.map.filter(|_| view.overlay().is_none()) else {
-        return screen.hide();
+        screen.hide()?;
+        return Ok(Drawn::Nothing);
     };
-    let Some(cell) = terminal
-        .backend_mut()
-        .window_size()
-        .ok()
-        .and_then(|window| {
-            let (across, down) = (window.columns_rows.width, window.columns_rows.height);
-            (across > 0 && down > 0)
-                .then(|| (window.pixels.width / across, window.pixels.height / down))
-        })
-    else {
-        return screen.hide();
+    let Some(cell) = cell else {
+        screen.hide()?;
+        return Ok(Drawn::Cannot(Maps::Unmeasured));
     };
     screen.show(view, Pane { cells, cell }, Instant::now())
 }
@@ -1551,6 +1584,12 @@ mod loop_tests {
     struct Flaky {
         inner: TestBackend,
         broken: Arc<AtomicBool>,
+        /// A terminal that answers `TIOCGWINSZ` with zeros in the pixel fields.
+        ///
+        /// Which is not an exotic terminal: tmux does not forward them, so this is what every
+        /// run inside one sees, however capable the terminal outside it is. It is the whole
+        /// of #656 — the allowlist says yes and the window size says nothing.
+        blind: bool,
     }
 
     impl Backend for Flaky {
@@ -1595,7 +1634,15 @@ mod loop_tests {
         }
 
         fn window_size(&mut self) -> io::Result<WindowSize> {
-            never(self.inner.window_size())
+            let window = never(self.inner.window_size())?;
+            Ok(WindowSize {
+                pixels: if self.blind {
+                    Size::new(0, 0)
+                } else {
+                    window.pixels
+                },
+                ..window
+            })
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -1835,6 +1882,7 @@ mod loop_tests {
         let mut terminal = Terminal::new(Flaky {
             inner: TestBackend::new(100, 24),
             broken: Arc::new(AtomicBool::new(false)),
+            blind: false,
         })
         .unwrap();
         // `↓` and `↑` move a cursor and nothing else, so this run can only ever end on the
@@ -1897,6 +1945,69 @@ mod loop_tests {
     }
 
     #[test]
+    fn a_terminal_that_will_not_say_how_big_a_cell_is_costs_the_tree_no_columns() {
+        // #656, through the real loop. The terminal is on the allowlist *and* answers the
+        // window size with zero pixels, which is what a run inside tmux sees whenever `TERM`
+        // still names the terminal outside it: the allowlist reads Ghostty and says yes, and
+        // tmux forwards no pixel fields at all.
+        //
+        // What went wrong was that the two gates were asked at different times — the
+        // allowlist before the layout, the pixel size at the draw — so the pane was reserved
+        // off the first and then declined by the second, and the reader got columns taken
+        // from the tree with nothing in them and no sentence anywhere saying why.
+        let (tmp, target) = fixture();
+        let mut terminal = Terminal::new(Flaky {
+            inner: TestBackend::new(100, 24),
+            broken: Arc::new(AtomicBool::new(false)),
+            blind: true,
+        })
+        .unwrap();
+        // Wide enough for a map, so nothing but the missing pixel size can be what keeps the
+        // pane off the screen.
+        const { assert!(100 >= crate::tui::treemap::MIN_WIDTH) };
+        let mut idle = Script::new(vec![key(KeyCode::Down), key(KeyCode::Up)])
+            .patience(Duration::from_millis(250));
+        let mut screen = Screen::new(Vec::new(), true);
+
+        drive(
+            &mut terminal,
+            &mut idle,
+            &mut Chrome::new(Vec::new(), Decor::silent()),
+            &mut screen,
+            &Options {
+                root: tmp.path().to_path_buf(),
+                min_size: crate::DEFAULT_MIN_SIZE,
+                size_mode: SizeMode::Skip,
+                one_file_system: true,
+                older_than: None,
+                ignored_files: false,
+            },
+            Arc::new(Ruleset::builtin().unwrap()),
+        )
+        .unwrap();
+        assert!(target.exists(), "the phrase cannot mark, so nothing can go");
+
+        // Not one byte, which was already true — the draw refused the zeros and said nothing.
+        assert!(
+            screen.sink().is_empty(),
+            "an image was sized from a guess at the cell"
+        );
+        // And this is the part that was not. Row 1 is the column heading, drawn across the
+        // tree's own pane on one background — so a map beside it leaves the heading short of
+        // the right edge with the layout's one-column gap between the two, unstyled. An
+        // unbroken run of that background to the last column is the tree having the whole
+        // width, which is the thing #656 took away.
+        let buffer = terminal.backend().inner.buffer().clone();
+        let heading: Vec<_> = (0..buffer.area.width).map(|x| buffer[(x, 1)].bg).collect();
+        assert!(
+            heading
+                .iter()
+                .all(|bg| *bg == ratatui::style::Color::Rgb(24, 24, 30)),
+            "the tree gave up columns for a map that could never be drawn in them: {heading:?}"
+        );
+    }
+
+    #[test]
     fn a_terminal_that_fails_mid_removal_still_waits_for_the_batch() {
         let (tmp, target) = fixture();
         let whole = files_under(&target);
@@ -1917,6 +2028,7 @@ mod loop_tests {
         let mut terminal = Terminal::new(Flaky {
             inner: TestBackend::new(100, 24),
             broken: Arc::clone(&broken),
+            blind: false,
         })
         .unwrap();
         // Mark the scan root, then ask-highlight-confirm, on repeat. The root row exists from
@@ -1979,6 +2091,7 @@ mod loop_tests {
         let mut terminal = Terminal::new(Flaky {
             inner: TestBackend::new(100, 24),
             broken: Arc::new(AtomicBool::new(false)),
+            blind: false,
         })
         .unwrap();
 
@@ -2068,6 +2181,7 @@ mod loop_tests {
         let mut terminal = Terminal::new(Flaky {
             inner: TestBackend::new(100, 24),
             broken: Arc::new(AtomicBool::new(false)),
+            blind: false,
         })
         .unwrap();
         let gone = target.clone();
