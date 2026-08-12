@@ -534,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn the_pixel_size_is_the_same_gate_as_the_allowlist_and_not_a_later_one() {
+    fn both_gates_come_back_as_one_answer_that_names_which_of_them_refused() {
         // #656. The allowlist is a fact about the program at the other end and the pixel size
         // is a fact about its window, and the bug was that only the first reached the layout:
         // inside tmux the outer terminal passes the allowlist while the winsize pixel fields

@@ -1000,8 +1000,8 @@ pub fn size_mode(asked: SizeMode) -> SizeMode {
 #[cfg(test)]
 mod tests {
     use super::{
-        Batch, Chrome, Decor, Message, Options, Outcome, Restore, Screen, SizeMode, drain, reap,
-        spawn_pricer, summarise,
+        Batch, Chrome, Decor, Drawn, Maps, Message, Options, Outcome, Placed, Restore, Screen,
+        SizeMode, drain, map, reap, spawn_pricer, summarise,
     };
     use crate::delete::{Failure, Refusal, Refused, Removal, Removed};
     use crate::fixture::priced;
@@ -1009,11 +1009,44 @@ mod tests {
     use crate::tui::chrome::XTERM_STACK;
     use crate::tui::state::View;
     use crate::walk::{Found, WalkError, WalkOutcome};
+    use ratatui::layout::Rect;
     use std::path::Path;
     use std::sync::mpsc::channel;
 
     fn view() -> View {
         View::new(Tree::new("/scan"))
+    }
+
+    #[test]
+    fn a_pane_with_no_cell_size_to_draw_in_answers_with_the_reason_rather_than_with_nothing() {
+        // The seam `drive`'s reconciliation guards, driven directly. It cannot be reached
+        // through the loop while the gate and the pane are both taken from one reading of the
+        // window — which is the whole of the fix — so this is what keeps the backstop honest:
+        // if a later change ever hands `map` a pane the cell size cannot fill, the answer
+        // names which gate refused instead of being the `Ok(())` that made #656 silent.
+        let mut tree = Tree::new("/scan");
+        tree.insert(priced("/scan/nx/node_modules", 8 * 1024 * 1024));
+        let mut view = View::new(tree);
+        view.allow_maps(Maps::Can);
+        view.sync();
+        let mut screen = Screen::new(Vec::new(), true);
+        let placed = Placed {
+            map: Some(Rect::new(60, 1, 40, 20)),
+            ..Placed::default()
+        };
+
+        assert_eq!(
+            map(&mut screen, &view, &placed, None).unwrap(),
+            Drawn::Cannot(Maps::Unmeasured)
+        );
+        assert!(screen.sink().is_empty(), "an image was sized from a guess");
+
+        // …and the same pane, once the terminal will say how big a cell is, is a picture.
+        assert_eq!(
+            map(&mut screen, &view, &placed, Some((9, 19))).unwrap(),
+            Drawn::Map
+        );
+        assert!(!screen.sink().is_empty());
     }
 
     fn removed(path: &str) -> Removed {
