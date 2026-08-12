@@ -1,4 +1,4 @@
-//! The treemap pane — **a spike**, and its escape hatch is [`Screen::allowed`] being false.
+//! The treemap pane — **a spike**, and its escape hatch is [`Maps`] not being [`Maps::Can`].
 //!
 //! Reclaimable space is spatial, and a treemap answers "where are the bytes" in a way a
 //! sorted list structurally cannot: `~/repos/archived` being two thirds of the picture is one
@@ -14,14 +14,22 @@
 //!    is a documented "do you speak this" query and it is a round trip with no bound on the
 //!    silence, which is exactly the blocking probe the chrome refuses to make.
 //! 2. **The terminal has to report a pixel size.** `TIOCGWINSZ` carries one and costs no
-//!    round trip, so a terminal that fills it in with zeros — which is most of them — gets no
-//!    map rather than a guess at its own cell size.
+//!    round trip, so a terminal that fills it in with zeros — which is most of them, and
+//!    every terminal seen through tmux — gets no map rather than a guess at its own cell
+//!    size.
 //! 3. **The pane has to fit.** Below [`MIN_WIDTH`] columns the map would cost the tree more
 //!    than it is worth, and the tree alone is the complete interface.
 //!
+//! **The first two are one answer, [`Maps`], and that is #656's whole lesson.** They were two
+//! answers taken at two different times — the allowlist before the layout, the pixel size at
+//! the draw — so a terminal that passed one and failed the other cost the tree columns that
+//! nothing was ever drawn in. Both are now folded into the predicate the layout reads, and it
+//! is re-asked every frame, because a window can lose its pixel fields while a run is going.
+//!
 //! Nothing above is a flag the reader has to find. What *is* a key is `m`, which turns the
-//! pane off on a terminal that could have one — because an enhancement you cannot dismiss is
-//! not an enhancement.
+//! pane off on a terminal that could have one — and on a terminal that could not, says which
+//! of the two reasons it is, because an enhancement you cannot dismiss is not an enhancement
+//! and a rectangle that declines without a word is worse than no rectangle.
 //!
 //! # What is expensive, and what is done about it
 //!
@@ -87,6 +95,102 @@ const SHARE: (f32, u16, u16) = (0.36, 32, 56);
 /// asked for, which during a breakdown is all of them.
 const SETTLE: Duration = Duration::from_millis(250);
 
+/// Whether a map can appear in this terminal right now, and when it cannot, why.
+///
+/// **One answer, because there were two and they were asked at different times.** The
+/// allowlist was read before the layout and the pixel size at the draw, so a terminal that
+/// passed the first and failed the second cost the tree its columns and then had nothing drawn
+/// in them. Neither gate was wrong; only one of them was visible to the layout.
+///
+/// The case that separates them is a multiplexer carrying the outer terminal's `TERM` through
+/// — tmux with `default-terminal "xterm-ghostty"`, which is what a workspace manager sets up.
+/// [`super::chrome::Decor`] then reads Ghostty and says yes, and tmux forwards no pixel fields
+/// at all, so the winsize reads zero. A bare `TERM=tmux-256color` never got this far: the
+/// allowlist refuses it, which is [`Maps::Unread`] and a different sentence.
+///
+/// So this is the *only* predicate the layout reads, and it carries the reason with it,
+/// because a bool would take the pane away and leave nobody able to say why it went.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Maps {
+    /// The terminal reads the protocol and says how big its cells are.
+    Can,
+    /// It is not known to read the graphics protocol. The default, because a view nobody has
+    /// told anything to has not been told this either.
+    #[default]
+    Unread,
+    /// It reads the protocol but reports no pixel size.
+    ///
+    /// Named for [`crate::size::Size::Unmeasured`] and for the same reason: there is no
+    /// honest cell size to be had here, and the answer to an absent measurement is to say it
+    /// is absent rather than to assume 8×16 and draw an image at the wrong scale over the
+    /// text it is meant to sit beside.
+    Unmeasured,
+}
+
+impl Maps {
+    /// Both gates in one answer: what the terminal is, and what it has just said about its
+    /// own window. Reached through [`Screen::mapping`], which is the only caller that holds
+    /// both halves.
+    fn of(reads: bool, cell: Option<(u16, u16)>) -> Self {
+        match (reads, cell) {
+            (false, _) => Self::Unread,
+            (true, None) => Self::Unmeasured,
+            (true, Some(_)) => Self::Can,
+        }
+    }
+
+    /// Whether a map can be drawn.
+    #[must_use]
+    pub fn can(self) -> bool {
+        matches!(self, Self::Can)
+    }
+
+    /// The one line for a reader who wanted a map there cannot be, or `None` when there can.
+    ///
+    /// Two sentences and not one, because the two refusals have different answers: a terminal
+    /// off the allowlist is the wrong terminal, where a terminal reporting no pixel size is
+    /// usually the right one with a multiplexer in between — and that is something the reader
+    /// can act on.
+    #[must_use]
+    pub fn why(self) -> Option<&'static str> {
+        match self {
+            Self::Can => None,
+            Self::Unread => {
+                Some("this terminal does not read the graphics protocol, so there is no map")
+            }
+            Self::Unmeasured => Some(
+                "this terminal reports no pixel size — tmux and screen do not pass one on — \
+                 so there is no map",
+            ),
+        }
+    }
+}
+
+/// What a call to [`Screen::show`] left on the terminal.
+///
+/// An answer rather than `Ok(())`, because "there is no picture" and "the picture is already
+/// right" are the same silence otherwise — which is exactly how #656 went unreported for as
+/// long as it did. The caller can see which it got, and say so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Drawn {
+    /// A map is on the terminal: written by this call, or still right from an earlier one.
+    Map,
+    /// None, because there is nothing under the cursor worth dividing into rectangles — an
+    /// empty directory, or one whose whole subtree the lens hides. Not a fault in anything.
+    Nothing,
+    /// None, because this terminal cannot have one — and which of the two reasons it is.
+    ///
+    /// **The layout should never have reserved a pane, and this is how the caller finds out
+    /// that it did.** A run that reaches this has [`Maps`] and the pane it was handed
+    /// disagreeing, which is #656's shape returning; the caller's job is to believe the
+    /// screen, which has actually tried, over the layout, which has only asked.
+    ///
+    /// The reason travels with it rather than being assumed at the other end, because the
+    /// caller assuming would be the wrong sentence under the pane on the terminal where the
+    /// other reason was the true one.
+    Cannot(Maps),
+}
+
 /// The pane the map goes in, in cells and in pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pane {
@@ -140,10 +244,11 @@ pub struct Screen<W: Write> {
     out: W,
     /// Whether this terminal is known to read the protocol at all.
     ///
-    /// The last gate rather than the only one: the view holds the reader's `m` and the
-    /// renderer holds whether there is room, and both of those ask this first. Checked again
-    /// here because it is the one that must never be got wrong — a byte of this written to a
-    /// terminal that cannot decode it is base64 in somebody's scrollback.
+    /// Half of [`Screen::mapping`]'s answer and the last gate rather than the only one: the
+    /// view holds the reader's `m` and the renderer holds whether there is room, and both of
+    /// those ask that first. Checked again in [`Screen::show`] because it is the one that must
+    /// never be got wrong — a byte of this written to a terminal that cannot decode it is
+    /// base64 in somebody's scrollback.
     allowed: bool,
     /// Whether there is an image on the terminal right now.
     up: bool,
@@ -171,26 +276,38 @@ impl<W: Write> Screen<W> {
         }
     }
 
-    /// Whether a map could appear at all in this terminal.
+    /// Whether a map could appear at all, given what the terminal has just said one cell
+    /// measures — `None` when it will not say.
+    ///
+    /// The one predicate, asked here rather than in two places: this is the half of the
+    /// answer only the screen knows, and the cell size is the half only the terminal knows,
+    /// and #656 was those two halves being combined nowhere. Asked **every frame**, because
+    /// only one of them is a constant: a window can lose its pixel fields without the program
+    /// at the other end changing — a tmux client attaching, a pane moving between displays.
     #[must_use]
-    pub fn allowed(&self) -> bool {
-        self.allowed
+    pub fn mapping(&self, cell: Option<(u16, u16)>) -> Maps {
+        Maps::of(self.allowed, cell)
     }
 
     /// Draws the map of whatever the cursor is on, if anything has changed since the last one.
     ///
+    /// Answers what it left on the screen rather than `Ok(())`: see [`Drawn`], and #656 for
+    /// what a silent decline costs.
+    ///
     /// # Errors
     ///
     /// Anything the terminal refuses.
-    pub fn show(&mut self, view: &View, pane: Pane, now: Instant) -> io::Result<()> {
+    pub fn show(&mut self, view: &View, pane: Pane, now: Instant) -> io::Result<Drawn> {
         if !self.allowed {
-            return Ok(());
+            return Ok(Drawn::Cannot(Maps::Unread));
         }
         let Some((width, height)) = pane.pixels() else {
-            return self.hide();
+            self.hide()?;
+            return Ok(Drawn::Cannot(Maps::Unmeasured));
         };
         let Some(root) = tiles::focus(view) else {
-            return self.hide();
+            self.hide()?;
+            return Ok(Drawn::Nothing);
         };
         let area = Area::of(f64::from(width), f64::from(height));
         // Asked on every frame and never throttled, because it is not a redraw: a map of a
@@ -198,7 +315,8 @@ impl<W: Write> Screen<W> {
         // there, and on this tool that is a picture of what was about to be deleted. It is
         // also free — see [`tiles::mappable`].
         if !tiles::mappable(view, root, area) {
-            return self.hide();
+            self.hide()?;
+            return Ok(Drawn::Nothing);
         }
 
         // Two fingerprints, because the two kinds of change have different deadlines. The
@@ -238,15 +356,16 @@ impl<W: Write> Screen<W> {
         // Nothing the map is drawn from has moved, so what is on the terminal is still the
         // right picture — and it is the still frame, which is nearly all of them.
         if self.up && !steered && arriving == self.arriving {
-            return Ok(());
+            return Ok(Drawn::Map);
         }
         if self.up && !steered && !settled {
-            return Ok(());
+            return Ok(Drawn::Map);
         }
 
         // Only now, once something is known to have changed, is the map worth laying out.
         let Some(map) = tiles::plan(view, root, area) else {
-            return self.hide();
+            self.hide()?;
+            return Ok(Drawn::Nothing);
         };
         let canvas = paint::paint(&map, width, height);
         let at = (pane.cells.y + 1, pane.cells.x + 1);
@@ -266,7 +385,7 @@ impl<W: Write> Screen<W> {
         self.steering = steering;
         self.arriving = arriving;
         self.since = Some(now);
-        Ok(())
+        Ok(Drawn::Map)
     }
 
     /// Takes the image down, if one is up.
@@ -332,7 +451,7 @@ fn fingerprint(of: &impl Hash) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{MIN_WIDTH, Pane, SETTLE, Screen, kitty, paint, tiles};
+    use super::{Drawn, MIN_WIDTH, Maps, Pane, SETTLE, Screen, kitty, paint, tiles};
     use crate::fixture::{gitignored, hit, priced};
     use crate::size::Size;
     use crate::tree::Tree;
@@ -355,7 +474,7 @@ mod tests {
         tree.insert(priced("/scan/nx/node_modules", 8 * 1024 * 1024));
         tree.insert(priced("/scan/pua/target", 2 * 1024 * 1024));
         let mut view = View::new(tree);
-        view.allow_maps(true);
+        view.allow_maps(Maps::Can);
         view.sync();
         view
     }
@@ -386,7 +505,9 @@ mod tests {
         screen.restore().unwrap();
 
         assert_eq!(written(&screen), "", "an escape reached a terminal");
-        assert!(!screen.allowed());
+        // …and a pixel size it *does* report changes nothing: the allowlist is the gate this
+        // one fails, and the answer names which.
+        assert_eq!(screen.mapping(Some((9, 19))), Maps::Unread);
     }
 
     #[test]
@@ -395,7 +516,7 @@ mod tests {
         // from a guess at the cell size is one that does not line up with the text beside it.
         let mut screen = screen();
         let view = view();
-        screen
+        let drawn = screen
             .show(
                 &view,
                 Pane {
@@ -406,6 +527,59 @@ mod tests {
             )
             .unwrap();
         assert_eq!(written(&screen), "");
+        // #656's second half: the caller is told it drew nothing. This returning `Ok(())` was
+        // indistinguishable from the still frame below, which is why a pane that never got a
+        // picture looked exactly like one that did not need a new one.
+        assert_eq!(drawn, Drawn::Cannot(Maps::Unmeasured));
+    }
+
+    #[test]
+    fn both_gates_come_back_as_one_answer_that_names_which_of_them_refused() {
+        // #656. The allowlist is a fact about the program at the other end and the pixel size
+        // is a fact about its window, and the bug was that only the first reached the layout:
+        // inside tmux the outer terminal passes the allowlist while the winsize pixel fields
+        // are zero, so the tree paid 36 columns for a picture the draw then refused to make.
+        //
+        // One predicate now answers both, and it says *which* — because taking the pane away
+        // silently is the same failure in the other direction.
+        let screen = screen();
+        assert_eq!(screen.mapping(Some((9, 19))), Maps::Can);
+        assert_eq!(screen.mapping(None), Maps::Unmeasured);
+        assert!(Maps::Can.can());
+        assert!(!Maps::Unmeasured.can() && !Maps::Unread.can());
+
+        // Two reasons and two sentences: a reader inside tmux has something to act on, and a
+        // reader on a terminal that will never read the protocol does not.
+        let unmeasured = Maps::Unmeasured.why().unwrap();
+        assert!(unmeasured.contains("pixel size"), "{unmeasured}");
+        assert_ne!(unmeasured, Maps::Unread.why().unwrap());
+        assert_eq!(Maps::Can.why(), None);
+        // A view nobody has told anything to has not been told this either.
+        assert_eq!(Maps::default(), Maps::Unread);
+    }
+
+    #[test]
+    fn a_still_frame_says_the_map_is_up_rather_than_saying_nothing_at_all() {
+        // The distinction [`Drawn`] exists for. Both of these wrote no bytes, and until they
+        // answered they were the same `Ok(())`: one is the picture already being right, the
+        // other is there being no picture at all.
+        let mut screen = screen();
+        let view = view();
+        let now = Instant::now();
+        assert_eq!(screen.show(&view, pane(), now).unwrap(), Drawn::Map);
+        let first = screen.sink().len();
+        assert_eq!(screen.show(&view, pane(), now).unwrap(), Drawn::Map);
+        assert_eq!(
+            screen.sink().len(),
+            first,
+            "the map was redrawn for nothing"
+        );
+
+        // And the third answer, which is neither: the terminal could draw one and the tree has
+        // nothing to divide into rectangles. Not a fault in anything, so the caller must not
+        // read it as the pane declining.
+        let empty = View::new(Tree::new("/scan"));
+        assert_eq!(screen.show(&empty, pane(), now).unwrap(), Drawn::Nothing);
     }
 
     #[test]
@@ -447,7 +621,7 @@ mod tests {
         tree.insert(priced("/scan/nx/node_modules", 8 * 1024 * 1024));
         tree.insert(hit("/scan/pua/target", Size::Unmeasured, 0));
         let mut view = View::new(tree);
-        view.allow_maps(true);
+        view.allow_maps(Maps::Can);
         view.sync();
         let mut screen = screen();
         let now = Instant::now();
@@ -479,7 +653,7 @@ mod tests {
         let mut tree = Tree::new("/scan");
         tree.insert(priced("/scan/only/node_modules", 8 * 1024 * 1024));
         let mut view = View::new(tree);
-        view.allow_maps(true);
+        view.allow_maps(Maps::Can);
         view.sync();
         let mut screen = screen();
         let now = Instant::now();
@@ -517,7 +691,7 @@ mod tests {
         tree.insert(priced("/scan/here/two/node_modules", 2 * 1024 * 1024));
         tree.insert(priced("/scan/there/target", 1024));
         let mut view = View::new(tree);
-        view.allow_maps(true);
+        view.allow_maps(Maps::Can);
         view.sync();
         view.apply(Action::Cursor(Motion::Down));
         let here = view
@@ -602,7 +776,7 @@ mod tests {
         tree.insert(priced("/scan/here/one/node_modules", 4 * 1024 * 1024));
         tree.insert(priced("/scan/here/two/node_modules", 2 * 1024 * 1024));
         let mut view = View::new(tree);
-        view.allow_maps(true);
+        view.allow_maps(Maps::Can);
         view.sync();
         view.apply(Action::Cursor(Motion::Down));
         let here = view
@@ -654,7 +828,7 @@ mod tests {
         tree.insert(priced("/scan/a/node_modules", 8 * 1024 * 1024));
         tree.insert(priced("/scan/b/target", 2 * 1024 * 1024));
         let mut view = View::new(tree);
-        view.allow_maps(true);
+        view.allow_maps(Maps::Can);
         view.sync();
         let mut screen = screen();
         let now = Instant::now();
@@ -680,7 +854,7 @@ mod tests {
         tree.insert(hit("/scan/going/node_modules", Size::Unmeasured, 0));
         tree.insert(hit("/scan/staying/target", Size::Unmeasured, 0));
         let mut view = View::new(tree);
-        view.allow_maps(true);
+        view.allow_maps(Maps::Can);
         view.sync();
         let mut screen = screen();
         let now = Instant::now();
@@ -861,12 +1035,12 @@ mod tests {
             ));
         }
         let mut view = View::new(tree);
-        view.allow_maps(true);
+        view.allow_maps(Maps::Can);
         view.sync();
         view.viewport(50);
         // As a run that draws one has it, so the still frame below is measured against the
         // lens-aware stamp rather than the fallback. See [`View::map_stamp`].
-        view.allow_maps(true);
+        view.allow_maps(Maps::Can);
         view.sync();
         println!("claims: {}", view.total().claims);
 
