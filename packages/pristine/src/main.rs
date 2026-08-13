@@ -956,7 +956,11 @@ fn report_fallback(out: &mut impl Write, fallback: &FallbackReport) -> std::io::
             format!(
                 ", {} of them {} the floor does not apply to",
                 fallback.files,
-                if fallback.files == 1 { "a file" } else { "files" }
+                if fallback.files == 1 {
+                    "a file"
+                } else {
+                    "files"
+                }
             ),
         )
     } else {

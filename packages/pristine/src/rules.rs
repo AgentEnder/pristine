@@ -110,7 +110,8 @@ pub enum Kind {
 pub(crate) const ENV_MARK: &str = ".env";
 
 /// Names that mean "nothing brings this back", matched whole against a lowercased file name.
-const UNRECOVERABLE_NAMES: [&str; 5] = [".npmrc", "credentials", "id_rsa", "id_ecdsa", "id_ed25519"];
+const UNRECOVERABLE_NAMES: [&str; 5] =
+    [".npmrc", "credentials", "id_rsa", "id_ecdsa", "id_ed25519"];
 
 /// Suffixes that mean the same. `.pem` is a private key far more often than it is anything
 /// else, and the times it is a certificate it is still not something a rebuild produces.
@@ -496,13 +497,7 @@ mod tests {
         // them in the order the design has always named them.
         assert_eq!(
             Kind::ALL.map(Kind::short),
-            [
-                "unrecoverable",
-                "dependencies",
-                "build",
-                "cache",
-                "noise"
-            ]
+            ["unrecoverable", "dependencies", "build", "cache", "noise"]
         );
         assert!(Kind::Unrecoverable.cost() < Kind::Dependencies.cost());
         assert!(Kind::Dependencies.cost() < Kind::Build.cost());
@@ -551,10 +546,7 @@ mod tests {
     fn a_name_that_could_be_read_either_way_is_read_as_the_expensive_one() {
         // `.env.log` matches both tables. Being wrong toward "noise" is the one mistake here
         // that cannot be undone by waiting for a rebuild, so the expensive end is asked first.
-        assert_eq!(
-            Kind::of_ignored_file(".env.log"),
-            Some(Kind::Unrecoverable)
-        );
+        assert_eq!(Kind::of_ignored_file(".env.log"), Some(Kind::Unrecoverable));
     }
 
     #[test]

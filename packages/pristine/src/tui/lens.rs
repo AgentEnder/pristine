@@ -829,10 +829,7 @@ mod tests {
         assert!(lens.matches(&gitignored("/scan/nx/dist")));
         assert!(!lens.matches(&gitignored("/scan/pua/dist")));
         assert!(!lens.is_everything());
-        assert_eq!(
-            lens.describe(),
-            "named + gitignored · every kind · /nx"
-        );
+        assert_eq!(lens.describe(), "named + gitignored · every kind · /nx");
     }
 
     #[test]
@@ -858,10 +855,7 @@ mod tests {
         );
         assert_eq!(Tier::of(&gitignored("/scan/a/dist")), Some(Tier::Ignored));
         assert_eq!(
-            Tier::of(&gitignored_file(
-                "/scan/a/.env",
-                Some(Kind::Unrecoverable)
-            )),
+            Tier::of(&gitignored_file("/scan/a/.env", Some(Kind::Unrecoverable))),
             None,
             "a file is judged by the files axis, and the tier axis declines to answer"
         );

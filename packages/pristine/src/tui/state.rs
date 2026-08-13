@@ -3846,10 +3846,7 @@ mod tests {
             3,
             "the gitignored one is out either way"
         );
-        assert_eq!(
-            view.lens().describe(),
-            "named · every kind · /nx"
-        );
+        assert_eq!(view.lens().describe(), "named · every kind · /nx");
     }
 
     #[test]
@@ -5998,7 +5995,10 @@ mod tests {
         assert_eq!(pending.unrecoverable(), 1);
         // Listed first, because the vocabulary is ordered by what it costs to lose and the
         // listing groups by that order.
-        assert_eq!(pending.entries()[0].path, PathBuf::from("/scan/nx/app/.env"));
+        assert_eq!(
+            pending.entries()[0].path,
+            PathBuf::from("/scan/nx/app/.env")
+        );
         assert_eq!(pending.entries()[0].kind, Some(Kind::Unrecoverable));
     }
 

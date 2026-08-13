@@ -298,9 +298,7 @@ fn confirming(frame: &mut Frame, view: &mut View) -> (Rect, [Rect; 2]) {
                 if unrecoverable == 1 { "is" } else { "are" },
                 Kind::Unrecoverable.cost_said()
             ),
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -314,7 +312,10 @@ fn confirming(frame: &mut Frame, view: &mut View) -> (Rect, [Rect; 2]) {
     // takes the hidden entries anyway. The one warning here that has no bound on its length is
     // the one naming the view, since a lens that names its axes is as long as its axes are.
     let inner_width = usize::from(LISTING.min(frame.area().width).saturating_sub(2));
-    let drawn_lines: usize = lines.iter().map(|line| wrapped_rows(line, inner_width)).sum();
+    let drawn_lines: usize = lines
+        .iter()
+        .map(|line| wrapped_rows(line, inner_width))
+        .sum();
     let said = u16::try_from(drawn_lines).unwrap_or(4);
     let wanted = u16::try_from(pending.entries().len()).unwrap_or(u16::MAX);
     let area = centred(
@@ -390,27 +391,23 @@ fn entries(pending: &Pending, width: u16) -> Vec<Line<'static>> {
                 if here { "› " } else { "  " },
                 Style::default().fg(Color::White),
             ),
-            Span::styled(
-                format!("{:<tail$}", shorten(&entry.path, tail)),
-                {
-                    // The group heading names the kind on the first line of a run only, so a
-                    // reader who has scrolled into the middle of a long unrecoverable group
-                    // would otherwise have nothing on the line telling them what it is. Red
-                    // here and cyan for a refusal is the tree's own division: a refusal is the
-                    // safety model working, and this is the safety model being overruled.
-                    let style = if entry.kept.is_none() && entry.kind == Some(Kind::Unrecoverable)
-                    {
-                        Style::default().fg(Color::Red)
-                    } else {
-                        Style::default()
-                    };
-                    if here {
-                        style.add_modifier(Modifier::BOLD)
-                    } else {
-                        style
-                    }
-                },
-            ),
+            Span::styled(format!("{:<tail$}", shorten(&entry.path, tail)), {
+                // The group heading names the kind on the first line of a run only, so a
+                // reader who has scrolled into the middle of a long unrecoverable group
+                // would otherwise have nothing on the line telling them what it is. Red
+                // here and cyan for a refusal is the tree's own division: a refusal is the
+                // safety model working, and this is the safety model being overruled.
+                let style = if entry.kept.is_none() && entry.kind == Some(Kind::Unrecoverable) {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default()
+                };
+                if here {
+                    style.add_modifier(Modifier::BOLD)
+                } else {
+                    style
+                }
+            }),
         ];
         match &entry.kept {
             // A refusal takes the whole of the right-hand side rather than the size column,
@@ -1090,7 +1087,11 @@ fn wrapped_rows(line: &Line<'_>, width: usize) -> usize {
     if width == 0 {
         return 1;
     }
-    let text: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
     let mut rows = 1;
     let mut used = 0;
     for word in text.split_whitespace() {
