@@ -36,6 +36,7 @@ use ignore::{DirEntry, WalkBuilder, WalkState};
 
 use crate::detect::Detector;
 use crate::fallback::{DEFAULT_MIN_SIZE, Fallback, FallbackReport};
+use crate::git;
 use crate::rules::{Kind, Rule, Ruleset};
 use crate::size::{Measurer, Size, SizeMode};
 use crate::tree::Tree;
@@ -45,6 +46,21 @@ use crate::tree::Tree;
 /// Not a blank and not a guess: the fallback knows the directory is safe to remove and knows
 /// nothing whatever about what put it there, so it says exactly that. See [`IgnoredClaim`].
 pub const UNLABELLED: &str = "Gitignored, kind unknown";
+
+/// What a claimed linked work tree is called on a row.
+pub const WORK_TREE_LABEL: &str = "Git · linked work tree";
+
+/// How long a linked work tree has to have been left alone before it is offered at all.
+///
+/// A floor rather than a flag, and it is **not** the same decision as `--older-than`. That one is
+/// off by default because a floor nobody asked for silently keeps directories they chose; this
+/// one is on always because nobody chooses a work tree — the walk offers it, and a work tree
+/// somebody used this morning is not a thing to put in front of them however clean it is.
+///
+/// The two compose rather than competing: the planner applies `--older-than` to every target
+/// including these, so the effective floor is whichever is stricter, and there is still one
+/// clock.
+pub const WORK_TREE_FLOOR: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 60 * 60);
 
 /// Why something is reclaimable, and what is known about it.
 ///
@@ -62,6 +78,46 @@ pub enum Claim {
     Ignored(IgnoredClaim),
     /// Tier two, on a leaf: a gitignored file.
     IgnoredFile(IgnoredFileClaim),
+    /// A linked git work tree that has been left alone and holds nothing uncommitted.
+    ///
+    /// Neither tier could ever have produced this. Tier one is marker-anchored and claims a
+    /// directory's *children*, and a work tree is not an artefact of a project — it is a place
+    /// somebody was working. Tier two refuses anything holding a checkout, and rightly.
+    WorkTree,
+}
+
+/// Whether `dir` is a linked work tree nobody has touched in a while that holds no work of its
+/// own.
+///
+/// **Ordered by what each answer costs**, because two of these run a subprocess and the walk
+/// meets every directory on the disk. `is_work_tree_root` is one `lstat` and rejects everything
+/// that is not a checkout; the age floor is the mtime the walk is about to read anyway and
+/// rejects every work tree somebody is still using; only what survives both pays for git. On a
+/// home directory that is a handful of `git status` calls rather than one per checkout, and each
+/// of those is ~10 ms because git prunes the ignored trees it is being asked about — measured on
+/// a repository carrying 2.4 GiB of build output.
+///
+/// **Judged here rather than left to the planner, because a claim prunes.** A tree node that is
+/// itself a claim can still take children, and both would credit their bytes to every ancestor,
+/// so a work tree cannot be claimed *and* walked into. Claiming only the ones that will survive
+/// the plan is what keeps a work tree somebody is using from swallowing the `node_modules` inside
+/// it: it is never claimed, so the walk descends and tier one finds them exactly as before.
+///
+/// The plan asks all of this again before anything is unlinked. This is what decides whether a
+/// row appears; [`crate::Planner`] is what decides whether it goes.
+fn claims_work_tree(dir: &Path) -> bool {
+    if !git::is_work_tree_root(dir) {
+        return false;
+    }
+    let idle = dir
+        .symlink_metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age >= WORK_TREE_FLOOR);
+    idle && git::checkout_at(dir) == Some(git::Checkout::Linked)
+        && git::head_on_branch(dir)
+        && git::is_clean(dir)
 }
 
 /// A claim made by the curated ruleset.
@@ -144,6 +200,7 @@ impl Hit {
                 Some(kind) => Cow::Owned(format!("Gitignored, {}", kind.short())),
                 None => Cow::Borrowed(UNLABELLED),
             },
+            Claim::WorkTree => Cow::Borrowed(WORK_TREE_LABEL),
         }
     }
 
@@ -160,8 +217,12 @@ impl Hit {
     pub fn kind(&self) -> Option<Kind> {
         match &self.claim {
             Claim::Rule(claim) => Some(claim.rule.kind),
-            Claim::Ignored(_) => None,
             Claim::IgnoredFile(claim) => claim.kind,
+            // Neither carries one, for the same reason stated twice over. The vocabulary is a
+            // scale of what an artefact costs to lose: tier two does not know what the
+            // directory is, and a work tree is not an artefact at all — what it costs is a
+            // `git worktree add` and a checkout, which is not a point on that axis.
+            Claim::Ignored(_) | Claim::WorkTree => None,
         }
     }
 
@@ -170,7 +231,7 @@ impl Hit {
     pub fn rule(&self) -> Option<&Rule> {
         match &self.claim {
             Claim::Rule(claim) => Some(&claim.rule),
-            Claim::Ignored(_) | Claim::IgnoredFile(_) => None,
+            Claim::Ignored(_) | Claim::IgnoredFile(_) | Claim::WorkTree => None,
         }
     }
 
@@ -183,7 +244,6 @@ impl Hit {
     pub fn is_ignored_file(&self) -> bool {
         matches!(self.claim, Claim::IgnoredFile(_))
     }
-
 }
 
 /// What a walk reports, as it happens.
@@ -633,16 +693,19 @@ where
         // Whether this claim's size costs a traversal, and so belongs to the pricing pool
         // rather than to this thread. Decided before the claim is published, because it
         // decides what size the claim is published with.
-        let queued =
-            matches!(claim, Claim::Rule(_)) && self.measurer.traverses(entry.path(), &metadata);
+        // A work tree is priced exactly as a tier-one claim is, and for the same reason: its
+        // size costs a traversal of a subtree the walk is about to prune at, so it belongs to
+        // the pool rather than to this thread.
+        let queued = matches!(claim, Claim::Rule(_) | Claim::WorkTree)
+            && self.measurer.traverses(entry.path(), &metadata);
 
         let size = match &claim {
             // Nothing is measured here when the pool is taking it: the claim goes out
             // unpriced and the number follows. What is left for this branch is the claim
             // whose size is free — a symlink, one `lstat` the walk already did — and the
             // claim no mode asked to price, which stays `Unmeasured`.
-            Claim::Rule(_) if queued => Size::Unmeasured,
-            Claim::Rule(_) => {
+            Claim::Rule(_) | Claim::WorkTree if queued => Size::Unmeasured,
+            Claim::Rule(_) | Claim::WorkTree => {
                 let measured = self.measurer.measure(entry.path(), &metadata);
                 self.report_blind_spots(
                     measured.unreadable,
@@ -668,7 +731,9 @@ where
 
         self.hits.fetch_add(1, Ordering::Relaxed);
         match &claim {
-            Claim::Rule(_) => {}
+            // Neither is a fallback hit: the report's fallback counts are what justify tier two
+            // being on by default, and a work tree was claimed by neither tier.
+            Claim::Rule(_) | Claim::WorkTree => {}
             Claim::Ignored(_) => {
                 self.fallback_hits.fetch_add(1, Ordering::Relaxed);
             }
@@ -745,6 +810,12 @@ where
         }
         if let Some(rule) = self.detector.detect(entry.path(), self.root, entry.depth()) {
             return Some(Claim::Rule(rule));
+        }
+        // Between the tiers, and it has to be: tier one prunes and would never reach a work
+        // tree root anyway, while tier two refuses every checkout outright — so a work tree
+        // asked of tier two is a directory nothing can ever claim.
+        if !leaf && claims_work_tree(entry.path()) {
+            return Some(Claim::WorkTree);
         }
         let work_tree = tier_two
             .filter(|_| !leaf || wanted)

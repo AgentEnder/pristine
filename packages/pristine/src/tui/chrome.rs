@@ -918,14 +918,14 @@ mod tests {
         assert_eq!(Status::of(&view, 0).bar().code(), (1, 0));
 
         view.removed(std::path::Path::new("/scan/a/node_modules"), 1024, true);
-        view.swept();
+        view.swept(std::path::Path::new("/scan/a/node_modules"));
         assert_eq!(Status::of(&view, 0), Status::Deleting(25));
         // A target the sweep could not finish is still one it is no longer working on, and so
         // is a target it could not touch at all: the bar says where the deleter is, not how
         // much of the batch worked.
         view.removed(std::path::Path::new("/scan/b/node_modules"), 512, false);
-        view.swept();
-        view.swept();
+        view.swept(std::path::Path::new("/scan/b/node_modules"));
+        view.swept(std::path::Path::new("/scan/c/node_modules"));
         assert_eq!(Status::of(&view, 0), Status::Deleting(75));
         assert_eq!(Status::of(&view, 0).bar().code(), (1, 75));
 

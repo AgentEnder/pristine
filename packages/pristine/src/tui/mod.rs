@@ -792,7 +792,7 @@ fn drain(view: &mut View, inbox: &Receiver<Message>, outcome: &mut Outcome) {
             }
             // Where the batch has got to, which is a different question from what happened to
             // any row — a target that failed before unlinking anything still counts here.
-            Ok(Message::Removing(Step::Swept(_))) => view.swept(),
+            Ok(Message::Removing(Step::Swept(path))) => view.swept(&path),
             Ok(Message::Repriced { claims, errors }) => {
                 // The walk's rule, kept: a pass that could not read everything makes every
                 // total it fed a lower bound, and the header says so beside the numbers.
@@ -1141,6 +1141,90 @@ mod tests {
         assert_eq!(view.drawn_total().bytes, 0);
         assert_eq!(view.drawn_freed(), 1000);
         assert!(view.is_spent(row));
+    }
+
+    #[test]
+    fn a_real_deleter_reports_paths_the_view_can_find_its_rows_by() {
+        use crate::delete::{Deleter, Planner, Target};
+        use crate::size::Size;
+        use crate::tui::keymap::Turn;
+        use crate::tui::state::Effect;
+        use std::time::Instant;
+
+        // Every other test in this module posts messages it wrote itself, so the paths match
+        // the tree by construction and the halves can never be caught disagreeing. This one
+        // lets the **deleter** choose them.
+        //
+        // That is the whole bug this pins. The tree is keyed on the spelling the walk produced
+        // — `.`-relative for a bare `pristine` — and the planner resolves every target before
+        // touching it, so the two spell one directory two ways. Report the resolved one and
+        // every `tree.find` in the view misses. Nothing errors: rows never empty, no row ever
+        // leaves, the headline reclaimable total never falls, and the only thing that moves is
+        // the position, which needs no path. A reader watching 150 GiB be deleted sees a
+        // completely still screen and a percentage climbing to 100.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(base.join("real")).unwrap();
+        // A name for the root that is not its canonical one, which is what `.` is to a bare
+        // run. A symlink because it is deterministic; the relative case is the common one.
+        let root = base.join("link");
+        std::os::unix::fs::symlink(base.join("real"), &root).unwrap();
+        let target = root.join("app/node_modules");
+        std::fs::create_dir_all(target.join("dep")).unwrap();
+        std::fs::write(target.join("dep/index.js"), vec![b'x'; 8192]).unwrap();
+
+        let mut tree = Tree::new(&root);
+        tree.insert(crate::fixture::hit(
+            target.to_str().unwrap(),
+            Size::Measured(8192),
+            0,
+        ));
+        let mut view = View::new(tree);
+        view.viewport(20);
+        let start = Instant::now();
+        view.animate(start);
+        assert_eq!(view.drawn_total().bytes, 8192);
+
+        // Through the real confirmation, and the deed is whatever **it** hands back. Building
+        // the plan from a path of the test's own choosing would step over the half of this that
+        // lives in the dialog: the batch it produces is what decides which spelling the deleter
+        // is given, and therefore which one comes back.
+        view.ask(&Planner::new(&root).plan([Target::at(&target)]));
+        view.apply(Action::Highlight(Turn::Next));
+        let deed = view.apply(Action::Answer);
+        assert_eq!(view.removing().unwrap().weighed(), Some((0, 8192)));
+        let Effect::Delete(deed) = deed else {
+            panic!("the confirmation did not produce a removal: {deed:?}");
+        };
+
+        let (post, inbox) = channel();
+        let plan = Planner::new(&root).plan(deed.iter().map(Target::at));
+        let reporting = post.clone();
+        let removal = Deleter::new()
+            .watching(move |step| {
+                let _ = reporting.send(Message::Removing(step.clone()));
+            })
+            .remove(&plan);
+        assert!(removal.is_clean(), "{:?}", removal.failures);
+        let mut outcome = Outcome::default();
+        drain(&mut view, &inbox, &mut outcome);
+        view.animate(start);
+
+        // The row emptied and left, which is only true if the deleter's paths found it.
+        let row = view
+            .tree()
+            .find(&target)
+            .expect("the row is still in the tree");
+        assert!(
+            view.is_spent(row),
+            "the row never emptied, so the report never found it"
+        );
+        assert_eq!(view.drawn_total().bytes, 0);
+        // …and the footer's byte figure moved with it, rather than sitting at zero of the
+        // batch's weight for the whole run.
+        let (freed, planned) = view.removing().unwrap().weighed().unwrap();
+        assert_eq!(planned, 8192);
+        assert!(freed > 0, "the batch freed {freed} of {planned}");
     }
 
     #[test]

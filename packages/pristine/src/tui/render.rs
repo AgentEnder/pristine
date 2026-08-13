@@ -948,6 +948,19 @@ fn status(view: &View) -> Paragraph<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     if let Some(removing) = view.removing() {
         spans.push(Span::styled(format!(" {} ", removing.label()), said));
+        // The target the batch is waiting on, named where the reader is already looking for
+        // news of it. Dimmed and after the counts, because it is the answer to "what is taking
+        // so long" rather than to "how far through is this" — and a path long enough to push
+        // the counts off the line would trade the second question for the first.
+        if let Some(busiest) = removing.busiest() {
+            let shown = busiest
+                .strip_prefix(view.tree().root_path())
+                .unwrap_or(busiest);
+            spans.push(Span::styled(
+                format!(" {} ", shown.display()),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
     }
     if let Some(notice) = view.notice() {
         // One colour for every notice, refusals included. A sentence that says a subtree was
@@ -2013,7 +2026,7 @@ mod tests {
         view.apply(Action::Highlight(Turn::Next));
         view.apply(Action::Answer);
         view.removed(Path::new("/scan/nx/node_modules"), 1024 * 1024, true);
-        view.swept();
+        view.swept(Path::new("/scan/nx/node_modules"));
         view.animate(std::time::Instant::now());
         let frame = painted(&mut view, 100, 8);
 
@@ -2027,6 +2040,10 @@ mod tests {
         );
         assert!(frame[7].contains("25%"), "{frame:#?}");
         assert!(frame[7].contains("freed 1.0 MiB"), "{frame:#?}");
+        // The batch's weight beside its position, which is the pair that tells "nearly over"
+        // from "the big one has not started". A count alone cannot: the targets left at 98%
+        // are routinely most of the bytes, because the small ones drain first.
+        assert!(frame[7].contains("1.0 MiB of 2.0 MiB"), "{frame:#?}");
 
         // And the one thing that speaks while a removal runs still gets through. `q` is held
         // back until the batch finishes; a reader who pressed it and saw nothing change would
@@ -2035,6 +2052,40 @@ mod tests {
         let frame = painted(&mut view, 100, 8);
         assert!(frame[7].contains("removing 1 of 4"), "{frame:#?}");
         assert!(frame[7].contains("the removal has to finish"), "{frame:#?}");
+    }
+
+    #[test]
+    fn the_footer_names_the_target_the_batch_is_waiting_on() {
+        // The question a reader actually has at 98% is not "how far through" — the count
+        // already said — but "what is it doing". A batch's last targets are its biggest, and a
+        // single target is swept by a single thread, so the name of the largest one still
+        // going is the answer to how much longer this is.
+        let mut view = view();
+        view.asking(
+            &[
+                Planned::at("/scan/nx/node_modules", Size::Measured(8 * 1024 * 1024)),
+                Planned::at("/scan/old/target", Size::Measured(1024)),
+            ],
+            &[],
+        );
+        view.apply(Action::Highlight(Turn::Next));
+        view.apply(Action::Answer);
+
+        // Both in flight, the small one further along. The name is the *large* one: how much
+        // has already gone is not what decides when the batch ends.
+        view.freeing(Path::new("/scan/old/target"), 900);
+        view.freeing(Path::new("/scan/nx/node_modules"), 512);
+        view.animate(std::time::Instant::now());
+        let frame = painted(&mut view, 120, 8);
+
+        assert!(
+            frame[7].contains("removing 0 of 2 directories"),
+            "{frame:#?}"
+        );
+        // Relative to the scan root, which is how the tree spells it two lines above — a
+        // reader should not have to translate between the row and the footer.
+        assert!(frame[7].contains("nx/node_modules"), "{frame:#?}");
+        assert!(!frame[7].contains("old/target"), "{frame:#?}");
     }
 
     #[test]

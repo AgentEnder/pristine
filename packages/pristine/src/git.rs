@@ -14,6 +14,7 @@
 //! If git cannot be run, or the repository will not answer, tier two goes inert for that work
 //! tree and says so. It never falls back to a guess.
 
+use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::{fmt, io, str};
@@ -72,6 +73,117 @@ pub(crate) fn git(dir: &Path) -> Command {
 #[must_use]
 pub fn is_work_tree_root(dir: &Path) -> bool {
     dir.join(".git").symlink_metadata().is_ok()
+}
+
+/// What the `.git` at a work tree root actually is.
+///
+/// [`is_work_tree_root`] deliberately collapses all three, which is right for the safety model's
+/// question — "is there a checkout here" — and wrong for the only question where the difference
+/// decides whether a directory is disposable.
+///
+/// **A linked work tree is the one kind that holds no history of its own.** Its commits go to the
+/// repository's object store and its branch is an ordinary ref there, so deleting the directory
+/// costs the checked-out files and nothing else — verified rather than assumed: a commit made in
+/// a linked work tree is still readable through its branch after the directory is removed
+/// outright. A [`Repository`](Self::Repository) *is* the object store, and a
+/// [`Submodule`](Self::Submodule) is a checkout the superproject's index points at, which is a
+/// different promise from "somewhere to do some work".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checkout {
+    /// `.git` is a directory: the repository itself, holding every object and ref under it.
+    Repository,
+    /// `.git` is a file pointing into another repository's `worktrees/`, which is where the
+    /// objects and the branch actually live.
+    Linked,
+    /// `.git` is a file pointing into a superproject's `modules/`.
+    Submodule,
+}
+
+/// Which kind of checkout is rooted at `dir`, or `None` if there is not one.
+///
+/// **Asked of git rather than read out of the `.git` file**, for this module's founding reason:
+/// the file's `gitdir:` line has to be resolved relative to the work tree, can be absolute or
+/// relative, and points somewhere whose *shape* is what distinguishes a linked work tree from a
+/// submodule. A hand-rolled reader gets that wrong quietly, and quietly is the failure mode a
+/// cleaner cannot afford — here it would mean reading a submodule as disposable.
+///
+/// The discriminator is git's own: `--git-dir` and `--git-common-dir` are equal for a repository
+/// and for a submodule, and a linked work tree is the only case where the first sits at
+/// `<common>/worktrees/<name>`. Measured against all three, rather than inferred from the
+/// documentation.
+///
+/// Fails toward [`Repository`](Checkout::Repository) — never toward `Linked` — whenever git
+/// cannot be run or will not answer. Everything downstream reads `Linked` as permission.
+#[must_use]
+pub fn checkout_at(dir: &Path) -> Option<Checkout> {
+    if !is_work_tree_root(dir) {
+        return None;
+    }
+    let Ok(output) = git(dir)
+        .args(["rev-parse", "--path-format=absolute", "--git-dir"])
+        .arg("--git-common-dir")
+        .output()
+    else {
+        return Some(Checkout::Repository);
+    };
+    if !output.status.success() {
+        return Some(Checkout::Repository);
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+    let (Some(git_dir), Some(common)) = (lines.next(), lines.next()) else {
+        return Some(Checkout::Repository);
+    };
+    let git_dir = Path::new(git_dir.trim());
+    // `<common>/worktrees/<name>`, checked a component at a time rather than by string prefix, so
+    // a repository that happens to live under a directory called `worktrees` cannot match.
+    let linked = git_dir
+        .parent()
+        .is_some_and(|holder| holder.file_name() == Some(OsStr::new("worktrees")))
+        && git_dir.parent().and_then(Path::parent) == Some(Path::new(common.trim()));
+    Some(if linked {
+        Checkout::Linked
+    } else if git_dir
+        .components()
+        .any(|part| part.as_os_str() == OsStr::new("modules"))
+    {
+        Checkout::Submodule
+    } else {
+        Checkout::Repository
+    })
+}
+
+/// Whether the work tree at `dir` holds work that exists nowhere else.
+///
+/// `git status --porcelain` is empty exactly when there is nothing uncommitted and nothing
+/// untracked — and it says nothing about *ignored* files, which is what makes this usable here at
+/// all: a work tree carrying 4 GiB of `node_modules` reads clean, because that is precisely the
+/// content this program exists to regenerate rather than preserve.
+///
+/// Errs toward "not clean" on every failure. The answer is the gate on an irreversible removal.
+#[must_use]
+pub fn is_clean(dir: &Path) -> bool {
+    git(dir)
+        .args(["status", "--porcelain"])
+        .output()
+        .is_ok_and(|output| output.status.success() && output.stdout.is_empty())
+}
+
+/// Whether `HEAD` names a branch rather than sitting detached.
+///
+/// **The one way removing a linked work tree can lose a commit.** A commit made on a detached
+/// `HEAD` is reachable only through that work tree's own `HEAD`, so once the directory is gone
+/// and the administrative files are pruned nothing refers to it and `gc` will collect it —
+/// measured, not reasoned about: `git fsck --unreachable` lists it immediately after. A commit on
+/// a branch is reachable through an ordinary ref in the repository and survives.
+///
+/// Errs toward "detached" on every failure, which is the answer that keeps the directory.
+#[must_use]
+pub fn head_on_branch(dir: &Path) -> bool {
+    git(dir)
+        .args(["symbolic-ref", "--quiet", "HEAD"])
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 /// The nearest ancestor of `from`, `from` itself included, that is a git work tree root.
@@ -271,8 +383,134 @@ impl std::error::Error for GitError {
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkTree, as_index_path, comparable};
+    use super::{
+        Checkout, WorkTree, as_index_path, checkout_at, comparable, git, head_on_branch, is_clean,
+    };
     use std::path::{Path, PathBuf};
+
+    /// A repository with one commit, made with git rather than by writing `.git` by hand — the
+    /// shapes this module distinguishes are git's, and a fixture that spelled them itself would
+    /// be asserting that the fixture agrees with the code.
+    fn repo(at: &Path) {
+        std::fs::create_dir_all(at).unwrap();
+        run(at, &["init", "--quiet", "."]);
+        run(at, &["config", "user.email", "test@example.com"]);
+        run(at, &["config", "user.name", "test"]);
+        std::fs::write(at.join("tracked.txt"), "content").unwrap();
+        run(at, &["add", "."]);
+        run(at, &["commit", "--quiet", "-m", "first"]);
+    }
+
+    /// `git worktree add --quiet`, which every fixture below needs and which does not fit on
+    /// one line spelled out at each call.
+    fn worktree(main: &Path, args: &[&str]) {
+        let mut all = vec!["worktree", "add", "--quiet"];
+        all.extend_from_slice(args);
+        run(main, &all);
+    }
+
+    fn run(at: &Path, args: &[&str]) {
+        let output = git(at).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} in {}: {}",
+            at.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn a_linked_work_tree_is_told_apart_from_the_repository_and_from_a_submodule() {
+        // The distinction the whole feature rests on, and none of the three can be told apart by
+        // whether `.git` is a file: a submodule has one too.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let main = base.join("main");
+        let inner = base.join("inner");
+        repo(&main);
+        repo(&inner);
+        worktree(&main, &["../linked", "-b", "feature"]);
+        run(
+            &main,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "--quiet",
+                "add",
+                inner.to_str().unwrap(),
+                "vendored",
+            ],
+        );
+        run(&main, &["commit", "--quiet", "-m", "vendored"]);
+
+        assert_eq!(checkout_at(&main), Some(Checkout::Repository));
+        assert_eq!(checkout_at(&base.join("linked")), Some(Checkout::Linked));
+        assert_eq!(
+            checkout_at(&main.join("vendored")),
+            Some(Checkout::Submodule),
+            "a submodule was read as a disposable work tree"
+        );
+        // Not a checkout at all, which is every other directory on the disk.
+        assert_eq!(checkout_at(&base), None);
+    }
+
+    #[test]
+    fn a_work_tree_is_clean_despite_ignored_build_output_and_dirty_with_anything_else() {
+        // The property that makes this usable: the directories pristine exists to reclaim are
+        // exactly the ones that must not count as work.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let main = base.join("main");
+        repo(&main);
+        std::fs::write(main.join(".gitignore"), "node_modules/\n").unwrap();
+        run(&main, &["add", ".gitignore"]);
+        run(&main, &["commit", "--quiet", "-m", "ignore"]);
+
+        std::fs::create_dir_all(main.join("node_modules/dep")).unwrap();
+        std::fs::write(main.join("node_modules/dep/index.js"), "x").unwrap();
+        assert!(
+            is_clean(&main),
+            "4 GiB of node_modules must not read as work that exists nowhere else"
+        );
+
+        // An untracked file that nothing ignores is work, and so is an edit to a tracked one.
+        std::fs::write(main.join("notes.md"), "only copy").unwrap();
+        assert!(!is_clean(&main));
+        std::fs::remove_file(main.join("notes.md")).unwrap();
+        assert!(is_clean(&main));
+        std::fs::write(main.join("tracked.txt"), "edited").unwrap();
+        assert!(!is_clean(&main));
+    }
+
+    #[test]
+    fn a_detached_head_is_refused_because_its_commits_are_reachable_from_nothing_else() {
+        // Measured in #656's follow-up: a commit made on a detached HEAD in a linked work tree is
+        // listed by `git fsck --unreachable` the moment the directory is removed and pruned. On a
+        // branch it survives, because the branch is an ordinary ref in the repository.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let main = base.join("main");
+        repo(&main);
+        worktree(&main, &["../onbranch", "-b", "feature"]);
+        worktree(&main, &["--detach", "../loose"]);
+
+        assert!(head_on_branch(&base.join("onbranch")));
+        assert!(!head_on_branch(&base.join("loose")));
+    }
+
+    #[test]
+    fn every_answer_that_decides_a_deletion_fails_toward_keeping_the_directory() {
+        // A directory git will not speak for at all. `is_clean` and `head_on_branch` gate an
+        // irreversible removal, so silence has to read as "do not touch it" — the same discipline
+        // the tier-two fallback keeps when a work tree will not answer.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        assert!(!is_clean(&base), "a directory git disowns read as clean");
+        assert!(!head_on_branch(&base));
+        // And a checkout it cannot classify is the kind nothing is allowed to remove.
+        assert_eq!(checkout_at(&base), None);
+    }
 
     /// Mirrors what [`WorkTree::open`] does to `git ls-files` output, so a fixture and a real
     /// index are the same shape.

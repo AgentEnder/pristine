@@ -1010,6 +1010,271 @@ fn a_watcher_is_told_when_a_target_was_only_partly_removed() {
     assert_eq!(removal.removed.len(), 1);
 }
 
+#[test]
+fn a_watcher_is_told_the_path_it_asked_about_rather_than_the_one_that_was_unlinked() {
+    // A caller keys its own state on the paths it handed in: the TUI looks a row up by the
+    // path the walk produced, and the walk produces paths spelled the way the root was — `.`
+    // for a bare `pristine`, so `./app/node_modules`.
+    //
+    // The planner resolves those before unlinking anything, which is the whole point of the
+    // under-root check, and the resolved spelling is a different string. Report that string
+    // and every lookup in the caller misses. Nothing errors: the front end shows a delete that
+    // never appears to happen — no row empties, no row leaves, the headline total never falls
+    // — while the one counter that needs no path climbs to 100%. That is a silent failure of
+    // exactly the shape this crate's own doc comments spend paragraphs refusing elsewhere.
+    //
+    // The mismatch is reproduced here with a symlinked ancestor because it is deterministic;
+    // a relative root is the same discrepancy and the common one.
+    let (_tmp, base) = fixture();
+    let real = base.join("real");
+    let link = base.join("link");
+    mkdir(&real);
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let asked_about = link.join("app/node_modules");
+    let unlinked = real.join("app/node_modules");
+    write(&asked_about.join("dep/index.js"), 4096);
+
+    let steps = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&steps);
+    let removal = Deleter::new()
+        .watching(move |step| sink.lock().unwrap().push(step.clone()))
+        .remove(&plan_for(&link, std::slice::from_ref(&asked_about)));
+
+    // The removal itself is unaffected: what gets unlinked is still the resolved path.
+    assert!(!unlinked.exists());
+
+    let steps = steps.lock().unwrap();
+    let reported: Vec<&PathBuf> = steps
+        .iter()
+        .map(|step| match step {
+            Step::Freeing(freeing) => &freeing.path,
+            Step::Finished(removed) => &removed.path,
+            Step::Swept(path) => path,
+        })
+        .collect();
+    assert!(!reported.is_empty(), "nothing was reported");
+    assert!(
+        reported.iter().all(|path| **path == asked_about),
+        "the watcher was told {reported:?} rather than {asked_about:?}"
+    );
+
+    // And the batch report agrees with the live one, because a front end that reconciles the
+    // two would otherwise find no row for the target the summary names.
+    assert_eq!(removal.removed.len(), 1);
+    assert_eq!(removal.removed[0].path, asked_about);
+}
+
+// ---- linked work trees -------------------------------------------------------------------
+//
+// The one class of checkout the deleter will remove whole, and the only expansion of its blast
+// radius since it was written. Every test below is a way that permission could be wrong.
+
+/// Runs git in `at`, asserting it worked. Fixtures are built with git rather than by writing
+/// `.git` by hand: the shapes being told apart here are git's own.
+fn git(at: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(at)
+        .args(args)
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} in {}: {}",
+        at.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `git worktree add --quiet`, which every fixture below needs and which does not fit on one
+/// line spelled out at each call.
+fn worktree(main: &Path, args: &[&str]) {
+    let mut all = vec!["worktree", "add", "--quiet"];
+    all.extend_from_slice(args);
+    git(main, &all);
+}
+
+/// A repository at `at` with one commit.
+fn repo(at: &Path) {
+    fs::create_dir_all(at).unwrap();
+    git(at, &["init", "--quiet", "."]);
+    git(at, &["config", "user.email", "test@example.com"]);
+    git(at, &["config", "user.name", "test"]);
+    write(&at.join("tracked.txt"), 16);
+    git(at, &["add", "."]);
+    git(at, &["commit", "--quiet", "-m", "first"]);
+}
+
+#[test]
+fn a_clean_linked_work_tree_is_removed_whole_and_its_history_survives() {
+    let (_tmp, base) = fixture();
+    let main = base.join("main");
+    repo(&main);
+    fs::write(main.join(".gitignore"), "node_modules/\n").unwrap();
+    git(&main, &["add", ".gitignore"]);
+    git(&main, &["commit", "--quiet", "-m", "ignore node_modules"]);
+    worktree(&main, &["../spent", "-b", "feature"]);
+    let spent = base.join("spent");
+    // A commit made only in the work tree, which is the thing that must survive it.
+    write(&spent.join("work.txt"), 32);
+    git(&spent, &["add", "."]);
+    git(&spent, &["commit", "--quiet", "-m", "in the work tree"]);
+    // And the build output that is the reason anybody wants the directory gone. Ignored, so it
+    // is not work — which is the property that makes any of this usable, since a work tree
+    // worth reclaiming is by definition one full of exactly this.
+    write(&spent.join("node_modules/dep/index.js"), 4096);
+
+    let removal = Deleter::new().remove(&plan_for(&base, std::slice::from_ref(&spent)));
+
+    assert!(removal.is_clean(), "{:?}", removal.failures);
+    assert!(!spent.exists(), "the work tree was left standing");
+    // The whole justification, end to end: the commit is still readable through its branch.
+    let shown = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&main)
+        .args(["show", "feature:work.txt"])
+        .output()
+        .unwrap();
+    assert!(
+        shown.status.success(),
+        "the commit died with the directory: {}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+}
+
+#[test]
+fn a_linked_work_tree_with_uncommitted_work_is_refused() {
+    let (_tmp, base) = fixture();
+    let main = base.join("main");
+    repo(&main);
+    worktree(&main, &["../busy", "-b", "feature"]);
+    let busy = base.join("busy");
+    // Untracked and unignored: this file exists nowhere else in the world.
+    write(&busy.join("notes.md"), 8);
+
+    let plan = plan_for(&base, std::slice::from_ref(&busy));
+    assert!(plan.targets().is_empty(), "{:?}", plan.targets());
+    assert_eq!(refusals(&plan), [(busy.clone(), Refusal::WorkTreeInUse)]);
+    assert!(busy.join("notes.md").exists());
+}
+
+#[test]
+fn a_linked_work_tree_on_a_detached_head_is_refused() {
+    // The commits are reachable through that work tree's HEAD and nothing else, so removing the
+    // directory is the one case where committed work genuinely dies.
+    let (_tmp, base) = fixture();
+    let main = base.join("main");
+    repo(&main);
+    worktree(&main, &["--detach", "../loose"]);
+    let loose = base.join("loose");
+
+    let plan = plan_for(&base, std::slice::from_ref(&loose));
+    assert!(plan.targets().is_empty(), "{:?}", plan.targets());
+    assert_eq!(
+        refusals(&plan),
+        [(loose.clone(), Refusal::WorkTreeDetached)]
+    );
+    assert!(loose.exists());
+}
+
+#[test]
+fn a_submodule_is_not_a_linked_work_tree_however_much_its_dot_git_looks_like_one() {
+    // Both carry a `.git` FILE, so the thing that tells them apart is where it points: a
+    // submodule's git dir is under the superproject's `modules/`, and the superproject's index
+    // points at the checkout. Reading one as disposable would delete a checked-out dependency
+    // and leave the superproject reporting a modified gitlink.
+    let (_tmp, base) = fixture();
+    let main = base.join("main");
+    let inner = base.join("inner");
+    repo(&main);
+    repo(&inner);
+    git(
+        &main,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "--quiet",
+            "add",
+            inner.to_str().unwrap(),
+            "vendored",
+        ],
+    );
+    git(&main, &["commit", "--quiet", "-m", "vendored"]);
+    let vendored = main.join("vendored");
+
+    let plan = plan_for(&base, std::slice::from_ref(&vendored));
+    assert!(plan.targets().is_empty(), "{:?}", plan.targets());
+    assert_eq!(
+        refusals(&plan),
+        [(vendored.clone(), Refusal::HoldsCheckout)]
+    );
+    assert!(vendored.join(".git").exists());
+}
+
+#[test]
+fn the_permission_granted_to_one_work_tree_does_not_reach_a_checkout_inside_it() {
+    // What makes this an exception rather than a hole. The plan proved something about the work
+    // tree's ROOT: that its history lives elsewhere and it holds nothing uncommitted. It proved
+    // nothing whatever about a clone somebody parked in a scratch directory inside it, and that
+    // clone is the only copy of whatever is in it.
+    let (_tmp, base) = fixture();
+    let main = base.join("main");
+    repo(&main);
+    worktree(&main, &["../spent", "-b", "feature"]);
+    let spent = base.join("spent");
+    // Ignored, so the work tree still reads clean — which is exactly the arrangement that makes
+    // this dangerous: the sweep is licensed at the root and walks straight into it.
+    fs::write(spent.join(".gitignore"), "scratch/\n").unwrap();
+    git(&spent, &["add", ".gitignore"]);
+    git(&spent, &["commit", "--quiet", "-m", "ignore it"]);
+    let stowaway = spent.join("scratch/someone-elses-clone");
+    repo(&stowaway);
+    write(&stowaway.join("the-only-copy.txt"), 64);
+
+    let removal = Deleter::new().remove(&plan_for(&base, std::slice::from_ref(&spent)));
+
+    // The clone is untouched, and so is every ancestor of it — the `rmdir` only happens once
+    // every child is known gone, so a refusal deep inside leaves the whole spine standing.
+    assert!(stowaway.join("the-only-copy.txt").exists());
+    assert!(stowaway.join(".git").exists());
+    assert!(spent.exists(), "the work tree was removed over a refusal");
+    assert!(
+        removal
+            .kept
+            .iter()
+            .any(|kept| kept.path == stowaway && kept.reason == Refusal::HoldsCheckout),
+        "{:?}",
+        removal.kept
+    );
+    // …and the refusal is the INNER one rather than the sweep having stopped at the root. The
+    // work tree's own tracked file is gone, so the licence was granted where it was meant to be
+    // and ran out exactly one directory deep.
+    assert!(
+        !spent.join("tracked.txt").exists(),
+        "the sweep never entered the work tree, so this proves nothing about where it stopped"
+    );
+}
+
+#[test]
+fn a_plain_repository_is_still_refused_even_when_it_is_clean_and_idle() {
+    // The permission is about linked work trees and nothing else. A repository IS the object
+    // store: its branches, its stashes and its reflog live in the directory being removed, so
+    // "clean" says nothing about what would be lost.
+    let (_tmp, base) = fixture();
+    let alone = base.join("alone");
+    repo(&alone);
+
+    let plan = plan_for(&base, std::slice::from_ref(&alone));
+    assert!(plan.targets().is_empty(), "{:?}", plan.targets());
+    assert_eq!(refusals(&plan), [(alone.clone(), Refusal::HoldsCheckout)]);
+    assert!(alone.join(".git").exists());
+}
+
 /// A `Removed` reduced to the fields two readers of it have to agree on.
 fn summarise(removed: &Removed) -> (PathBuf, u64, u64, bool) {
     (

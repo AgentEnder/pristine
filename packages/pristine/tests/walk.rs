@@ -27,7 +27,7 @@ fn rule(hit: &Hit) -> &Rule {
 fn project_root(hit: &Hit) -> &Path {
     match &hit.claim {
         Claim::Rule(claim) => &claim.project_root,
-        Claim::Ignored(_) | Claim::IgnoredFile(_) => {
+        Claim::Ignored(_) | Claim::IgnoredFile(_) | Claim::WorkTree => {
             panic!("expected a tier-one hit, got {:?}", hit.claim)
         }
     }

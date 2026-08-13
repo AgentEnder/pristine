@@ -81,6 +81,7 @@ use cap_primitives::fs::{
     remove_file, stat,
 };
 
+use crate::git;
 use crate::size::{Size, Stat, allocated, device, identity, multiply_linked};
 use crate::walk::Hit;
 
@@ -140,6 +141,18 @@ pub enum Refusal {
     OtherFileSystem,
     /// It holds a git checkout, so somewhere under it is work that may exist nowhere else.
     HoldsCheckout,
+    /// It is a linked work tree, but it has uncommitted changes or untracked files.
+    ///
+    /// Ignored files are not work — a work tree carrying 4 GiB of `node_modules` is clean, and
+    /// that content is what this program exists to regenerate rather than keep.
+    WorkTreeInUse,
+    /// It is a linked work tree whose `HEAD` is detached.
+    ///
+    /// The one way removing one of these loses a commit: work committed on a detached `HEAD` is
+    /// reachable only through that work tree's own `HEAD`, so once the directory goes and the
+    /// administrative files are pruned, nothing refers to it. On a branch it is an ordinary ref
+    /// in the repository and survives the directory by design.
+    WorkTreeDetached,
     /// It could not be read, so nothing about it could be proved.
     Unreadable(String),
 }
@@ -155,6 +168,13 @@ impl fmt::Display for Refusal {
             Self::RecentlyUsed { age: None } => write!(f, "touched in the future"),
             Self::OtherFileSystem => write!(f, "on another filesystem"),
             Self::HoldsCheckout => write!(f, "holds a git checkout"),
+            Self::WorkTreeInUse => write!(f, "has uncommitted or untracked work in it"),
+            Self::WorkTreeDetached => {
+                write!(
+                    f,
+                    "is on a detached HEAD, so its commits are reachable from nothing else"
+                )
+            }
             Self::Unreadable(why) => write!(f, "{why}"),
         }
     }
@@ -182,6 +202,12 @@ pub struct PlanTarget {
     pub size: Size,
     /// Whether the target is itself a symlink, in which case removing it is one `unlink`.
     pub is_symlink: bool,
+    /// Whether this target is a linked work tree the plan has approved removing whole.
+    ///
+    /// The **only** thing that lets a sweep past its own checkout refusal, and it licenses that
+    /// exactly once: at this target's own root. A checkout nested anywhere inside is refused as
+    /// it always was, because nothing has been proved about that one.
+    pub checkout: bool,
 }
 
 /// A resolved, checked list of directories to remove.
@@ -389,10 +415,56 @@ impl Planner {
         Ok(PlanTarget {
             requested: target.path.clone(),
             is_symlink: metadata.is_symlink(),
+            checkout: approve_checkout(&path)?,
             size: target.size,
             path,
         })
     }
+}
+
+/// Whether `path` is a linked work tree the deleter is allowed to remove whole.
+///
+/// **The one place a checkout is ever approved, and it is re-derived here rather than
+/// inherited.** The walk decided the same thing minutes ago, and a decision of that age is
+/// exactly what #595 was written about: a `stat` taken at a moment, with a confirmation prompt
+/// sitting between it and the `unlink`. A work tree somebody started working in while the dialog
+/// was open has to come back out of the batch, so every question is asked again here.
+///
+/// Nothing changes for a directory that is not a checkout at all, which is nearly all of them:
+/// one `lstat` says so and this answers `Ok(false)`.
+///
+/// The three questions, and what each one rules out:
+///
+/// - **A linked work tree, not a repository or a submodule.** A repository *is* the object
+///   store — its branches, stashes and reflog live in the directory being removed. A submodule
+///   is a checkout the superproject's index points at. Only a linked work tree keeps its history
+///   somewhere else, which is the whole reason any of this is allowed.
+/// - **`HEAD` on a branch.** Verified rather than argued: a commit made on a detached `HEAD` is
+///   listed by `git fsck --unreachable` the moment the directory goes and the administrative
+///   files are pruned. On a branch it is an ordinary ref in the repository and survives.
+/// - **Nothing uncommitted or untracked.** Ignored files do not count, which is what makes this
+///   usable at all — a work tree worth reclaiming is by definition one full of build output.
+///
+/// # What removing one does not do
+///
+/// The repository keeps its `worktrees/<name>` administrative directory, and `git worktree list`
+/// will call it prunable. Deliberate: pruning means **writing into the repository**, which is
+/// very often outside the scan root, and "nothing outside the root is ever touched" is worth
+/// more than the tidiness. `git worktree prune` is one command and it is the reader's to run.
+fn approve_checkout(path: &Path) -> Result<bool, Refusal> {
+    if !git::is_work_tree_root(path) {
+        return Ok(false);
+    }
+    if git::checkout_at(path) != Some(git::Checkout::Linked) {
+        return Err(Refusal::HoldsCheckout);
+    }
+    if !git::head_on_branch(path) {
+        return Err(Refusal::WorkTreeDetached);
+    }
+    if !git::is_clean(path) {
+        return Err(Refusal::WorkTreeInUse);
+    }
+    Ok(true)
 }
 
 /// Somebody watching a removal happen. See [`Deleter::watching`].
@@ -412,6 +484,20 @@ type Watcher = Arc<dyn Fn(&Step) + Send + Sync>;
 /// answered for every target, because a batch that fails on all of them has still been worked
 /// through — and a position indicator that reads zero throughout is describing the outcome
 /// rather than the position.
+///
+/// # Every path here is the one the caller asked about
+///
+/// Not the resolved path the `unlinkat` was issued against — [`PlanTarget::requested`], the
+/// spelling that went in. The two differ whenever the target is reached through a symlinked
+/// ancestor or named relatively, which on a real run is the common case and not the exotic
+/// one: a bare `pristine` scans `.`, so every claim it finds is spelled `./…` and every one
+/// of them resolves to something else.
+///
+/// It is stated here because a caller cannot work around getting it wrong. A live view keys
+/// its rows on the paths it handed in, and a report in the other spelling matches none of
+/// them — silently, since a path that finds no row is indistinguishable from a row that was
+/// never drawn. What that looks like is a removal of 150 GiB during which nothing on screen
+/// moves except the one counter that needs no path.
 #[derive(Debug, Clone)]
 pub enum Step {
     /// Bytes have left the disk and this target is still being swept.
@@ -570,7 +656,7 @@ impl Deleter {
                             // that failed before unlinking an entry counts here and nowhere
                             // else. Without it a batch that fails on every target reports no
                             // progress at all right up to the moment it ends.
-                            watching(&Step::Swept(target.path.clone()));
+                            watching(&Step::Swept(target.requested.clone()));
                         }
                         mine.push(sweep);
                     }
@@ -679,6 +765,14 @@ struct Sweep<'a> {
     watching: Option<&'a Watcher>,
     told_bytes: u64,
     told_entries: u64,
+    /// The one directory in this sweep whose own `.git` does not stop it: the root of a target
+    /// the plan approved as a linked work tree. `None` for every other target, which is nearly
+    /// all of them.
+    ///
+    /// A path rather than a flag, because the licence is granted to one *directory* and not to
+    /// the sweep. A checkout nested inside the work tree — a submodule, somebody's clone parked
+    /// in a scratch folder — is refused exactly as it always was.
+    approved: Option<PathBuf>,
 }
 
 impl<'a> Sweep<'a> {
@@ -696,15 +790,26 @@ impl<'a> Sweep<'a> {
             watching,
             told_bytes: 0,
             told_entries: 0,
+            approved: None,
         }
     }
 
     fn run(mut self, target: &PlanTarget) -> Self {
-        self.path.clone_from(&target.path);
-        let Some((parent, name)) = self.parent_of(&target.path) else {
+        // Descend by the resolved path and **report by the requested one**. They are two names
+        // for one directory, and which one a `Step` carries is not cosmetic: a caller keys its
+        // own state on the paths it handed in, so a report in the other spelling is a lookup
+        // that misses. Nothing errors when it does — the front end simply shows a removal that
+        // never appears to happen — which is why this is stated here rather than left to each
+        // reporting site to remember.
+        self.path.clone_from(&target.requested);
+        // Granted to this target's root only, and named by the same spelling everything else in
+        // this sweep is reported by so the comparison below cannot go wrong on a symlinked
+        // ancestor.
+        self.approved = target.checkout.then(|| target.requested.clone());
+        let Some((parent, name)) = self.parent_of(target) else {
             return self;
         };
-        self.complete = self.entry(&parent, &name, &target.path);
+        self.complete = self.entry(&parent, &name, &target.requested);
         self
     }
 
@@ -732,12 +837,12 @@ impl<'a> Sweep<'a> {
     /// component swapped for a symlink is an `ELOOP` rather than a redirect. The final
     /// component is *not* opened: a claim may legitimately be a symlink — Bazel's `bazel-*` —
     /// and it has to be unlinked as a link rather than followed.
-    fn parent_of(&mut self, target: &Path) -> Option<(fs::File, OsString)> {
+    fn parent_of(&mut self, target: &PlanTarget) -> Option<(fs::File, OsString)> {
         // Unreachable for a planned target, which the planner proved is under the root.
         // Refusing beats descending from a root this path has nothing to do with.
-        let Ok(relative) = target.strip_prefix(&self.plan.root) else {
+        let Ok(relative) = target.path.strip_prefix(&self.plan.root) else {
             self.failures.push(Failure {
-                path: target.to_path_buf(),
+                path: target.requested.clone(),
                 message: format!("is not under {}", self.plan.root.display()),
             });
             return None;
@@ -745,7 +850,14 @@ impl<'a> Sweep<'a> {
 
         let mut names: Vec<&OsStr> = relative.components().map(Component::as_os_str).collect();
         let name = names.pop()?;
-        let mut walked = self.plan.root.clone();
+        // The caller's spelling of the root, got by taking back off the components this loop is
+        // about to walk. The descent uses descriptors and needs no path at all; this exists so
+        // that an ancestor that fails to open is named the way the caller named it, the same as
+        // every other path this sweep reports.
+        let mut walked = target.requested.clone();
+        for _ in 0..relative.components().count() {
+            walked.pop();
+        }
         // `dup`, so the loop can own each handle in turn without consuming the shared root.
         let mut dir = match self.root.try_clone() {
             Ok(dir) => dir,
@@ -837,7 +949,14 @@ impl<'a> Sweep<'a> {
 
         // Before anything in this directory is touched: a checkout under here may hold work
         // that exists nowhere else, and half-removing it is worse than not starting.
-        if children.iter().any(|child| child == ".git") {
+        //
+        // The single exception is the root of a target the plan proved is a linked work tree
+        // holding nothing uncommitted — see [`Planner::approve_checkout`]. Compared by path and
+        // not by a flag on the sweep, so the licence cannot travel downward: a submodule or a
+        // stray clone *inside* the work tree is refused here exactly as it was before, which is
+        // the case that makes this an exception rather than a hole.
+        let approved = self.approved.as_deref() == Some(path);
+        if !approved && children.iter().any(|child| child == ".git") {
             self.kept.push(Refused {
                 path: path.to_path_buf(),
                 reason: Refusal::HoldsCheckout,

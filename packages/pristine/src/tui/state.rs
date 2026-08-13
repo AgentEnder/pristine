@@ -158,18 +158,69 @@ impl Roll {
 /// actually *happened* to, so a batch where one turned out to be gone already ends at eleven of
 /// twelve rather than counting a directory nobody touched. The state ends when the batch
 /// reports, not when the count reaches its total.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// # …and a count on its own is not enough either, which took a real batch to learn
+///
+/// The paragraph above is right that bytes cannot say how much is left. What it missed is that
+/// a count cannot say how much is left *either*, because targets are not the same size — and
+/// they are not close. A real `pristine ~` batch of 2,188 directories sat at **2,162 of 2,188,
+/// 98%** for over an hour, because the small ones drain first and the twenty-six still going
+/// were most of the bytes. Every figure on the screen was true and the reader still could not
+/// tell it from a hang.
+///
+/// So there are two, and they answer the two different questions a reader has: [`percent`] is
+/// how far through the *list*, [`weighed`] is how much of the *weight*, and [`busiest`] names
+/// the one target that decides when it ends. Neither number is the other's approximation.
+///
+/// [`percent`]: Removing::percent
+/// [`weighed`]: Removing::weighed
+/// [`busiest`]: Removing::busiest
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Removing {
-    /// Targets the confirmed plan handed to the deleter.
+    /// Every target the confirmed plan handed to the deleter, and where each has got to.
+    targets: HashMap<PathBuf, Live>,
+    /// Targets the confirmed plan handed to the deleter. Held rather than counted off the map
+    /// above, which collapses a plan that named one target twice — and a denominator that
+    /// quietly shrank would make the batch smaller than the dialog promised.
     total: usize,
     /// Targets the deleter has reported finishing with, whole or in part.
     done: usize,
+    /// What the plan said the whole batch was worth, which is only the part anybody had priced.
+    /// Zero when none of it was, which is the state a default scan leaves most batches in.
+    planned: u64,
+}
+
+/// Where one target of a batch has got to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Live {
+    /// What the plan thought this target was worth, or zero when nothing had priced it.
+    planned: u64,
+    /// The latest cumulative figure it has reported. Assigned rather than added to, because
+    /// [`crate::Freeing::bytes`] is a running total and never a delta — which is what makes a
+    /// consumer that misses a report or coalesces two of them exact anyway.
+    freed: u64,
+    /// Whether the pool has moved off it.
+    swept: bool,
 }
 
 impl Removing {
-    /// The start of a batch of `total` targets.
-    fn new(total: usize) -> Self {
-        Self { total, done: 0 }
+    /// The start of a batch, given what the plan thought each of its targets was worth.
+    fn new(targets: &[(PathBuf, u64)]) -> Self {
+        Self {
+            total: targets.len(),
+            done: 0,
+            planned: targets.iter().map(|(_, planned)| planned).sum(),
+            targets: targets
+                .iter()
+                .map(|(path, planned)| {
+                    let live = Live {
+                        planned: *planned,
+                        ..Live::default()
+                    };
+                    (path.clone(), live)
+                })
+                .collect(),
+        }
     }
 
     /// Notes one more target the deleter has come back out of.
@@ -177,28 +228,93 @@ impl Removing {
     /// Capped at the total rather than allowed past it: the count is a position in a batch of
     /// known size, and a `13 of 12` would say the batch was not what the confirmation said it
     /// was — which is the one thing the dialog promises.
-    fn finished(&mut self) {
+    ///
+    /// The count moves whether or not `path` is one this batch knows about. That is deliberate
+    /// and it is load-bearing: the position is the one figure here that needs no path to be
+    /// right, so it stays right even if every path-keyed thing beside it stops matching.
+    fn finished(&mut self, path: &Path) {
         self.done = self.done.saturating_add(1).min(self.total);
+        if let Some(live) = self.targets.get_mut(path) {
+            live.swept = true;
+        }
+    }
+
+    /// Bytes one target has given back so far, as a running total.
+    fn freeing(&mut self, path: &Path, bytes: u64) {
+        if let Some(live) = self.targets.get_mut(path) {
+            live.freed = bytes;
+        }
     }
 
     /// Targets done, and how many there are.
     #[must_use]
-    pub fn counted(self) -> (usize, usize) {
+    pub fn counted(&self) -> (usize, usize) {
         (self.done, self.total)
     }
 
     /// How far through, for the footer and for the dock.
+    ///
+    /// **Targets rather than bytes, and that is not an oversight.** A batch that failed on every
+    /// one of its targets has still been worked through, and a bar weighted by bytes would read
+    /// 0% for the whole of it — which reports the *outcome* under the guise of the position.
+    /// What bytes are good for is saying how much is left, and [`Removing::weighed`] says that
+    /// beside this rather than instead of it.
     #[must_use]
-    pub fn percent(self) -> u8 {
+    pub fn percent(&self) -> u8 {
         percent(self.done, self.total)
     }
 
-    /// What the footer says, which is where the deleter is rather than only what it has given
-    /// back. The freed counter beside it already carries the bytes.
+    /// Bytes given back so far against what the plan expected of the whole batch, or `None`
+    /// when nothing in it was priced and there is no denominator to give.
+    ///
+    /// This is the half of the answer a count cannot give. Targets vary in size by four orders
+    /// of magnitude, so "2162 of 2188" says nothing about whether the remainder is a second or
+    /// an hour — and the last few targets of a real batch are routinely most of its bytes.
     #[must_use]
-    pub fn label(self) -> String {
+    pub fn weighed(&self) -> Option<(u64, u64)> {
+        (self.planned > 0).then(|| (self.freed(), self.planned))
+    }
+
+    /// Bytes the batch has given back so far, across every target in it.
+    #[must_use]
+    pub fn freed(&self) -> u64 {
+        self.targets.values().map(|live| live.freed).sum()
+    }
+
+    /// The target the batch is most likely to be waiting on: the largest one the pool has
+    /// started and not yet moved off.
+    ///
+    /// A removal runs its targets concurrently, so there is no single current one — but there
+    /// is one that decides when the batch ends. A target is swept by a single thread, so once
+    /// the pool has more threads than targets left the finish time is the largest survivor's,
+    /// and that is the name worth drawing. It changes only when that target is done, where
+    /// naming the most recent report would flicker between unrelated paths several times a
+    /// second — motion that is not information.
+    ///
+    /// Weighed by what the plan thought each was worth, falling back to what each has already
+    /// given back when nothing priced them: on an unpriced batch the target that has freed the
+    /// most is the best available guess at the biggest. The path breaks the remaining ties, so
+    /// that two equal targets do not swap the name between frames.
+    #[must_use]
+    pub fn busiest(&self) -> Option<&Path> {
+        self.targets
+            .iter()
+            .filter(|(_, live)| !live.swept && live.freed > 0)
+            .max_by_key(|(path, live)| (live.planned, live.freed, *path))
+            .map(|(path, _)| path.as_path())
+    }
+
+    /// What the footer says: where the deleter is, and how much of the batch's weight that
+    /// leaves. The name of what it is working on is drawn beside this rather than folded in,
+    /// because only the renderer knows how much room is left for a path.
+    #[must_use]
+    pub fn label(&self) -> String {
+        let weight = match self.weighed() {
+            Some((freed, planned)) => format!(" · {} of {}", human(freed), human(planned)),
+            None => String::new(),
+        };
         format!(
-            "removing {} of {} · {}%",
+            "removing {} of {} · {}%{weight}",
             self.done,
             plural(self.total, "directory", "directories"),
             self.percent()
@@ -423,8 +539,11 @@ impl Pending {
             return None;
         }
         let entry = self.entries.remove(at);
-        if let Some(target) = &entry.target {
-            self.targets.retain(|path| path != target);
+        // Matched on the requested path because that is what the deed carries — see
+        // [`Pending::targets`]. `target` is still what says whether this line is a target at
+        // all, which a refusal is not.
+        if entry.target.is_some() {
+            self.targets.retain(|path| path != &entry.path);
         }
         self.bytes = self.bytes.saturating_sub(entry.size.bytes().unwrap_or(0));
         if entry.kept.is_none() && entry.size.bytes().is_none() {
@@ -1129,6 +1248,13 @@ impl View {
     /// for a target that took ten seconds and one that took ten milliseconds, which is the
     /// definition of motion that is not information.
     pub fn freeing(&mut self, path: &Path, bytes: u64) {
+        // Before the tree lookup and outside it, because the two answer to different things:
+        // the footer's arithmetic is about the batch, which is known in full, while the row is
+        // about a node that may legitimately not be drawn. Folding the first into the second
+        // makes a missing row silently cost the whole counter.
+        if let Some(removing) = &mut self.removing {
+            removing.freeing(path, bytes);
+        }
         if let Some(id) = self.tree.find(path) {
             self.moving.frees(id, bytes);
             self.stale = true;
@@ -1148,6 +1274,16 @@ impl View {
     /// consequences are not: the row is out of the batch and out of the marks from the moment
     /// the sweep first touched it.
     pub fn removed(&mut self, path: &Path, bytes: u64, complete: bool) {
+        // The target's last word on itself, and for most targets its only one: a sweep reports
+        // progress every 64 entries, so anything smaller than that finishes without ever having
+        // said anything. A counter fed only by [`View::freeing`] would leave every small target
+        // in a batch worth nothing — which on a real batch is most of them.
+        //
+        // Assignment rather than addition, and that is what makes this safe to do beside the
+        // progress reports: both are the same running total read at different moments.
+        if let Some(removing) = &mut self.removing {
+            removing.freeing(path, bytes);
+        }
         let Some(id) = self.tree.find(path) else {
             return;
         };
@@ -1175,9 +1311,9 @@ impl View {
     ///
     /// It deliberately does not touch the tree. Nothing happened to that directory, so there
     /// is nothing for its row to say.
-    pub fn swept(&mut self) {
+    pub fn swept(&mut self, path: &Path) {
         if let Some(removing) = &mut self.removing {
-            removing.finished();
+            removing.finished(path);
         }
     }
 
@@ -1340,9 +1476,17 @@ impl View {
             .filter(|entry| entry.size.bytes().is_none())
             .count();
         self.pending = Some(Pending {
+            // **The requested spelling, not the resolved one**, and the difference is the whole
+            // of #656's sibling bug. The deed is re-planned before it runs, so either spelling
+            // reaches the same directory — but whichever goes in is what the deleter calls the
+            // target when it reports back, and the view can only find a row by the name the
+            // walk gave it. Hand the resolved path to the deed and every report comes back in
+            // a spelling the tree has never heard of: no row empties, no row leaves, the
+            // headline total never falls, and the only thing that still moves is the position,
+            // because it is the one figure that needs no path.
             targets: targets
                 .iter()
-                .map(|target| target.resolved.clone())
+                .map(|target| target.requested.clone())
                 .collect(),
             bytes,
             unpriced,
@@ -1980,8 +2124,8 @@ impl View {
 
     /// Where the removal in flight has got to, if there is one.
     #[must_use]
-    pub fn removing(&self) -> Option<Removing> {
-        self.removing
+    pub fn removing(&self) -> Option<&Removing> {
+        self.removing.as_ref()
     }
 
     /// Puts the view mid-removal without one having happened.
@@ -1990,7 +2134,7 @@ impl View {
     /// door into that state runs an actual removal against an actual filesystem.
     #[cfg(test)]
     pub(crate) fn deleting_for_test(&mut self) {
-        self.removing = Some(Removing::new(1));
+        self.removing = Some(Removing::new(&[(PathBuf::from("/scan/target"), 0)]));
     }
 
     /// What just happened, for the footer.
@@ -2403,7 +2547,22 @@ impl View {
                 // Cleared outright rather than expired, standing ones included: answering this
                 // dialog is as deliberate as a reader gets, and what the last batch refused is
                 // not a thing to leave sitting beside a live count of this one.
-                self.removing = Some(Removing::new(pending.targets.len()));
+                // Each target's own weight, taken from the listing the reader just agreed to
+                // rather than re-derived from the tree — the same reason the box adds its
+                // headline up over the entries. A footer whose denominator disagreed with the
+                // figure in the dialog would be two statements about one batch.
+                //
+                // Weighed before any of it goes, because the deleter can only ever report what
+                // it has *given back*. An unpriced target is a zero, and a batch of nothing but
+                // those gives no byte figure at all rather than a total that is quietly a
+                // fraction of the truth.
+                let weighed: Vec<(PathBuf, u64)> = pending
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.target.is_some())
+                    .map(|entry| (entry.path.clone(), entry.size.bytes().unwrap_or(0)))
+                    .collect();
+                self.removing = Some(Removing::new(&weighed));
                 self.notice = None;
                 Effect::Delete(pending.targets)
             }
@@ -5294,10 +5453,10 @@ mod tests {
     fn a_running_removal_counts_targets_against_the_batch_it_was_given() {
         let mut view = view();
         view.asking(
-            &planned(&[
-                "/scan/nx/node_modules",
-                "/scan/nx/packages/ui/node_modules",
-                "/scan/old/target",
+            &priced(&[
+                ("/scan/nx/node_modules", 200),
+                ("/scan/nx/packages/ui/node_modules", 100),
+                ("/scan/old/target", 10),
             ]),
             &[],
         );
@@ -5308,9 +5467,13 @@ mod tests {
         // separates this bar from the pricing one, whose total grows as the walk finds claims.
         assert_eq!(view.removing().unwrap().counted(), (0, 3));
         assert_eq!(view.removing().unwrap().percent(), 0);
+        // The batch's weight comes from the tree, so the denominator is there from the first
+        // frame — which is the whole point of it. `2162 of 2188` cannot say whether the rest is
+        // a second or an hour, and `0 B of 310 B` can.
+        assert_eq!(view.removing().unwrap().weighed(), Some((0, 310)));
         assert_eq!(
             view.removing().unwrap().label(),
-            "removing 0 of 3 directories · 0%"
+            "removing 0 of 3 directories · 0% · 0 B of 310 B"
         );
 
         // The count moves on the deleter leaving a target, never on what it did there — the
@@ -5322,22 +5485,30 @@ mod tests {
             (0, 3),
             "the position moved on what happened to a row"
         );
-        view.swept();
+        // The bytes are not the position and do move here: this target has given back what it
+        // was worth, whatever the count says about where the pool is.
+        assert_eq!(view.removing().unwrap().weighed(), Some((200, 310)));
+        view.swept(Path::new("/scan/nx/node_modules"));
         assert_eq!(view.removing().unwrap().counted(), (1, 3));
 
         // A target the sweep went into and came back out of counts the same: it is not a claim
-        // that the target was removed — the row is still there saying what is left of it.
+        // that the target was removed — the row is still there saying what is left of it. Its
+        // bytes count for what actually went, which is less than the plan expected of it.
         view.removed(Path::new("/scan/nx/packages/ui/node_modules"), 40, false);
-        view.swept();
+        view.swept(Path::new("/scan/nx/packages/ui/node_modules"));
         assert_eq!(view.removing().unwrap().counted(), (2, 3));
         assert_eq!(view.removing().unwrap().percent(), 66);
+        assert_eq!(view.removing().unwrap().weighed(), Some((240, 310)));
 
         // The third target turns out to be gone already, so nothing happened to it and no row
         // moves — but the deleter still worked through it and said so, so the count reaches
         // its total rather than stopping one short for the rest of the run.
-        view.swept();
+        view.swept(Path::new("/scan/old/target"));
         assert_eq!(view.removing().unwrap().counted(), (3, 3));
         assert_eq!(view.removing().unwrap().percent(), 100);
+        // …and the bytes stop short, because they describe the outcome and it fell short. The
+        // two figures disagreeing is them answering different questions, not a fault.
+        assert_eq!(view.removing().unwrap().weighed(), Some((240, 310)));
 
         view.deleted(Notice::passing("removed 240 B from 1 directory"), 240);
         assert!(view.removing().is_none());
@@ -5345,13 +5516,99 @@ mod tests {
     }
 
     #[test]
+    fn the_footer_names_the_target_the_batch_is_waiting_on() {
+        let mut view = view();
+        view.asking(
+            &priced(&[
+                ("/scan/nx/node_modules", 200),
+                ("/scan/nx/packages/ui/node_modules", 100),
+                ("/scan/old/target", 10),
+            ]),
+            &[],
+        );
+        view.apply(Action::Highlight(Turn::Next));
+        view.apply(Action::Answer);
+
+        // Nothing has started, so there is nothing to name. A footer that guessed here would be
+        // naming a target the pool may not have reached.
+        assert_eq!(view.removing().unwrap().busiest(), None);
+
+        // Two in flight at once, which is the normal state of a batch: the pool runs as many
+        // targets as it has threads. The one worth naming is the larger — a target is swept by
+        // a single thread, so it is the one that decides when the batch ends.
+        view.freeing(Path::new("/scan/old/target"), 4);
+        assert_eq!(
+            view.removing().unwrap().busiest(),
+            Some(Path::new("/scan/old/target"))
+        );
+        view.freeing(Path::new("/scan/nx/node_modules"), 8);
+        assert_eq!(
+            view.removing().unwrap().busiest(),
+            Some(Path::new("/scan/nx/node_modules")),
+            "the smaller target was named while a larger one was still going"
+        );
+
+        // Weighed by what the plan expected rather than by what has gone, so the name does not
+        // hand over the moment a big target gets ahead on bytes. `old/target` is worth 10 and
+        // `nx/node_modules` 200, and the second stays named while it is still running.
+        view.freeing(Path::new("/scan/old/target"), 10);
+        assert_eq!(
+            view.removing().unwrap().busiest(),
+            Some(Path::new("/scan/nx/node_modules"))
+        );
+
+        // The pool moves off it, and the name hands over to the largest still going rather
+        // than sticking on a target that is finished.
+        view.swept(Path::new("/scan/nx/node_modules"));
+        assert_eq!(
+            view.removing().unwrap().busiest(),
+            Some(Path::new("/scan/old/target"))
+        );
+
+        // And when the last one is done there is nobody left to be waiting on.
+        view.swept(Path::new("/scan/old/target"));
+        assert_eq!(view.removing().unwrap().busiest(), None);
+    }
+
+    #[test]
+    fn an_unpriced_batch_gives_no_byte_figure_rather_than_a_misleading_one() {
+        // A default scan prices a fraction of what it finds, so a batch can be entirely
+        // unpriced. The count still works — it never needed a size — and the byte pair is
+        // withheld outright. Drawing `0 B of 0 B`, or a total that is quietly a fraction of the
+        // truth, would be worse than saying nothing: a reader would read it as "nearly done".
+        let mut view = View::new(Tree::new("/scan"));
+        view.viewport(10);
+        view.found(hit("/scan/app/node_modules", Size::Unmeasured, 0));
+        view.asking(
+            &[Planned::at("/scan/app/node_modules", Size::Unmeasured)],
+            &[],
+        );
+        view.apply(Action::Highlight(Turn::Next));
+        view.apply(Action::Answer);
+
+        assert_eq!(view.removing().unwrap().weighed(), None);
+        assert_eq!(
+            view.removing().unwrap().label(),
+            "removing 0 of 1 directory · 0%"
+        );
+
+        // The name still works, because what has been freed is the fallback ordering when
+        // nothing priced the batch.
+        view.freeing(Path::new("/scan/app/node_modules"), 512);
+        assert_eq!(
+            view.removing().unwrap().busiest(),
+            Some(Path::new("/scan/app/node_modules"))
+        );
+    }
+
+    #[test]
     fn a_batch_that_fails_on_everything_still_shows_the_deleter_working_through_it() {
         let mut view = view();
         view.asking(
-            &planned(&[
-                "/scan/nx/node_modules",
-                "/scan/nx/packages/ui/node_modules",
-                "/scan/old/target",
+            &priced(&[
+                ("/scan/nx/node_modules", 200),
+                ("/scan/nx/packages/ui/node_modules", 100),
+                ("/scan/old/target", 10),
             ]),
             &[],
         );
@@ -5362,14 +5619,27 @@ mod tests {
         // and not one row moves. The deleter is working through them all the same, and a bar
         // that read 0% for the whole run and then vanished would be reporting the OUTCOME
         // while claiming to report the position.
-        for done in 1..=3 {
-            view.swept();
-            assert_eq!(view.removing().unwrap().counted(), (done, 3));
+        for (done, path) in [
+            "/scan/nx/node_modules",
+            "/scan/nx/packages/ui/node_modules",
+            "/scan/old/target",
+        ]
+        .iter()
+        .enumerate()
+        {
+            view.swept(Path::new(path));
+            assert_eq!(view.removing().unwrap().counted(), (done + 1, 3));
         }
         assert_eq!(view.removing().unwrap().percent(), 100);
+        // The position reaches its total and the bytes stay at nothing, which is the pair
+        // saying exactly what happened: the deleter went everywhere it was sent and came back
+        // with nothing. A single bar weighted by bytes would have read 0% throughout and then
+        // vanished, and one weighted by targets alone could not tell this from a batch that
+        // freed 300 GiB.
+        assert_eq!(view.removing().unwrap().weighed(), Some((0, 310)));
         assert_eq!(
             view.removing().unwrap().label(),
-            "removing 3 of 3 directories · 100%"
+            "removing 3 of 3 directories · 100% · 0 B of 310 B"
         );
 
         // …and nothing was deleted, which is the other half of the same claim: the position
@@ -5768,6 +6038,16 @@ mod tests {
         targets
             .iter()
             .map(|path| Planned::at(*path, Size::Measured(10)))
+            .collect()
+    }
+
+    /// The same, for tests that care what each target is worth — the batch's weight is what
+    /// the footer's byte figure is a fraction of, and a batch of equal targets cannot show
+    /// that the largest one is the one being named.
+    fn priced(targets: &[(&str, u64)]) -> Vec<Planned> {
+        targets
+            .iter()
+            .map(|(path, bytes)| Planned::at(*path, Size::Measured(*bytes)))
             .collect()
     }
 }
