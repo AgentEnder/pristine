@@ -530,7 +530,7 @@ fn run(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::error::Er
         writeln!(out, "{}", summary(&hits))?;
         report_unpriced(out, unpriced(&hits))?;
         report_fallback(out, &outcome.fallback)?;
-        report_scan(out, &outcome)?;
+        report_scan(out, &outcome, &cli.root)?;
         return Ok(whole);
     }
 
@@ -552,7 +552,7 @@ fn run(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::error::Er
     // a tier that went inert is a tier whose findings are missing from what is about to be
     // removed, and a plan that did not say so would read as the whole of what is reclaimable.
     report_fallback(out, &outcome.fallback)?;
-    report_scan(out, &outcome)?;
+    report_scan(out, &outcome, &cli.root)?;
 
     if cli.dry_run {
         writeln!(out, "\ndry run: nothing was removed")?;
@@ -1089,7 +1089,7 @@ fn write_removal(
 ///
 /// On stdout, beside the numbers it qualifies, because someone reading only the listing would
 /// otherwise take an undercount for a total. The detail goes to standard error.
-fn report_scan(out: &mut impl Write, outcome: &WalkOutcome) -> std::io::Result<()> {
+fn report_scan(out: &mut impl Write, outcome: &WalkOutcome, root: &Path) -> std::io::Result<()> {
     if outcome.excluded > 0 {
         // Said even though nothing went wrong, and said on stdout beside the numbers it
         // qualifies. A total with a subtree missing from it is not the total, however
@@ -1120,12 +1120,32 @@ fn report_scan(out: &mut impl Write, outcome: &WalkOutcome) -> std::io::Result<(
         plural(outcome.errors.len(), PATH),
     )?;
     if !forbidden.is_empty() {
+        // Named once, spelled the way an `exclude` entry is spelled, because a reader who wants
+        // them gone has to be able to say which ones. Withholding the list to keep the output
+        // short would leave the summary above pointing at a flag nobody can fill in — and these
+        // paths do not change from run to run, so seeing them once is the whole cost.
         writeln!(
             out,
-            "  of those, {} the system will not let any process read; \
-             --exclude takes them off this list",
+            "  of those, {} the system will not let any process read. To stop seeing them, \
+             add to `exclude` in {}:",
             plural(forbidden.len(), PATH),
+            Ruleset::user_config_path()
+                .as_deref()
+                .unwrap_or_else(|| Path::new("the rules file"))
+                .display(),
         )?;
+        // Sorted, for the reason the removal report is: the walk finishes in whatever order
+        // its threads allow, and a list somebody is about to paste into a config file should
+        // not come out in a different order every run.
+        let mut shown: Vec<&Path> = forbidden
+            .iter()
+            .filter_map(|error| error.path.as_deref())
+            .map(|path| path.strip_prefix(root).unwrap_or(path))
+            .collect();
+        shown.sort_unstable();
+        for path in shown {
+            writeln!(out, "    \"{}\",", path.display())?;
+        }
     }
     // Only the ones somebody can act on go to standard error one by one. The forbidden set is
     // named by the line above and by `--exclude`, which is the whole of what can be done.
