@@ -187,6 +187,7 @@ impl Fallback {
                 Some(Err(message)) => errors.push(WalkError {
                     path: Some(root.clone()),
                     message: message.to_string(),
+                    forbidden: false,
                 }),
                 None => {}
             }

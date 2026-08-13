@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
 
+use ignore::gitignore::Gitignore;
 use ignore::{DirEntry, WalkBuilder, WalkState};
 
 use crate::detect::Detector;
@@ -298,6 +299,26 @@ pub struct WalkError {
     pub path: Option<PathBuf>,
     /// What went wrong.
     pub message: String,
+    /// Whether the operating system refused, rather than something having gone wrong.
+    ///
+    /// Recorded from the `io::Error`'s kind at the moment it is caught, never by reading the
+    /// message afterwards — this crate has already been bitten once by parsing a program's
+    /// prose, and an errno does not get translated.
+    ///
+    /// The two are worth telling apart because only one of them is news. A macOS home directory
+    /// holds a dozen paths under `Library` that TCC refuses every process without Full Disk
+    /// Access, and they will read the same on every run forever; printing them beside a genuine
+    /// failure, every time, is how a reader learns to skip the line that says the totals are a
+    /// floor.
+    pub forbidden: bool,
+}
+
+impl WalkError {
+    /// Whether this was the system refusing rather than something going wrong.
+    #[must_use]
+    pub fn is_forbidden(&self) -> bool {
+        self.forbidden
+    }
 }
 
 /// What a walk found.
@@ -315,6 +336,12 @@ pub struct WalkOutcome {
     pub fallback: FallbackReport,
     /// Everything that could not be read.
     pub errors: Vec<WalkError>,
+    /// How many paths were skipped because the reader excluded them.
+    ///
+    /// Counted and reported rather than silently obeyed: a total that is missing a subtree has
+    /// to say so, and "you told me not to look" is a different sentence from "I could not
+    /// look" — see [`Walker::excludes`].
+    pub excluded: usize,
 }
 
 /// A configured scan of one tree.
@@ -333,6 +360,9 @@ pub struct Walker {
     fallback: bool,
     ignored_files: bool,
     min_size: u64,
+    /// Paths the reader has said not to look at, in gitignore syntax. Empty by default: what
+    /// this program does not look at is a decision only the reader can make.
+    excludes: Arc<Gitignore>,
 }
 
 impl Walker {
@@ -355,7 +385,26 @@ impl Walker {
             fallback: true,
             ignored_files: false,
             min_size: DEFAULT_MIN_SIZE,
+            excludes: Arc::new(Gitignore::empty()),
         }
+    }
+
+    /// Paths not to descend into, matched in gitignore syntax against paths under the root.
+    ///
+    /// **Different from every other refusal in this program, and reported differently.** An
+    /// unreadable directory makes the totals a lower bound and says so, because the scan wanted
+    /// to look and could not. An excluded one is the reader saying "not there" — the totals are
+    /// still not the whole tree, but nothing went wrong, and a run that cried "scan incomplete"
+    /// over a choice its user made would be teaching them to ignore that sentence.
+    ///
+    /// Gitignore syntax rather than a list of prefixes, because it is the matcher everybody
+    /// reading this already knows, and it brings negation with it: an exclude of
+    /// `Library/Application Support` and a re-include of `!Library/Application Support/Zed` is
+    /// one line each and needs no new grammar.
+    #[must_use]
+    pub fn excludes(mut self, excludes: Arc<Gitignore>) -> Self {
+        self.excludes = excludes;
+        self
     }
 
     /// How many threads to walk with. Defaults to the machine's parallelism.
@@ -500,7 +549,8 @@ impl Walker {
             threads
         };
 
-        let builder = self.builder(threads);
+        let excluded = Arc::new(AtomicUsize::new(0));
+        let builder = self.builder(threads, &excluded);
 
         // Deliberately unbounded, and the bound that matters is on the POOL rather than on the
         // queue. A bounded queue is backpressure, and backpressure here means stalling the
@@ -557,6 +607,7 @@ impl Walker {
             unmeasured: scan.unmeasured.load(Ordering::Relaxed),
             fallback,
             errors,
+            excluded: excluded.load(Ordering::Relaxed),
         }
     }
 
@@ -567,8 +618,11 @@ impl Walker {
     /// has a `.gitignore`, so a filtering walk would find almost nothing. `hidden(false)` is
     /// the same point — `.venv`, `.gradle`, `.nx` and `.build` all start with a dot. Tier two
     /// brings its own matcher and queries it per path instead.
-    fn builder(&self, threads: usize) -> WalkBuilder {
+    fn builder(&self, threads: usize, excluded: &Arc<AtomicUsize>) -> WalkBuilder {
         let mut builder = WalkBuilder::new(self.root.as_path());
+        // Cloned into the closure, which the parallel walker calls from every thread.
+        let matcher = Arc::clone(&self.excludes);
+        let counted = Arc::clone(excluded);
         builder
             .hidden(false)
             .parents(false)
@@ -580,9 +634,24 @@ impl Walker {
             .same_file_system(self.same_file_system)
             .threads(threads)
             .max_depth(self.max_depth)
-            // Git's object store is large, never reclaimable, and full of names that would
-            // waste marker probes.
-            .filter_entry(|entry| entry.file_name() != OsStr::new(".git"));
+            .filter_entry(move |entry| {
+                // Git's object store is large, never reclaimable, and full of names that would
+                // waste marker probes.
+                if entry.file_name() == OsStr::new(".git") {
+                    return false;
+                }
+                // Counted on the way past rather than dropped, so the report can say how much
+                // of the tree the reader chose not to see. Pruning here rather than filtering
+                // the results is the whole value of an exclude: the subtree is never walked,
+                // so a directory the process cannot read is never even reached — which is what
+                // takes its unreadable-path warning off the screen along with it.
+                let directory = entry.file_type().is_some_and(|kind| kind.is_dir());
+                if matcher.matched(entry.path(), directory).is_ignore() {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                true
+            });
         builder
     }
 
@@ -603,6 +672,7 @@ impl Walker {
                     lock(&stray).push(WalkError {
                         path: Some(path),
                         message: "claimed directory is not under the scan root".to_owned(),
+                        forbidden: false,
                     });
                 }
             }
@@ -618,6 +688,7 @@ impl Walker {
                         path: Some(priced.path),
                         message: "priced directory is not an unpriced claim in this tree"
                             .to_owned(),
+                        forbidden: false,
                     });
                 }
             }
@@ -662,7 +733,11 @@ where
         let entry = match result {
             Ok(entry) => entry,
             Err(err) => {
-                self.fail(error_path(&err), err.to_string());
+                let path = error_path(&err);
+                match err.io_error() {
+                    Some(io) => self.fail_io(path, io),
+                    None => self.fail(path, err.to_string()),
+                }
                 return WalkState::Continue;
             }
         };
@@ -685,7 +760,11 @@ where
         let metadata = match entry.metadata() {
             Ok(metadata) => metadata,
             Err(err) => {
-                self.fail(Some(entry.path().to_path_buf()), err.to_string());
+                let path = Some(entry.path().to_path_buf());
+                match err.io_error() {
+                    Some(io) => self.fail_io(path, io),
+                    None => self.fail(path, err.to_string()),
+                }
                 return WalkState::Skip;
             }
         };
@@ -909,7 +988,24 @@ where
     }
 
     fn fail(&self, path: Option<PathBuf>, message: String) {
-        lock(&self.errors).push(WalkError { path, message });
+        lock(&self.errors).push(WalkError {
+            path,
+            message,
+            forbidden: false,
+        });
+    }
+
+    /// The same, for an error that came from the filesystem and can say which kind it is.
+    ///
+    /// Takes the message from the `io::Error` rather than from the [`ignore::Error`] wrapping
+    /// it, because the wrapper's `Display` already contains the path — and the reporter puts the
+    /// path in front of it, which is how `pristine: <path>: <path>: …` reached a screen.
+    fn fail_io(&self, path: Option<PathBuf>, err: &std::io::Error) {
+        lock(&self.errors).push(WalkError {
+            path,
+            message: err.to_string(),
+            forbidden: err.kind() == std::io::ErrorKind::PermissionDenied,
+        });
     }
 
     /// Reports the corners of a subtree a traversal did not see. The message differs by tier
@@ -923,6 +1019,7 @@ where
         for path in paths {
             errors.push(WalkError {
                 path: Some(path),
+                forbidden: false,
                 message: message.to_owned(),
             });
         }

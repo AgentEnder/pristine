@@ -76,6 +76,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use ignore::gitignore::Gitignore;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, MouseButton, MouseEventKind,
 };
@@ -137,6 +138,8 @@ pub struct Options {
     /// found nothing until the scan was run again would not be one. This is only where the lens
     /// starts, so that `--ignored-files` means the same thing here as it does to the listing.
     pub ignored_files: bool,
+    /// Paths the reader has said never to walk into. See [`crate::Walker::excludes`].
+    pub excludes: Arc<Gitignore>,
 }
 
 /// What one arriving event tells the view.
@@ -834,7 +837,8 @@ fn spawn_walk(options: &Options, ruleset: Arc<Ruleset>, post: Sender<Message>) -
         // had left them out would make `i` a key that finds nothing until the run is done
         // again.
         .ignored_files(true)
-        .min_size(options.min_size);
+        .min_size(options.min_size)
+        .excludes(Arc::clone(&options.excludes));
     std::thread::spawn(move || {
         let reporting = post.clone();
         let outcome = walker.run(move |found| {
@@ -911,6 +915,7 @@ fn spawn_pricer(options: &Options, post: Sender<Message>) -> Sender<Vec<PathBuf>
                     Err(err) => {
                         errors.push(WalkError {
                             path: Some(path.clone()),
+                            forbidden: err.kind() == io::ErrorKind::PermissionDenied,
                             message: err.to_string(),
                         });
                         continue;
@@ -920,6 +925,7 @@ fn spawn_pricer(options: &Options, post: Sender<Message>) -> Sender<Vec<PathBuf>
                 errors.extend(sized.unreadable.into_iter().map(|path| WalkError {
                     path: Some(path),
                     message: "unreadable, so this size is a lower bound".to_owned(),
+                    forbidden: false,
                 }));
                 let _ = post.send(Message::Found(Found::Priced(Priced {
                     path: path.clone(),
@@ -1071,6 +1077,7 @@ mod tests {
             errors: vec![WalkError {
                 path: Some("/scan/locked".into()),
                 message: "Permission denied".to_owned(),
+                forbidden: true,
             }],
             ..WalkOutcome::default()
         }))
@@ -1368,6 +1375,7 @@ mod tests {
                 one_file_system: true,
                 older_than: None,
                 ignored_files: false,
+                excludes: std::sync::Arc::new(ignore::gitignore::Gitignore::empty()),
             },
             post,
         );
@@ -2019,6 +2027,7 @@ mod loop_tests {
                 one_file_system: true,
                 older_than: None,
                 ignored_files: false,
+                excludes: std::sync::Arc::new(ignore::gitignore::Gitignore::empty()),
             },
             Arc::new(Ruleset::builtin().unwrap()),
         )
@@ -2098,6 +2107,7 @@ mod loop_tests {
                 one_file_system: true,
                 older_than: None,
                 ignored_files: false,
+                excludes: std::sync::Arc::new(ignore::gitignore::Gitignore::empty()),
             },
             Arc::new(Ruleset::builtin().unwrap()),
         )
@@ -2172,6 +2182,7 @@ mod loop_tests {
                 one_file_system: true,
                 older_than: None,
                 ignored_files: false,
+                excludes: std::sync::Arc::new(ignore::gitignore::Gitignore::empty()),
             },
             Arc::new(Ruleset::builtin().unwrap()),
         );
@@ -2265,6 +2276,7 @@ mod loop_tests {
                 one_file_system: true,
                 older_than: None,
                 ignored_files: false,
+                excludes: std::sync::Arc::new(ignore::gitignore::Gitignore::empty()),
             },
             Arc::new(Ruleset::builtin().unwrap()),
         )
@@ -2340,6 +2352,7 @@ mod loop_tests {
                 one_file_system: true,
                 older_than: None,
                 ignored_files: false,
+                excludes: std::sync::Arc::new(ignore::gitignore::Gitignore::empty()),
             },
             Arc::new(Ruleset::builtin().unwrap()),
         )

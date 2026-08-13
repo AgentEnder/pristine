@@ -287,6 +287,7 @@ impl Rule {
 pub struct Ruleset {
     rules: Vec<Arc<Rule>>,
     detector: Detector,
+    excludes: Vec<String>,
 }
 
 /// The wire shape of a rules file. Only ever seen by serde.
@@ -295,6 +296,11 @@ pub struct Ruleset {
 struct RulesFile {
     #[serde(default)]
     rules: Vec<Rule>,
+    /// Paths the reader never wants walked, in gitignore syntax. Not a rule and deliberately
+    /// not spelled as one: a rule says what a directory *is* so that it can be reclaimed, and
+    /// this says where not to look at all.
+    #[serde(default)]
+    exclude: Vec<String>,
 }
 
 impl Ruleset {
@@ -326,14 +332,19 @@ impl Ruleset {
     ///
     /// If either file is malformed, a rule is incomplete, or a glob fails to compile.
     pub fn with_overrides(user_toml: &str) -> Result<Self, RuleError> {
+        let user = Self::parse_file(user_toml)?;
         let mut rules = Self::parse_rules(BUILTIN)?;
-        for rule in Self::parse_rules(user_toml)? {
+        for rule in user.rules {
             match rules.iter().position(|existing| existing.id == rule.id) {
                 Some(at) => rules[at] = rule,
                 None => rules.push(rule),
             }
         }
-        Self::from_rules(rules)
+        let mut ruleset = Self::from_rules(rules)?;
+        // Only the user's file can carry these. The built-in set names what artefacts *are*,
+        // which is knowledge about ecosystems; where not to look is knowledge about one disk.
+        ruleset.excludes = user.exclude;
+        Ok(ruleset)
     }
 
     /// Loads the ruleset, layering the user's file over the built-in set when it exists.
@@ -377,9 +388,21 @@ impl Ruleset {
     }
 
     fn parse_rules(toml: &str) -> Result<Vec<Rule>, RuleError> {
-        let file: RulesFile =
-            toml::from_str(toml).map_err(|err| RuleError::Parse(err.to_string()))?;
-        Ok(file.rules)
+        Ok(Self::parse_file(toml)?.rules)
+    }
+
+    fn parse_file(toml: &str) -> Result<RulesFile, RuleError> {
+        toml::from_str(toml).map_err(|err| RuleError::Parse(err.to_string()))
+    }
+
+    /// The paths the user's file says never to walk, in gitignore syntax.
+    ///
+    /// Empty unless they asked for it. What a cleaner does not look at is a decision only its
+    /// reader can make, and a shipped list of "system directories" would be a guess about an
+    /// operating system that changes underneath it.
+    #[must_use]
+    pub fn excludes(&self) -> &[String] {
+        &self.excludes
     }
 
     fn from_rules(rules: Vec<Rule>) -> Result<Self, RuleError> {
@@ -396,7 +419,11 @@ impl Ruleset {
         }
         let rules: Vec<Arc<Rule>> = rules.into_iter().map(Arc::new).collect();
         let detector = Detector::new(&rules)?;
-        Ok(Self { rules, detector })
+        Ok(Self {
+            rules,
+            detector,
+            excludes: Vec::new(),
+        })
     }
 }
 
@@ -656,6 +683,31 @@ mod tests {
         assert_eq!(rule.markers_required, MarkersRequired::All);
         assert_eq!(rule.kind, Kind::Build);
         assert_eq!(rule.label(), "A Build Artifacts");
+    }
+
+    #[test]
+    fn the_user_file_can_say_where_never_to_look_and_the_builtin_set_cannot() {
+        // Two different kinds of knowledge in one file. A rule says what an artefact *is*,
+        // which is true of an ecosystem everywhere; an exclude says where not to look, which is
+        // true of one disk. Only the second can come from the user, and shipping a default set
+        // of "system paths" would be a guess about an operating system that moves.
+        let ruleset = Ruleset::with_overrides(
+            r#"
+            exclude = ["Library/Application Support/CloudDocs", "!keep/me"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            ruleset.excludes(),
+            ["Library/Application Support/CloudDocs", "!keep/me"]
+        );
+        // The rules still layer as they always did.
+        assert!(ruleset.rules().iter().any(|rule| rule.id == "node"));
+
+        // And a file that says nothing about it excludes nothing, which is the default a
+        // cleaner has to have: what it does not look at is the reader's decision.
+        assert!(Ruleset::builtin().unwrap().excludes().is_empty());
+        assert!(Ruleset::with_overrides("").unwrap().excludes().is_empty());
     }
 
     #[test]

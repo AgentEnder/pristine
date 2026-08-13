@@ -15,7 +15,7 @@ use std::sync::mpsc::{channel, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 
-use pristine::{Claim, Found, Hit, Order, Rule, Ruleset, Size, SizeMode, Sort, Walker};
+use pristine::{Claim, Found, Hit, Order, Rule, Ruleset, Size, SizeMode, Sort, WalkError, Walker};
 use tempfile::TempDir;
 
 /// Every fixture in this file is tier one, so a hit that carries no rule is a failure rather
@@ -817,4 +817,109 @@ fn a_user_rule_extends_the_built_in_set() {
 
     assert_eq!(hits.len(), 1);
     assert_eq!(rule(&hits[0]).id, "myecosystem");
+}
+
+// ---- excludes ---------------------------------------------------------------------------
+//
+// What the scan is told not to look at. Different from every other reason a directory goes
+// unclaimed, and reported differently: nothing went wrong, but the totals are still not the
+// whole tree, and a run that hid that would be lying about its own arithmetic.
+
+/// A walker excluding `patterns`, in gitignore syntax, relative to `root`.
+fn excluding(root: &Path, patterns: &[&str]) -> Walker {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    for pattern in patterns {
+        builder.add_line(None, pattern).unwrap();
+    }
+    Walker::new(root, ruleset()).excludes(Arc::new(builder.build().unwrap()))
+}
+
+#[test]
+fn an_excluded_subtree_is_never_walked_and_is_counted() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    touch(&root.join("keep/package.json"));
+    touch(&root.join("keep/node_modules/dep/index.js"));
+    touch(&root.join("skip/package.json"));
+    touch(&root.join("skip/node_modules/dep/index.js"));
+
+    let walker = excluding(root, &["skip"]);
+    let hits = scan_with(&walker);
+    let paths: Vec<_> = hits.iter().map(|hit| hit.path.clone()).collect();
+
+    assert_eq!(paths, [root.join("keep/node_modules")]);
+    // Counted rather than silently obeyed. A total with a subtree missing from it has to say
+    // so however deliberately the subtree went missing.
+    let outcome = walker.run(|_| {});
+    assert!(outcome.excluded > 0, "the exclusion was not reported");
+}
+
+#[test]
+fn an_exclusion_can_be_taken_back_for_one_subtree() {
+    // The reason the patterns are gitignore's rather than a list of prefixes: "not in here,
+    // except that one" needs no new grammar, and a macOS `Library` is exactly that shape —
+    // a dozen directories the system will not open, beside real reclaimable output.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    touch(&root.join("Library/Wanted/package.json"));
+    touch(&root.join("Library/Wanted/node_modules/dep/index.js"));
+    touch(&root.join("Library/Private/package.json"));
+    touch(&root.join("Library/Private/node_modules/dep/index.js"));
+
+    let hits = scan_with(&excluding(root, &["Library/*", "!Library/Wanted"]));
+    let paths: Vec<_> = hits.iter().map(|hit| hit.path.clone()).collect();
+
+    assert_eq!(paths, [root.join("Library/Wanted/node_modules")]);
+}
+
+#[test]
+fn excluding_nothing_is_the_default_and_changes_nothing() {
+    // The empty case is worth pinning because the matcher is consulted for every entry on the
+    // disk: an `ignore` override set that matched everything when empty would silently empty
+    // every scan.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    touch(&root.join("app/package.json"));
+    touch(&root.join("app/node_modules/dep/index.js"));
+
+    assert_eq!(scan(root).len(), 1);
+    assert_eq!(scan_with(&excluding(root, &[])).len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_the_system_refuses_is_told_apart_from_one_that_failed() {
+    // Both make the totals a floor and both are reported. Only one of them is news: a path the
+    // OS refuses every process reads the same on every run forever, and listing it beside a
+    // real failure teaches a reader to skip the line that says the totals are a floor.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    touch(&root.join("app/package.json"));
+    let locked = root.join("app/locked");
+    mkdir(&locked);
+    if !seal(&locked) {
+        return; // running as root, which can read it anyway
+    }
+
+    let outcome = Walker::new(root, ruleset()).run(|_| {});
+    unseal(&locked);
+
+    assert!(
+        !outcome.errors.is_empty(),
+        "the sealed directory went unreported"
+    );
+    assert!(
+        outcome.errors.iter().any(WalkError::is_forbidden),
+        "{:?}",
+        outcome.errors
+    );
+    // And the message does not repeat the path, which the reporter puts in front of it.
+    for error in &outcome.errors {
+        if let Some(path) = &error.path {
+            assert!(
+                !error.message.contains(&*path.to_string_lossy()),
+                "the path is in the message as well as in front of it: {error:?}"
+            );
+        }
+    }
 }

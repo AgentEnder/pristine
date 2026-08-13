@@ -2120,6 +2120,7 @@ mod tests {
         let errors = vec![crate::walk::WalkError {
             path: Some("/scan/locked".into()),
             message: "Permission denied".to_owned(),
+            forbidden: true,
         }];
         terminal
             .draw(|frame| {

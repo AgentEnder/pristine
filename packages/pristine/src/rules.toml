@@ -54,6 +54,31 @@
 #
 # Rules are evaluated in order and the first match wins, so put the more specific rule first
 # where two could claim the same directory.
+#
+# ---------------------------------------------------------------------------------------
+# `exclude`: where NOT to look. A user file only — this one ships none, and will not.
+# ---------------------------------------------------------------------------------------
+#
+# A rule says what a directory IS, which is knowledge about an ecosystem and true everywhere.
+# Where not to look is knowledge about one disk, so it can only come from the person holding
+# it. A shipped list of "system directories" would be a guess about an operating system that
+# moves underneath it, and a cleaner that quietly skipped somewhere would be lying about its
+# own totals.
+#
+# Gitignore syntax, matched against paths under the scan root, so a pattern containing a `/`
+# is anchored to that root and one without matches at any depth. `!` takes something back,
+# which is the shape a real exclusion usually has — a directory full of things the system
+# refuses to open, with something worth reclaiming sitting among them:
+#
+#   exclude = [
+#     "Library/Application Support/*",
+#     "!Library/Application Support/Zed",
+#   ]
+#
+# Excluded paths are COUNTED AND REPORTED (`excluded: 114 paths not walked`). That is the
+# point of them being a list rather than a silence: the totals are still not the whole tree,
+# and a run that hid that would be lying in the other direction. `--exclude <GLOB>` adds to
+# this list for one run.
 
 [[rules]]
 id = "node"

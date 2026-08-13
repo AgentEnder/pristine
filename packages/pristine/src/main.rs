@@ -62,6 +62,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use pristine::delete::confirm;
 use pristine::repo::{Class, Repo, Reset, Selected, Selection};
 use pristine::size::human;
@@ -148,6 +149,20 @@ struct Sweep {
     /// again; passing this opens the tree with them already on screen.
     #[arg(long)]
     ignored_files: bool,
+
+    /// Never walk into paths matching this glob. Repeatable, and layered over the `exclude`
+    /// list in the rules file.
+    ///
+    /// Gitignore syntax, matched against paths under the scan root — so `--exclude
+    /// 'Library/Application Support/CloudDocs'` and `--exclude '**/Photos Library.photoslibrary'`
+    /// both work, and a leading `!` re-includes something a broader pattern took out.
+    ///
+    /// What this is FOR is a subtree that is nobody's business to scan: one the operating
+    /// system will not let any process read, a mounted volume, somebody else's home. What it is
+    /// not for is making a total look tidier — an excluded path is reported, because a figure
+    /// that is missing a subtree has to say so.
+    #[arg(long, value_name = "GLOB")]
+    exclude: Vec<String>,
 
     /// Put a number on every claim, by walking each one.
     ///
@@ -407,6 +422,28 @@ fn main() -> ExitCode {
 /// *subtrees* and a listing can only answer it about directories. The listing is what a script
 /// gets, and it is the same scan underneath — see [`Sweep::interactive`] for the three ways a
 /// run says it does not want the tree.
+/// The paths this run will not walk into, from the rules file and the command line together.
+///
+/// Layered rather than either-or: the file is where a standing decision lives — the directories
+/// this machine's operating system will never open, a volume that is somebody else's — and the
+/// flag is for one run. Neither is a default, and there is deliberately no shipped list: a
+/// built-in set of "system paths" is a guess about an OS that changes underneath it, and a
+/// cleaner that quietly skipped somewhere would be lying about its own totals.
+///
+/// Matched relative to the scan root, in gitignore syntax, because that is the matcher the
+/// reader already knows and it brings negation with it for free.
+fn excludes(
+    root: &Path,
+    ruleset: &Ruleset,
+    extra: &[String],
+) -> Result<Arc<Gitignore>, Box<dyn std::error::Error>> {
+    let mut builder = GitignoreBuilder::new(root);
+    for pattern in ruleset.excludes().iter().chain(extra) {
+        builder.add_line(None, pattern)?;
+    }
+    Ok(Arc::new(builder.build()?))
+}
+
 fn sweep_with(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::error::Error>> {
     if !cli.interactive() {
         return run(cli, out);
@@ -420,6 +457,7 @@ fn sweep_with(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::er
             one_file_system: cli.one_file_system,
             older_than: cli.older_than,
             ignored_files: cli.ignored_files,
+            excludes: excludes(&cli.root, &ruleset, &cli.exclude)?,
         },
         ruleset,
     )?;
@@ -446,7 +484,8 @@ fn run(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::error::Er
     // The mount rule has to reach the walk as well as the plan. Setting it on only one of them
     // makes `--one-file-system=false` a flag that permits crossing a mount the scan never
     // looked across, which reads as "there was nothing over there".
-    let outcome = Walker::new(&cli.root, ruleset)
+    let outcome = Walker::new(&cli.root, Arc::clone(&ruleset))
+        .excludes(excludes(&cli.root, &ruleset, &cli.exclude)?)
         .same_file_system(cli.one_file_system)
         .ignored_files(cli.ignored_files)
         .min_size(cli.min_size)
@@ -1051,15 +1090,46 @@ fn write_removal(
 /// On stdout, beside the numbers it qualifies, because someone reading only the listing would
 /// otherwise take an undercount for a total. The detail goes to standard error.
 fn report_scan(out: &mut impl Write, outcome: &WalkOutcome) -> std::io::Result<()> {
+    if outcome.excluded > 0 {
+        // Said even though nothing went wrong, and said on stdout beside the numbers it
+        // qualifies. A total with a subtree missing from it is not the total, however
+        // deliberately it went missing.
+        writeln!(
+            out,
+            "excluded: {} not walked, because you asked for that",
+            plural(outcome.excluded, PATH),
+        )?;
+    }
     if outcome.errors.is_empty() {
         return Ok(());
     }
+
+    // Split before it is counted, because these are two different sentences. A path the
+    // operating system refuses every process is not a fault to be fixed and will read the same
+    // on every run forever; a path that could not be read for any other reason is news. Listing
+    // them together means eleven unfixable lines every run, which teaches a reader to skip
+    // exactly the sentence that says the totals are a floor.
+    let (forbidden, failed): (Vec<_>, Vec<_>) = outcome
+        .errors
+        .iter()
+        .partition(|error| error.is_forbidden());
+
     writeln!(
         out,
         "scan incomplete: {} could not be read, so everything above is a lower bound",
         plural(outcome.errors.len(), PATH),
     )?;
-    for error in &outcome.errors {
+    if !forbidden.is_empty() {
+        writeln!(
+            out,
+            "  of those, {} the system will not let any process read; \
+             --exclude takes them off this list",
+            plural(forbidden.len(), PATH),
+        )?;
+    }
+    // Only the ones somebody can act on go to standard error one by one. The forbidden set is
+    // named by the line above and by `--exclude`, which is the whole of what can be done.
+    for error in failed {
         match &error.path {
             Some(path) => eprintln!("pristine: {}: {}", path.display(), error.message),
             None => eprintln!("pristine: {}", error.message),
