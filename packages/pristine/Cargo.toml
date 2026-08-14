@@ -1,77 +1,43 @@
-# The published package is `pristine-cli`: the plain `pristine` on crates.io is a 0.0.0
-# placeholder from an unrelated project and crates.io does not reclaim names. The binary a
-# human types stays `pristine` on every channel, so the collision leaks into exactly one
-# install string (`cargo install pristine-cli`).
+
 [package]
-name = "pristine-cli"
-description = "A language-agnostic reclaimable-space finder and cleaner."
-# Deliberately a literal, not `version.workspace = true`: `nx release` owns this line, and
-# @monodon/rust's version actions require `[package].version` to be a plain string. Inheriting
-# it from the workspace makes the crate silently skip versioning while the npm packages bump.
-version = "0.1.0"
+name = 'pristine-cli'
+description = 'A language-agnostic reclaimable-space finder and cleaner.'
+version = '0.1.0'
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-readme = "../../README.md"
-keywords = ["disk", "cleanup", "node_modules", "cli"]
-categories = ["command-line-utilities", "filesystem"]
-# Nx wiring is workspace machinery; it has no business inside the published crate.
-exclude = ["project.json"]
+readme = '../../README.md'
+keywords = ['disk', 'cleanup', 'node_modules', 'cli']
+categories = ['command-line-utilities', 'filesystem']
+exclude = ['project.json']
 
-# The library is `pristine` even though the package is `pristine-cli`, so `use pristine::…`
-# reads the same in the integration tests as it will in any downstream consumer.
 [lib]
-name = "pristine"
-path = "src/lib.rs"
+name = 'pristine'
+path = 'src/lib.rs'
 
 [[bin]]
-name = "pristine"
-path = "src/main.rs"
+name = 'pristine'
+path = 'src/main.rs'
 
 [dependencies]
-clap = { version = "4.6", features = ["derive"] }
-# ripgrep's walker. It brings the parallel walk and the full gitignore stack in one
-# dependency; tier one uses the first half and tier two (#588) gets the second half free.
-ignore = "0.4.33"
-# Already in the tree via `ignore`, so the marker/target globs (`*.csproj`, `bazel-*`) cost
-# no new compilation.
-globset = "0.4.20"
-# The front end. `crossterm` is deliberately not a second direct dependency: ratatui
-# re-exports the exact version it was built against as `ratatui::crossterm`, and a separately
-# pinned copy is how a project ends up handing a `KeyEvent` from one semver-incompatible
-# crossterm to a backend expecting another — which compiles until the two versions drift.
-#
-# Default features off because they are not free: `all-widgets` pulls a calendar (and `time`
-# behind it), `macros` a proc-macro crate, `palette` a colour-science library. This draws a
-# tree, a header and a footer. `layout-cache` is kept, because the layout is recomputed on
-# every frame and every resize, which is exactly what it caches.
-ratatui = { version = "0.30", default-features = false, features = [
-  "crossterm",
-  "layout-cache",
+clap = { version = '4.6', features = ['derive'] }
+ignore = '0.4.33'
+globset = '0.4.20'
+ratatui = { version = '0.30', default-features = false, features = [
+	'crossterm',
+	'layout-cache',
 ] }
-# The `/` filter, which npkill is right to make a regex over the whole path rather than a
-# substring: `work/.*/data` is the query a tree of checkouts actually wants. `regex-automata`
-# and `regex-syntax` are already in the graph under `globset`, so this is the API on top of
-# machinery that was being compiled anyway.
-regex = "1.12"
-serde = { version = "1.0.229", features = ["derive"] }
-toml = "1.1.4"
-unicode-normalization = "0.1.25"
-# The deleter's descriptor-relative syscalls: `openat` with `O_NOFOLLOW`, `fstatat`,
-# `unlinkat`. This is the layer `cap-std` is built from, taken directly because the deleter
-# wants the primitives rather than the capability wrapper. It is what lets the removal descend
-# without resolving a path — the property the safety model rests on — while keeping the
-# crate's `unsafe_code = "forbid"`, which a hand-rolled `libc` descent could not.
-cap-primitives = "4.0.2"
+regex = '1.12'
+serde = { version = '1.0.229', features = ['derive'] }
+toml = '1.1.4'
+unicode-normalization = '0.1.25'
+cap-primitives = '4.0.2'
 
 [dev-dependencies]
-tempfile = "3.27.0"
-# Setting a directory's mtime is the only way to test the age floor against a real
-# filesystem rather than against an injected clock, and the standard library can only do it
-# for an open `File`. Tests only: nothing shipped writes a timestamp.
-filetime = "0.2.28"
+tempfile = '3.27.0'
+filetime = '0.2.28'
 
 [lints]
 workspace = true
