@@ -591,19 +591,37 @@ fn the_crate_publishes_over_oidc_rather_than_a_stored_token() {
     );
 }
 
-/// Extract the quoted-string array assigned to `key` in the crate's Cargo.toml.
-fn cargo_string_array(key: &str) -> Vec<String> {
-    let cargo = fs::read_to_string("Cargo.toml").expect("the crate manifest should be readable");
-    let prefix = format!("{key} = [");
-    let line = cargo
-        .lines()
-        .find(|l| l.trim_start().starts_with(prefix.as_str()))
-        .unwrap_or_else(|| panic!("Cargo.toml has no `{key} = [...]` array"));
-    // Odd-indexed `split('"')` fields are the contents between quote pairs.
-    line.split('"')
-        .skip(1)
-        .step_by(2)
-        .map(str::to_owned)
+/// Parse a manifest as TOML.
+///
+/// Deliberately a real parser, unlike `build_matrix` above. `nx release version`
+/// round-trips `packages/pristine/Cargo.toml` through `@ltd/j-toml`, which
+/// reserializes every string with single quotes (brain:
+/// `areas/pristine/docs/releasing.md`, "Things that bite"). Cargo and crates.io
+/// read that manifest exactly as they read the double-quoted one, so a reader
+/// here that goes looking for `"` does not catch a real problem — it invents one,
+/// and it invents it on the release commit, which is the worst place to spend a
+/// red build.
+fn manifest(source: &str, what: &str) -> toml::Table {
+    source
+        .parse()
+        .unwrap_or_else(|e| panic!("{what} should be valid TOML: {e}"))
+}
+
+/// Extract the `[package]` string array assigned to `key`.
+fn cargo_string_array(cargo: &toml::Table, key: &str) -> Vec<String> {
+    cargo
+        .get("package")
+        .and_then(|package| package.get(key))
+        .unwrap_or_else(|| panic!("Cargo.toml [package] has no `{key}`"))
+        .as_array()
+        .unwrap_or_else(|| panic!("Cargo.toml [package] `{key}` is not an array"))
+        .iter()
+        .map(|entry| {
+            entry
+                .as_str()
+                .unwrap_or_else(|| panic!("Cargo.toml [package] `{key}` holds a non-string"))
+                .to_owned()
+        })
         .collect()
 }
 
@@ -613,10 +631,13 @@ fn cargo_string_array(key: &str) -> Vec<String> {
 /// binaries. Assert the constraints here instead.
 #[test]
 fn crate_metadata_is_crates_io_publishable() {
-    let cargo = fs::read_to_string("Cargo.toml").expect("the crate manifest should be readable");
-    let workspace = read("Cargo.toml");
+    let cargo = manifest(
+        &fs::read_to_string("Cargo.toml").expect("the crate manifest should be readable"),
+        "the crate manifest",
+    );
+    let workspace = manifest(&read("Cargo.toml"), "the workspace manifest");
 
-    let keywords = cargo_string_array("keywords");
+    let keywords = cargo_string_array(&cargo, "keywords");
     assert!(
         (1..=5).contains(&keywords.len()),
         "crates.io allows at most 5 keywords, found {}: {keywords:?}",
@@ -634,28 +655,40 @@ fn crate_metadata_is_crates_io_publishable() {
     }
 
     assert!(
-        !cargo_string_array("categories").is_empty(),
+        !cargo_string_array(&cargo, "categories").is_empty(),
         "declare at least one crates.io category"
     );
 
     // A field may be stated outright or inherited with `field.workspace = true`,
-    // in which case the root manifest has to actually carry it. An inherited key
-    // the workspace never declares is a `cargo publish` failure and nothing
-    // earlier — `cargo build` does not read publish metadata.
+    // in which case the root manifest's `[workspace.package]` has to actually
+    // carry it. An inherited key the workspace never declares is a
+    // `cargo publish` failure and nothing earlier — `cargo build` does not read
+    // publish metadata.
     for field in ["readme", "repository", "license", "description"] {
-        let declared = |toml: &str, decl: &str| {
-            toml.lines()
-                .any(|l| l.trim_start().starts_with(&format!("{field}{decl}")))
-        };
-        if declared(&cargo, " = ") {
+        let declared = cargo
+            .get("package")
+            .and_then(|package| package.get(field))
+            .unwrap_or_else(|| {
+                panic!(
+                    "Cargo.toml [package] is missing `{field}`, which `cargo install` users read"
+                )
+            });
+        if declared.is_str() {
             continue;
         }
         assert!(
-            declared(&cargo, ".workspace = true"),
-            "Cargo.toml [package] is missing `{field}`, which `cargo install` users read"
+            declared
+                .get("workspace")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false),
+            "Cargo.toml [package] `{field}` is neither a string nor `{field}.workspace = true`"
         );
         assert!(
-            declared(&workspace, " = "),
+            workspace
+                .get("workspace")
+                .and_then(|w| w.get("package"))
+                .and_then(|package| package.get(field))
+                .is_some_and(toml::Value::is_str),
             "the crate inherits `{field}` from the workspace, which does not declare it"
         );
     }
