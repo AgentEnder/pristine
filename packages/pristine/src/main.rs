@@ -150,6 +150,17 @@ struct Sweep {
     #[arg(long)]
     ignored_files: bool,
 
+    /// Name every path the summary lines count, instead of only counting them.
+    ///
+    /// Off by default because the counts are the useful part and the list is not: a home
+    /// directory can hit a hundred and thirty-six unreadable paths, and a hundred and
+    /// thirty-six lines of stderr after a scan is a worse way to learn "this total is a floor"
+    /// than one line saying so. What the default keeps is the *fact*; this is for the run where
+    /// you want to act on it — building an `exclude` list, or chasing one path that should have
+    /// been readable.
+    #[arg(long, short = 'v')]
+    verbose: bool,
+
     /// Never walk into paths matching this glob. Repeatable, and layered over the `exclude`
     /// list in the rules file.
     ///
@@ -461,14 +472,29 @@ fn sweep_with(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::er
         },
         ruleset,
     )?;
-    // A live view says everything it knows while the reader is there to read it — an
-    // unreadable path in the header, a failed removal in the footer — and a script reads none
-    // of that. The status is the one channel both front ends share, so it says the same thing
-    // in both: this run could not do everything it was asked.
-    for failure in &outcome.errors {
-        match &failure.path {
-            Some(path) => eprintln!("pristine: {}: {}", path.display(), failure.message),
-            None => eprintln!("pristine: {}", failure.message),
+    // A live view says everything it knows while the reader is there to read it — an unreadable
+    // path in the header, a failed removal in the footer — and a script reads none of that. The
+    // status is the one channel both front ends share, so it says the same thing in both: this
+    // run could not do everything it was asked.
+    //
+    // **One line rather than one per path**, because the header has already said it and the
+    // reader has already read it. Repeating a hundred and thirty-six paths onto the terminal
+    // the moment the view is torn down does not add a fact; it buries the shell prompt under
+    // the one part of the run the reader had finished with.
+    if !outcome.errors.is_empty() {
+        if cli.verbose {
+            for failure in &outcome.errors {
+                match &failure.path {
+                    Some(path) => eprintln!("pristine: {}: {}", path.display(), failure.message),
+                    None => eprintln!("pristine: {}", failure.message),
+                }
+            }
+        } else {
+            eprintln!(
+                "pristine: {} could not be read, so what was shown is a lower bound{}",
+                plural(outcome.errors.len(), PATH),
+                hint(false),
+            );
         }
     }
     Ok(outcome.whole())
@@ -530,7 +556,7 @@ fn run(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::error::Er
         writeln!(out, "{}", summary(&hits))?;
         report_unpriced(out, unpriced(&hits))?;
         report_fallback(out, &outcome.fallback)?;
-        report_scan(out, &outcome, &cli.root)?;
+        report_scan(out, &outcome, &cli.root, cli.verbose)?;
         return Ok(whole);
     }
 
@@ -552,7 +578,7 @@ fn run(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::error::Er
     // a tier that went inert is a tier whose findings are missing from what is about to be
     // removed, and a plan that did not say so would read as the whole of what is reclaimable.
     report_fallback(out, &outcome.fallback)?;
-    report_scan(out, &outcome, &cli.root)?;
+    report_scan(out, &outcome, &cli.root, cli.verbose)?;
 
     if cli.dry_run {
         writeln!(out, "\ndry run: nothing was removed")?;
@@ -1089,7 +1115,12 @@ fn write_removal(
 ///
 /// On stdout, beside the numbers it qualifies, because someone reading only the listing would
 /// otherwise take an undercount for a total. The detail goes to standard error.
-fn report_scan(out: &mut impl Write, outcome: &WalkOutcome, root: &Path) -> std::io::Result<()> {
+fn report_scan(
+    out: &mut impl Write,
+    outcome: &WalkOutcome,
+    root: &Path,
+    verbose: bool,
+) -> std::io::Result<()> {
     if outcome.excluded > 0 {
         // Said even though nothing went wrong, and said on stdout beside the numbers it
         // qualifies. A total with a subtree missing from it is not the total, however
@@ -1119,24 +1150,42 @@ fn report_scan(out: &mut impl Write, outcome: &WalkOutcome, root: &Path) -> std:
         "scan incomplete: {} could not be read, so everything above is a lower bound",
         plural(outcome.errors.len(), PATH),
     )?;
-    if !forbidden.is_empty() {
-        // Named once, spelled the way an `exclude` entry is spelled, because a reader who wants
-        // them gone has to be able to say which ones. Withholding the list to keep the output
-        // short would leave the summary above pointing at a flag nobody can fill in — and these
-        // paths do not change from run to run, so seeing them once is the whole cost.
+    // The split, in one line, and then nothing else unless it was asked for. The counts carry
+    // the whole of what a reader has to know by default — that the totals are a floor, and how
+    // much of the floor is unfixable — and the paths carry only what they need on the run where
+    // they act on it. A hundred and thirty-six lines of stderr says the same thing, worse.
+    if !forbidden.is_empty() && !failed.is_empty() {
         writeln!(
             out,
-            "  of those, {} the system will not let any process read. To stop seeing them, \
-             add to `exclude` in {}:",
-            plural(forbidden.len(), PATH),
+            "  {} refused by the system, {} for other reasons{}",
+            forbidden.len(),
+            failed.len(),
+            hint(verbose),
+        )?;
+    } else if !forbidden.is_empty() {
+        writeln!(
+            out,
+            "  all of them refused by the system rather than failing{}",
+            hint(verbose),
+        )?;
+    }
+    if !verbose {
+        return Ok(());
+    }
+
+    if !forbidden.is_empty() {
+        // Spelled the way an `exclude` entry is spelled, so the block pastes straight in, and
+        // the file it pastes into is named. Sorted for the reason the removal report is: the
+        // walk finishes in whatever order its threads allow, and a list somebody is about to
+        // copy should not reorder itself between runs.
+        writeln!(
+            out,
+            "  to stop seeing these, add to `exclude` in {}:",
             Ruleset::user_config_path()
                 .as_deref()
                 .unwrap_or_else(|| Path::new("the rules file"))
                 .display(),
         )?;
-        // Sorted, for the reason the removal report is: the walk finishes in whatever order
-        // its threads allow, and a list somebody is about to paste into a config file should
-        // not come out in a different order every run.
         let mut shown: Vec<&Path> = forbidden
             .iter()
             .filter_map(|error| error.path.as_deref())
@@ -1147,8 +1196,7 @@ fn report_scan(out: &mut impl Write, outcome: &WalkOutcome, root: &Path) -> std:
             writeln!(out, "    \"{}\",", path.display())?;
         }
     }
-    // Only the ones somebody can act on go to standard error one by one. The forbidden set is
-    // named by the line above and by `--exclude`, which is the whole of what can be done.
+    // The ones somebody can act on, to standard error, where the detail of a failure goes.
     for error in failed {
         match &error.path {
             Some(path) => eprintln!("pristine: {}: {}", path.display(), error.message),
@@ -1156,6 +1204,18 @@ fn report_scan(out: &mut impl Write, outcome: &WalkOutcome, root: &Path) -> std:
         }
     }
     Ok(())
+}
+
+/// What to say about the paths a count did not name, when nothing named them.
+///
+/// Empty under `--verbose`, where the list follows and pointing at the flag that produced it
+/// would be telling a reader to do what they have already done.
+fn hint(verbose: bool) -> &'static str {
+    if verbose {
+        ""
+    } else {
+        " · --verbose names them"
+    }
 }
 
 /// A noun and its plural, so a count can be read aloud.

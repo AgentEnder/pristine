@@ -496,9 +496,19 @@ fn a_root_that_is_not_there_fails_instead_of_reporting_an_empty_tree() {
     let (printed, complaints) = fails(Path::new("/pristine/does/not/exist"), &[]);
 
     assert!(printed.contains("scan incomplete"), "{printed}");
+    // The count is the default, and it carries the fact on its own. A reader who wants the
+    // path asks for it — see below — because a home directory reaches a hundred and thirty-six
+    // of these and a hundred and thirty-six lines of stderr is a worse way to say "floor".
+    assert!(
+        !complaints.contains("/pristine/does/not/exist"),
+        "the default named every path: {complaints}"
+    );
+
+    let (printed, complaints) = fails(Path::new("/pristine/does/not/exist"), &["--verbose"]);
+    assert!(printed.contains("scan incomplete"), "{printed}");
     assert!(
         complaints.contains("/pristine/does/not/exist"),
-        "{complaints}"
+        "--verbose did not name the path: {complaints}"
     );
 }
 
@@ -524,10 +534,72 @@ fn a_repository_that_will_not_answer_makes_the_scan_incomplete() {
 
     let (printed, complaints) = fails(tmp.path(), &["--min-size", "128K"]);
 
+    // The status and the sentence, without the detail: this is a failure a reader can act on,
+    // so `--verbose` names it, but the default still says the scan did not cover what it was
+    // pointed at.
+    assert!(printed.contains("scan incomplete"), "{printed}");
+    assert!(complaints.is_empty(), "{complaints}");
+
+    let (printed, complaints) = fails(tmp.path(), &["--min-size", "128K", "--verbose"]);
     assert!(printed.contains("scan incomplete"), "{printed}");
     assert!(
         complaints.contains("git would not list the index"),
-        "{complaints}"
+        "--verbose did not name the failure: {complaints}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn many_unreadable_paths_cost_two_lines_rather_than_one_line_each() {
+    // The complaint this default exists for. A home directory reaches a hundred and thirty-six
+    // unreadable paths, and printing one line each buries the shell prompt under the part of
+    // the run the reader had already finished with — while saying nothing the count does not.
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let mut sealed = Vec::new();
+    for n in 0..20 {
+        let locked = root.join(format!("locked{n}"));
+        fs::create_dir_all(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        sealed.push(locked);
+    }
+    if fs::read_dir(&sealed[0]).is_ok() {
+        return; // running as root, which can read them anyway
+    }
+
+    let quiet = run(root, &[], "");
+    let loud = run(root, &["--verbose"], "");
+    for locked in &sealed {
+        fs::set_permissions(locked, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // The fact survives at full volume; only the enumeration goes. Two lines carry it — the
+    // count, and the split with a pointer at the flag that expands it.
+    assert!(quiet.stdout.contains("scan incomplete"), "{}", quiet.stdout);
+    assert!(quiet.stdout.contains("--verbose"), "{}", quiet.stdout);
+    assert_eq!(
+        quiet.stdout.matches("locked").count(),
+        0,
+        "{}",
+        quiet.stdout
+    );
+    assert!(
+        quiet.stderr.lines().count() <= 1,
+        "{} lines of stderr for 20 unreadable paths:\n{}",
+        quiet.stderr.lines().count(),
+        quiet.stderr
+    );
+
+    // And asking still names every one of them. These are refusals rather than failures, so
+    // they arrive as the pasteable `exclude` block on stdout — the detail of a *failure* is
+    // what goes to stderr.
+    assert_eq!(
+        loud.stdout.matches("locked").count(),
+        20,
+        "--verbose named {} of 20:\n{}",
+        loud.stdout.matches("locked").count(),
+        loud.stdout
     );
 }
 
