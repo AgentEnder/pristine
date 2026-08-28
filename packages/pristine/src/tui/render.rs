@@ -518,6 +518,16 @@ fn headline(view: &View, errors: &[WalkError]) -> Paragraph<'static> {
             plural(total.claims, "directory", "directories")
         )),
     ];
+    // Said on the headline as well as on the rows, because the rows carrying it may all be
+    // collapsed out of view — and a total that silently excludes a third of what `du` would
+    // have reported needs to say so somewhere always visible.
+    let shared = view.tree().node(view.tree().root()).shared;
+    if shared > 0 {
+        spans.push(Span::styled(
+            format!("· {} shared, stays ", human(shared)),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
     if total.unpriced > 0 {
         // Two different facts, and saying the wrong one is a small lie a reader would catch:
         // while the walk is running an unpriced claim is one the pool has not reached yet,
@@ -880,16 +890,27 @@ fn arrival(view: &View, id: NodeId) -> Style {
     Style::default().bg(Color::Rgb(channel(26.0), channel(62.0), channel(44.0)))
 }
 
-/// What this row is, when anything knows.
+/// What this row is, when anything knows, and what its number leaves out.
 ///
 /// Only on a claim: an ancestor covers several rules at once, and a directory holding a
 /// `node_modules` and a `target` is not one artefact. The tier-two gap is carried through
 /// rather than papered over — a row that says only "gitignored" is a row nothing has named.
+///
+/// The remainder rides in the same cell because the table has no room for a column that is
+/// empty on almost every row, and because it is a caveat on the size rather than a second
+/// size. Without it, the honest number is the confusing one: a `node_modules` that `du` calls
+/// 162 MiB, shown as 46.8 MiB with nothing else on the line, reads as a tool that failed to
+/// look — and the reader's next move is to distrust it rather than to prune their store.
 fn label(view: &View, id: NodeId) -> String {
-    match &view.tree().node(id).hit {
-        Some(hit) => hit.label().into_owned(),
-        None => String::new(),
+    let node = view.tree().node(id);
+    let Some(hit) = &node.hit else {
+        return String::new();
+    };
+    let label = hit.label();
+    if hit.shared == 0 {
+        return label.into_owned();
     }
+    format!("{label} · {} shared, stays", human(hit.shared))
 }
 
 /// How long ago, in the coarsest unit that is still true.

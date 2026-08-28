@@ -25,6 +25,7 @@ pub(crate) fn hit(path: &str, size: Size, seconds: u64) -> Hit {
     let ruleset = Ruleset::builtin().expect("the built-in ruleset parses");
     let rule = Arc::clone(&ruleset.rules()[0]);
     Hit {
+        shared: 0,
         path: PathBuf::from(path),
         claim: Claim::Rule(RuleClaim {
             project_root: PathBuf::from("/scan"),

@@ -1230,12 +1230,12 @@ impl View {
         }
     }
 
-    /// A price for a claim that was published without one.
-    pub fn priced(&mut self, path: &Path, size: Size) {
+    /// A price for a claim that was published without one, and the remainder it came with.
+    pub fn priced(&mut self, path: &Path, size: Size, shared: u64) {
         if let Some(id) = self.tree.find(path) {
             self.moving.cools(id);
         }
-        self.tree.price(path, size);
+        self.tree.price(path, size, shared);
         self.stale = true;
         self.sorted = false;
     }
@@ -3430,7 +3430,7 @@ mod tests {
 
         // …and the moment a price lands it is a number, without the row moving.
         let mut view = view;
-        view.priced(Path::new("/scan/nx/node_modules"), Size::Measured(2048));
+        view.priced(Path::new("/scan/nx/node_modules"), Size::Measured(2048), 0);
         view.sync();
         assert_eq!(view.roll(at(&view, "/scan/nx")).label(), "2.0 KiB");
     }
@@ -3495,7 +3495,7 @@ mod tests {
         // put a number on it that makes it the biggest thing in the scan. The row moves, by
         // design — and the cursor moves with it rather than staying on row 2, which is now
         // somebody else.
-        view.priced(Path::new("/scan/old/target"), Size::Measured(9000));
+        view.priced(Path::new("/scan/old/target"), Size::Measured(9000), 0);
         view.sync();
 
         assert_eq!(shown(&view), ["/scan", "  old", "  nx"]);
@@ -5081,7 +5081,7 @@ mod tests {
 
         // …and the two facts stay apart once the pass reports: nothing left to ask for
         // because it has a price now, rather than because somebody is still working on it.
-        view.priced(&claim, Size::Measured(64));
+        view.priced(&claim, Size::Measured(64), 0);
         view.repriced(&[claim], Notice::passing("priced 1 directory"));
         assert_eq!(view.apply(Action::Price(nx)), Effect::None);
         assert!(
@@ -5251,7 +5251,7 @@ mod tests {
         // wrong in, and not a dash, which throws away a number that is already known.
         assert_eq!(view.roll(nx).label(), "> 4.1 KiB");
 
-        view.priced(Path::new("/scan/nx/b/node_modules"), Size::Measured(700));
+        view.priced(Path::new("/scan/nx/b/node_modules"), Size::Measured(700), 0);
         view.sync();
         assert_eq!(view.roll(nx).label(), "4.8 KiB");
     }
@@ -5274,7 +5274,7 @@ mod tests {
         assert!(view.is_pricing(a));
         assert!(!view.is_pricing(b));
 
-        view.priced(Path::new("/scan/a/node_modules"), Size::Measured(64));
+        view.priced(Path::new("/scan/a/node_modules"), Size::Measured(64), 0);
         assert!(!view.is_pricing(a));
     }
 
@@ -5369,7 +5369,7 @@ mod tests {
         // bytes can be trusted.
         assert!((view.share(view.tree().root()) - 0.5).abs() < 1e-9);
 
-        view.priced(Path::new("/scan/b/node_modules"), Size::Measured(1000));
+        view.priced(Path::new("/scan/b/node_modules"), Size::Measured(1000), 0);
         view.sync();
         assert!((view.share(view.tree().root()) - 0.5).abs() < 1e-9);
     }

@@ -871,6 +871,7 @@ mod tests {
         view.priced(
             std::path::Path::new("/scan/a/node_modules"),
             Size::Measured(1024),
+            0,
         );
         view.sync();
         assert_eq!(Status::of(&view, 0), Status::Scanning(3072));

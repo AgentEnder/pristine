@@ -633,6 +633,7 @@ mod tests {
         view.priced(
             std::path::Path::new("/scan/pua/target"),
             Size::Measured(4096),
+            0,
         );
         view.sync();
         screen

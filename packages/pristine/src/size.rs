@@ -23,8 +23,13 @@
 //! When a breakdown is asked for, the subtree goes through the tight `read_dir` + `lstat`
 //! loop below rather than back through the scan that found it: no ignore stack, no rule
 //! evaluation, no path bookkeeping, one pass, on the walker thread that found the claim.
-//! Bytes are *allocated* blocks rather than apparent length, because allocated is what
-//! deleting gives back.
+//! Bytes are *allocated* blocks rather than apparent length, because allocated is closer to
+//! what deleting gives back — though not equal to it. A block a claim references may be held
+//! by a hard link with a name outside the claim, or by an extent cloned out of a store, and
+//! either way it stays where it is when the claim goes. What survives is measured rather than
+//! assumed: see [`Pass::settle`] for names and [`crate::sharing`] for extents. The claim
+//! reports what comes back, and what does not comes back beside it as
+//! [`Measurement::shared`].
 //!
 //! ## The one thing a default scan does have to look at
 //!
@@ -40,10 +45,12 @@
 //! walked. Over `~/repos`: 2.9 s with tier two off, 4.1 s with it on, for 75 tier-two claims
 //! that arrive priced.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
+
+use crate::sharing;
 
 /// What is known about a claim's size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -52,7 +59,14 @@ pub enum Size {
     /// failure and not a zero: ask for a breakdown to turn it into a number.
     #[default]
     Unmeasured,
-    /// Allocated bytes, summed over everything beneath the claim.
+    /// Allocated bytes that deleting the claim would actually give back, summed over
+    /// everything beneath it.
+    ///
+    /// Not "how many distinct bytes live under here" — that is `du`'s question, and the two
+    /// numbers part company wherever the tree shares storage with something outside itself.
+    /// A `node_modules` pnpm cloned out of its store references gigabytes and owns none of
+    /// them; what it is worth is what comes back, so that is what this is. The difference is
+    /// [`Measurement::shared`], reported beside it rather than folded in.
     Measured(u64),
 }
 
@@ -152,8 +166,12 @@ impl SizeMode {
 /// The result of measuring one directory.
 #[derive(Debug, Clone, Default)]
 pub struct Measurement {
-    /// What is known about the size.
+    /// What is known about the size — the bytes deleting this claim actually returns.
     pub size: Size,
+    /// Blocks the claim references but would not give back, because something outside it
+    /// holds another reference: a hard link with a name elsewhere, or an extent cloned out of
+    /// a store. Zero on an ordinary tree, and most of a pnpm `node_modules`.
+    pub shared: u64,
     /// Entries that could not be read, so the total is a lower bound. Reported rather than
     /// swallowed: a number that silently excludes an unreadable half of the tree is worse
     /// than one labelled incomplete.
@@ -166,6 +184,8 @@ pub struct Survey {
     /// The total. [`Size::Unmeasured`] only when the survey gave up early, which it does only
     /// once `nested_repo` is set and the candidate is dead anyway.
     pub size: Size,
+    /// Blocks referenced but not owned. See [`Measurement::shared`].
+    pub shared: u64,
     /// A git repository living inside the candidate, if there is one. Its presence is what
     /// stops the directory above it being removed wholesale.
     pub nested_repo: Option<PathBuf>,
@@ -230,6 +250,7 @@ impl Measurer {
         if !metadata.is_dir() {
             return Measurement {
                 size: Size::Measured(allocated(metadata)),
+                shared: 0,
                 unreadable: Vec::new(),
             };
         }
@@ -239,7 +260,8 @@ impl Measurer {
 
         let walked = self.walk(dir, metadata, false);
         Measurement {
-            size: Size::Measured(walked.bytes),
+            size: Size::Measured(walked.freed),
+            shared: walked.shared,
             unreadable: walked.unreadable,
         }
     }
@@ -265,6 +287,7 @@ impl Measurer {
         if !metadata.is_dir() {
             return Survey {
                 size: Size::Measured(allocated(metadata)),
+                shared: 0,
                 nested_repo: None,
                 unreadable: Vec::new(),
                 not_crossed: Vec::new(),
@@ -275,7 +298,14 @@ impl Measurer {
             size: if walked.nested_repo.is_some() {
                 Size::Unmeasured
             } else {
-                Size::Measured(walked.bytes)
+                Size::Measured(walked.freed)
+            },
+            // A survey that stopped at a nested repository has no total, and a remainder
+            // without a total to sit beside is not a fact about anything.
+            shared: if walked.nested_repo.is_some() {
+                0
+            } else {
+                walked.shared
             },
             nested_repo: walked.nested_repo,
             unreadable: walked.unreadable,
@@ -289,7 +319,9 @@ impl Measurer {
     /// asked for that has no further use for the total.
     fn walk(&self, dir: &Path, metadata: &fs::Metadata, watch_for_repos: bool) -> Walked {
         let mut pass = Pass {
-            bytes: allocated(metadata),
+            // The directory's own inode. A directory cannot be cloned or hard-linked into a
+            // store, so it is owned outright and needs none of the reconciliation below.
+            freed: allocated(metadata),
             boundary: device(metadata),
             watch_for_repos,
             ..Pass::default()
@@ -351,12 +383,7 @@ impl Measurer {
                 }
                 continue;
             }
-            if let Some(identity) = multiply_linked(&metadata) {
-                if !pass.linked.insert(identity) {
-                    continue;
-                }
-            }
-            pass.bytes += allocated(&metadata);
+            pass.charge(&path, &metadata);
             if metadata.is_dir() {
                 pass.stack.push(path);
             }
@@ -368,31 +395,115 @@ impl Measurer {
 /// The running state of one traversal.
 #[derive(Debug, Default)]
 struct Pass {
-    bytes: u64,
+    /// Bytes settled as recoverable so far. Entries with no second reference land here as
+    /// they are seen; hard-linked ones cannot, and wait in `linked`.
+    freed: u64,
+    /// Bytes this claim references and would not get back.
+    shared: u64,
     boundary: u64,
     watch_for_repos: bool,
     unreadable: Vec<PathBuf>,
     not_crossed: Vec<PathBuf>,
-    /// Multiply-linked files, so a hard-linked artefact is counted once per claim rather than
-    /// once per link. Only populated by files that actually carry more than one link, which on
-    /// an ordinary tree is none of them.
-    linked: HashSet<(u64, u64)>,
+    /// Multiply-linked inodes, held until the pass ends.
+    ///
+    /// This used to be a `HashSet`, and the difference is the whole correction. A set makes a
+    /// claim's total agree with `du`, by counting a hard-linked file once instead of once per
+    /// link — but `du` answers "how many distinct bytes are under here", and agreeing with it
+    /// imported its question along with its number. What pristine promises is what a deletion
+    /// gives back, and for an inode whose other name lives outside the claim that is nothing
+    /// at all: `unlink` drops `st_nlink` from 2 to 1 and frees no blocks.
+    ///
+    /// Telling those apart needs no filesystem-wide search, which an earlier comment here
+    /// claimed it did. `st_nlink` already says how many names the inode has; counting how many
+    /// this pass found is the other half, and that is only knowable once the pass is over.
+    /// Hence a map, and hence [`Pass::settle`].
+    ///
+    /// Only files carrying more than one link get an entry — on an ordinary tree none of them,
+    /// on a pnpm tree on ext4 most of them.
+    linked: HashMap<(u64, u64), Linked>,
     stack: Vec<PathBuf>,
 }
 
+/// One multiply-linked inode, and what the claim has seen of it.
+#[derive(Debug)]
+struct Linked {
+    /// Names this inode has anywhere on the volume, from `st_nlink`.
+    names: u64,
+    /// Names this pass found inside the claim.
+    seen: u64,
+    /// What the inode is billed for.
+    allocated: u64,
+    /// What it owns outright, once extent sharing is accounted for too. The two forms compose
+    /// rather than substitute: a pnpm file on btrfs can be both hard-linked into a store and
+    /// cloned out of one.
+    private: u64,
+}
+
 impl Pass {
-    fn stopped_at(self, nested_repo: PathBuf) -> Walked {
+    /// Books one entry.
+    ///
+    /// A multiply-linked file is not charged here at all — see [`Pass::settle`]. Everything
+    /// else is settled on the spot, because nothing later in the pass can change what it is
+    /// worth.
+    fn charge(&mut self, path: &Path, metadata: &fs::Metadata) {
+        let allocated = allocated(metadata);
+        if let Some(identity) = multiply_linked(metadata) {
+            self.linked
+                .entry(identity)
+                .or_insert_with(|| Linked {
+                    names: links(metadata),
+                    seen: 0,
+                    allocated,
+                    private: sharing::of(path, allocated).private,
+                })
+                .seen += 1;
+            return;
+        }
+        // Only a regular file can have extents to share. A directory is its own entry table
+        // and a symlink is its own target string, so asking the filesystem about either buys
+        // a syscall per entry to be told what is already known.
+        if !metadata.is_file() {
+            self.freed += allocated;
+            return;
+        }
+        let sharing = sharing::of(path, allocated);
+        self.freed += sharing.private;
+        self.shared += sharing.shared(allocated);
+    }
+
+    /// Settles the hard-linked inodes, now that the pass knows how much of each it found.
+    ///
+    /// An inode every one of whose names is inside the claim goes when the claim goes, so it
+    /// is worth what it owns. An inode with a name outside is worth nothing — every block of
+    /// it stays, held by the name that survives. That second case is the pnpm store, and it is
+    /// the one the old accounting priced at full value.
+    fn settle(&mut self) {
+        for group in std::mem::take(&mut self.linked).values() {
+            if group.seen >= group.names {
+                self.freed += group.private;
+                self.shared += group.allocated - group.private;
+            } else {
+                self.shared += group.allocated;
+            }
+        }
+    }
+
+    fn stopped_at(mut self, nested_repo: PathBuf) -> Walked {
+        self.settle();
         Walked {
-            bytes: self.bytes,
+            freed: self.freed,
+            shared: self.shared,
             nested_repo: Some(nested_repo),
             unreadable: self.unreadable,
             not_crossed: self.not_crossed,
         }
     }
 
-    fn finished(self) -> Walked {
+    fn finished(mut self) -> Walked {
+        self.settle();
         Walked {
-            bytes: self.bytes,
+            freed: self.freed,
+            shared: self.shared,
             nested_repo: None,
             unreadable: self.unreadable,
             not_crossed: self.not_crossed,
@@ -402,7 +513,10 @@ impl Pass {
 
 /// What one traversal came back with.
 struct Walked {
-    bytes: u64,
+    /// Bytes a deletion of this subtree would actually return.
+    freed: u64,
+    /// Bytes it references and would leave behind.
+    shared: u64,
     /// The directory holding the `.git` that stopped the walk, when one did. `bytes` is then a
     /// lower bound rather than a total.
     nested_repo: Option<PathBuf>,
@@ -535,12 +649,17 @@ pub(crate) fn identity(_stat: &impl Stat) -> Option<(u64, u64)> {
 }
 
 /// The `(device, inode)` identity of a file with more than one hard link, or `None` when it
-/// has exactly one and cannot be double-counted.
+/// has exactly one and so is worth exactly what it is billed.
 ///
-/// Deduplicating here makes a claim's total agree with `du`, which is the number the user
-/// will check it against. It still overstates a pnpm `node_modules`, whose links point into
-/// a store *outside* the claim: deleting the tree frees only the links. Answering that would
-/// mean proving no link lives elsewhere, which costs a scan of the whole filesystem.
+/// A file with a second name is not something a claim can be priced on the spot, because what
+/// the claim is worth depends on where that other name is. [`Pass::settle`] resolves it once
+/// the pass has seen every name it is going to.
+///
+/// This used to say that telling an inside link from an outside one "costs a scan of the whole
+/// filesystem". It does not, and that sentence was the bug: `st_nlink` reports how many names
+/// the inode has, so counting the ones inside the claim is the entire test. What it cost
+/// instead was a claim's honesty — a pnpm `node_modules` on ext4 was priced at its store's
+/// full contents, and deleting it returned none of them.
 #[cfg(unix)]
 pub(crate) fn multiply_linked(stat: &impl Stat) -> Option<(u64, u64)> {
     (stat.nlink() > 1 && !stat.is_dir()).then(|| (stat.dev(), stat.ino()))
@@ -551,9 +670,26 @@ pub(crate) fn multiply_linked(_stat: &impl Stat) -> Option<(u64, u64)> {
     None
 }
 
+/// How many names the inode has, anywhere on its volume.
+///
+/// The count that decides whether deleting a claim really releases a hard-linked file, by
+/// standing against the number of names the claim itself holds.
+#[cfg(unix)]
+pub(crate) fn links(stat: &impl Stat) -> u64 {
+    stat.nlink()
+}
+
+/// One, off unix, where [`multiply_linked`] never reports a group for this to describe.
+#[cfg(not(unix))]
+pub(crate) fn links(_stat: &impl Stat) -> u64 {
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Measurer, Size, SizeMode};
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
     use std::path::Path;
     use std::{fs, io};
     use tempfile::TempDir;
@@ -611,6 +747,107 @@ mod tests {
         unseal(&sealed);
 
         assert_eq!(measured.unreadable, [sealed]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_link_whose_other_name_is_outside_the_claim_is_worth_nothing() {
+        // The pnpm store, in miniature, and the case the old accounting got backwards. The
+        // artefact's blocks live in `store`; `claim` holds a second name for the same inode.
+        // Deleting `claim` drops `st_nlink` from 2 to 1 and returns not one block.
+        let tmp = TempDir::new().unwrap();
+        write(&tmp, "store/blob.bin", 512 * 1024);
+        fs::create_dir(tmp.path().join("claim")).unwrap();
+        fs::hard_link(
+            tmp.path().join("store/blob.bin"),
+            tmp.path().join("claim/blob.bin"),
+        )
+        .unwrap();
+
+        let claim = tmp.path().join("claim");
+        let metadata = claim.symlink_metadata().unwrap();
+        let measured = Measurer::new(SizeMode::Breakdown).measure(&claim, &metadata);
+
+        // The directory's own inode is real and does come back. The 512 KiB does not.
+        let bytes = measured.size.bytes().unwrap();
+        assert!(
+            bytes < 512 * 1024,
+            "priced at {bytes}, the store's blocks and all"
+        );
+        assert!(
+            measured.shared >= 512 * 1024,
+            "the blocks that stay are not reported: {measured:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_link_whose_every_name_is_inside_the_claim_is_worth_its_blocks() {
+        // The other half, and why the test is `seen == nlink` rather than `nlink > 1`. Both
+        // names go when the claim goes, so the blocks really do come back — counted once,
+        // which is the part the old `HashSet` already had right.
+        let tmp = TempDir::new().unwrap();
+        write(&tmp, "claim/artifact.bin", 512 * 1024);
+        fs::hard_link(
+            tmp.path().join("claim/artifact.bin"),
+            tmp.path().join("claim/second.name"),
+        )
+        .unwrap();
+
+        let claim = tmp.path().join("claim");
+        let metadata = claim.symlink_metadata().unwrap();
+        let measured = Measurer::new(SizeMode::Breakdown).measure(&claim, &metadata);
+
+        assert!(measured.size.bytes().unwrap() >= 512 * 1024, "{measured:?}");
+        assert_eq!(measured.shared, 0, "nothing outside holds any of it");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_claim_cloned_out_of_a_store_is_worth_nothing_either() {
+        // The same shape as the hard-link case above, in the form pnpm actually takes on
+        // APFS: `st_nlink` is 1 on both sides and every block is still shared. Nothing about
+        // the names says so, which is why this needs `crate::sharing` and not just a link
+        // count.
+        let tmp = TempDir::new().unwrap();
+        write(&tmp, "store/blob.bin", 512 * 1024);
+        fs::create_dir(tmp.path().join("claim")).unwrap();
+        let cloned = std::process::Command::new("cp")
+            .arg(if cfg!(target_os = "macos") {
+                "-c"
+            } else {
+                "--reflink=always"
+            })
+            .arg(tmp.path().join("store/blob.bin"))
+            .arg(tmp.path().join("claim/blob.bin"))
+            .status()
+            .is_ok_and(|status| status.success());
+        if !cloned {
+            return; // a filesystem that cannot share extents has nothing to prove here
+        }
+
+        let claim = tmp.path().join("claim");
+        let metadata = claim.symlink_metadata().unwrap();
+        let measured = Measurer::new(SizeMode::Breakdown).measure(&claim, &metadata);
+        if measured.shared == 0 {
+            return; // cloned, but on a platform this crate cannot ask — the fallback, correctly
+        }
+
+        let bytes = measured.size.bytes().unwrap();
+        assert!(
+            bytes < 512 * 1024,
+            "priced at {bytes}, the store's blocks and all"
+        );
+        assert!(measured.shared >= 512 * 1024, "{measured:?}");
+        assert_eq!(
+            tmp.path()
+                .join("claim/blob.bin")
+                .symlink_metadata()
+                .unwrap()
+                .nlink(),
+            1,
+            "one name, and every block of it shared — what a link count cannot see"
+        );
     }
 
     #[cfg(unix)]

@@ -172,6 +172,15 @@ pub struct Hit {
     /// could not have been claimed without a full pass over it, so there was nothing left to
     /// save, and a *file* is one `lstat` the walk had already done.
     pub size: Size,
+    /// Blocks under the claim that a deletion would *not* return, because something outside
+    /// it holds another reference: a hard link with a name elsewhere, or an extent cloned out
+    /// of a content-addressed store. Zero on an ordinary tree, and most of a pnpm
+    /// `node_modules`.
+    ///
+    /// Carried beside the size rather than folded into it, because the two answer different
+    /// questions and a row that showed only the first would read as a bug. A `node_modules`
+    /// worth 320 MiB that `du` calls 22 GiB needs to say where the difference went.
+    pub shared: u64,
     /// The directory's own mtime. The best single proxy for "do I still need this".
     pub modified: Option<SystemTime>,
 }
@@ -280,6 +289,8 @@ pub struct Priced {
     pub path: PathBuf,
     /// What the traversal found.
     pub size: Size,
+    /// What it found that will not come back. See [`Hit::shared`].
+    pub shared: u64,
 }
 
 /// One claim waiting for the pricing pool.
@@ -683,7 +694,10 @@ impl Walker {
             // double-counted rather than absorbed — so `price` refuses it and it is reported,
             // on the same rule as a claim from outside the root.
             Found::Priced(priced) => {
-                if lock(&tree).price(&priced.path, priced.size).is_none() {
+                if lock(&tree)
+                    .price(&priced.path, priced.size, priced.shared)
+                    .is_none()
+                {
                     lock(&stray).push(WalkError {
                         path: Some(priced.path),
                         message: "priced directory is not an unpriced claim in this tree"
@@ -778,22 +792,22 @@ where
         let queued = matches!(claim, Claim::Rule(_) | Claim::WorkTree)
             && self.measurer.traverses(entry.path(), &metadata);
 
-        let size = match &claim {
+        let (size, shared) = match &claim {
             // Nothing is measured here when the pool is taking it: the claim goes out
             // unpriced and the number follows. What is left for this branch is the claim
             // whose size is free — a symlink, one `lstat` the walk already did — and the
             // claim no mode asked to price, which stays `Unmeasured`.
-            Claim::Rule(_) | Claim::WorkTree if queued => Size::Unmeasured,
+            Claim::Rule(_) | Claim::WorkTree if queued => (Size::Unmeasured, 0),
             Claim::Rule(_) | Claim::WorkTree => {
                 let measured = self.measurer.measure(entry.path(), &metadata);
                 self.report_blind_spots(
                     measured.unreadable,
                     "unreadable, so this size is a lower bound",
                 );
-                measured.size
+                (measured.size, measured.shared)
             }
             Claim::Ignored(_) => match self.survey(entry.path(), &metadata) {
-                Some(size) => size,
+                Some(surveyed) => surveyed,
                 // Refused, and always by descending rather than pruning: a rule may still match
                 // deeper, and an ignored directory holding a tracked file can still have
                 // reclaimable subdirectories under it that do not.
@@ -805,7 +819,10 @@ where
             // to grow a branch for one. The floor is deliberately not applied: it exists to
             // keep a small ignored *directory* off a list sorted by size, which is not why a
             // 40-byte `.env` is on it.
-            Claim::IgnoredFile(_) => self.measurer.measure(entry.path(), &metadata).size,
+            Claim::IgnoredFile(_) => {
+                let measured = self.measurer.measure(entry.path(), &metadata);
+                (measured.size, measured.shared)
+            }
         };
 
         self.hits.fetch_add(1, Ordering::Relaxed);
@@ -843,6 +860,7 @@ where
             path,
             claim,
             size,
+            shared,
             modified: metadata.modified().ok(),
         }));
 
@@ -921,7 +939,7 @@ where
     /// neither the size floor nor "holds no checkout" can be inferred, and the second is a
     /// negative, which is only proved by covering everything. By the time the tier can say
     /// "claim", it has already paid for the number.
-    fn survey(&self, path: &Path, metadata: &std::fs::Metadata) -> Option<Size> {
+    fn survey(&self, path: &Path, metadata: &std::fs::Metadata) -> Option<(Size, u64)> {
         let surveyed = self.measurer.survey(path, metadata);
         let blind_spots = !surveyed.unreadable.is_empty() || !surveyed.not_crossed.is_empty();
         self.report_blind_spots(
@@ -949,7 +967,7 @@ where
             .size
             .bytes()
             .is_some_and(|bytes| bytes >= self.min_size)
-            .then_some(surveyed.size)
+            .then_some((surveyed.size, surveyed.shared))
     }
 
     /// One pricing thread: takes claims off the queue and measures them until the walk is
@@ -983,6 +1001,7 @@ where
             (self.on_found)(Found::Priced(Priced {
                 path: job.path,
                 size: measured.size,
+                shared: measured.shared,
             }));
         }
     }

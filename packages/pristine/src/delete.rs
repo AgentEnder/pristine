@@ -65,7 +65,6 @@
 //! know when its `rmdir` is safe. Removing a single target is therefore single-threaded, as
 //! `rm -rf` is.
 
-use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
@@ -82,7 +81,8 @@ use cap_primitives::fs::{
 };
 
 use crate::git;
-use crate::size::{Size, Stat, allocated, device, identity, multiply_linked};
+use crate::sharing;
+use crate::size::{Size, Stat, allocated, device, identity, links};
 use crate::walk::Hit;
 
 /// How far the pool is oversubscribed past the machine's parallelism, because the work is
@@ -521,7 +521,8 @@ pub enum Step {
 pub struct Freeing {
     /// The target.
     pub path: PathBuf,
-    /// Allocated bytes given back **so far**, counting a hard-linked file once — the same
+    /// Allocated bytes given back **so far**, counting only what each `unlink` really
+    /// returned — the same
     /// accounting [`Removed::bytes`] uses, because they are the same running total read at
     /// different moments.
     ///
@@ -688,7 +689,9 @@ impl Deleter {
 pub struct Removed {
     /// The target.
     pub path: PathBuf,
-    /// Allocated bytes given back, counting a hard-linked file once.
+    /// Allocated bytes given back: what the volume actually got, not what the entries were
+    /// billed for. A file whose blocks are held by a hard link elsewhere, or by an extent it
+    /// was cloned out of, contributes nothing here however large it looked.
     pub bytes: u64,
     /// Files, directories and links unlinked.
     pub entries: u64,
@@ -754,10 +757,6 @@ struct Sweep<'a> {
     bytes: u64,
     entries: u64,
     complete: bool,
-    /// The `(device, inode)` of every multiply-linked file already counted, so a hard-linked
-    /// artefact is worth its blocks once — the same accounting [`crate::size`] uses, so a
-    /// plan's estimate and the bytes actually freed are measured the same way.
-    linked: HashSet<(u64, u64)>,
     kept: Vec<Refused>,
     failures: Vec<Failure>,
     /// Where progress goes while this sweep runs, and the totals already sent, so a report is
@@ -784,7 +783,6 @@ impl<'a> Sweep<'a> {
             bytes: 0,
             entries: 0,
             complete: false,
-            linked: HashSet::new(),
             kept: Vec::new(),
             failures: Vec::new(),
             watching,
@@ -978,7 +976,9 @@ impl<'a> Sweep<'a> {
         // walked and not whatever the name resolves to now.
         match remove_dir(parent, Path::new(name)) {
             Ok(()) => {
-                self.count(metadata);
+                // A directory is its own entry table: nothing else references it, so removing
+                // it returns every block it is billed for.
+                self.count(allocated(metadata));
                 true
             }
             Err(err) => {
@@ -997,9 +997,11 @@ impl<'a> Sweep<'a> {
         path: &Path,
         metadata: &Metadata,
     ) -> bool {
+        // Asked *before* the `unlink`, because afterwards there is nothing left to ask about.
+        let freed = Self::freed_by_unlinking(parent, name, metadata);
         match remove_file(parent, Path::new(name)) {
             Ok(()) => {
-                self.count(metadata);
+                self.count(freed);
                 true
             }
             Err(err) => {
@@ -1009,15 +1011,32 @@ impl<'a> Sweep<'a> {
         }
     }
 
-    fn count(&mut self, metadata: &Metadata) {
-        self.entries += 1;
-        if let Some(identity) = multiply_linked(metadata) {
-            if !self.linked.insert(identity) {
-                self.tell();
-                return;
-            }
+    /// What this entry's removal actually returns to the volume.
+    ///
+    /// The deleter can answer this exactly, where the measurer can only reason about it — and
+    /// the reason is that it is standing at the moment of the `unlink` with a fresh `fstatat`
+    /// in hand. Blocks held by a hard link come back when the **last** name goes and not
+    /// before, and `st_nlink` read here says whether this is that name. It needs no
+    /// bookkeeping at all to get right: two names inside one target are seen as 2 then 1, so
+    /// the blocks are counted once; two names with one outside are seen as 2 and 2, so they
+    /// are counted never, which is what the volume will agree with.
+    ///
+    /// That replaced a set of already-counted inodes, which could only ever have implemented
+    /// the first of those.
+    fn freed_by_unlinking(parent: &fs::File, name: &OsStr, metadata: &Metadata) -> u64 {
+        let allocated = allocated(metadata);
+        if links(metadata) > 1 {
+            return 0;
         }
-        self.bytes += allocated(metadata);
+        // Its last name, so what comes back is what it owns — which is not all of it if its
+        // extents were cloned out of a store. `getattrlistat` against the descriptor already
+        // open, never a re-resolved path.
+        sharing::at(parent, name, allocated).private
+    }
+
+    fn count(&mut self, bytes: u64) {
+        self.entries += 1;
+        self.bytes += bytes;
         self.tell();
     }
 

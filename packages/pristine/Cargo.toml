@@ -35,6 +35,11 @@ toml = '1.1.4'
 unicode-normalization = '0.1.25'
 cap-primitives = '4.0.2'
 
+# Only for the raw `getattrlist`/`ioctl` declarations `src/sharing/` needs. Nothing else in
+# the crate touches it.
+[target.'cfg(unix)'.dependencies]
+libc = '0.2.180'
+
 [dev-dependencies]
 tempfile = '3.27.0'
 filetime = '0.2.28'

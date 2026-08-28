@@ -527,15 +527,16 @@ fn run(cli: &Sweep, out: &mut impl Write) -> Result<bool, Box<dyn std::error::Er
             // fact about anything.
             Found::Pricing(_) => {}
             Found::Priced(priced) => {
-                lock(&sizes).insert(priced.path, priced.size);
+                lock(&sizes).insert(priced.path, (priced.size, priced.shared));
             }
         });
 
     let mut hits = hits.into_inner().unwrap_or_else(PoisonError::into_inner);
     let sizes = sizes.into_inner().unwrap_or_else(PoisonError::into_inner);
     for hit in &mut hits {
-        if let Some(size) = sizes.get(&hit.path) {
-            hit.size = *size;
+        if let Some(&(size, shared)) = sizes.get(&hit.path) {
+            hit.size = size;
+            hit.shared = shared;
         }
     }
     // Biggest first, and the unpriced after the priced rather than ahead of them: a tier-one
@@ -929,19 +930,53 @@ fn row(hit: &Hit, root: &Path) -> String {
     let path = hit.path.strip_prefix(root).unwrap_or(&hit.path);
     // The asymmetry is the point: a tier-two row says only that git hides the directory, which
     // is the honest thing it knows and tells you the deletion is not a cheap one.
-    format!(
+    let row = format!(
         "{:>10}  {:<60}  {}",
         hit.size.label(),
         path.display(),
         hit.label()
-    )
+    );
+    match remainder(hit) {
+        Some(remainder) => format!("{row}\n{remainder}"),
+        None => row,
+    }
+}
+
+/// The line under a row whose bytes are mostly somebody else's.
+///
+/// Without it the number above is unreadable. A `node_modules` that `du` calls 22 GiB and
+/// pristine calls 320 MiB looks like a scan that failed, and the user's next move is to
+/// distrust the tool rather than the directory — when in fact the tool is right and the 21.8
+/// GiB is sitting in a package store, waiting for that store to be pruned.
+///
+/// Said only when there is something to say. On an ordinary build directory nothing is shared
+/// and a second line per row would be noise.
+fn remainder(hit: &Hit) -> Option<String> {
+    (hit.shared > 0).then(|| {
+        // "shared with something else" and not "with a store outside the scan", though a
+        // store is what it nearly always is. What was measured is that another reference
+        // exists — `st_nlink` above the names found here, or extents the filesystem reports
+        // as another file's too. *Where* that reference lives is a different question and one
+        // nothing here has asked, so the line does not answer it.
+        format!(
+            "{:>10}  plus {} shared with something else, which would not come back",
+            "",
+            human(hit.shared)
+        )
+    })
 }
 
 /// What the scan found, across both tiers.
 fn summary(hits: &[Hit]) -> String {
     let priced: u64 = hits.iter().filter_map(|hit| hit.size.bytes()).sum();
+    let shared: u64 = hits.iter().map(|hit| hit.shared).sum();
+    let held = if shared == 0 {
+        String::new()
+    } else {
+        format!(", {} shared and not reclaimable", human(shared))
+    };
     format!(
-        "\n{} reclaimable, {} priced, {} not priced",
+        "\n{} reclaimable, {} priced{held}, {} not priced",
         plural(hits.len(), noun(hits)),
         human(priced),
         unpriced(hits),

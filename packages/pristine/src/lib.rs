@@ -66,6 +66,7 @@ mod fixture;
 pub mod git;
 pub mod repo;
 pub mod rules;
+mod sharing;
 pub mod size;
 pub mod tree;
 pub mod tui;

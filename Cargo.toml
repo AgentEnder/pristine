@@ -16,7 +16,14 @@ authors = ["Craigory Coppola <craigorycoppola@gmail.com>"]
 # `[lints] workspace = true`. CI runs clippy with `-D warnings`, so every level below
 # is effectively deny in CI and warn while you work.
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# `deny` rather than `forbid`, and the difference is load-bearing for exactly one module.
+# Asking a filesystem how much of a file it would actually give back is a question safe Rust
+# cannot put: APFS answers it through `getattrlist(2)` and btrfs/XFS through the `FIEMAP`
+# ioctl, and `std`'s `MetadataExt` exposes neither. `forbid` cannot be lifted locally — that
+# is what distinguishes it — so the whole crate would have had to choose between the lint and
+# a correct reclaimable number. `src/sharing/` is the one place that opts out, in about forty
+# lines under a documented `#[allow]`; everywhere else this is still deny.
+unsafe_code = "deny"
 missing_docs = "warn"
 unreachable_pub = "warn"
 

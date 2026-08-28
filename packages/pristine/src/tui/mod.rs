@@ -779,7 +779,9 @@ fn drain(view: &mut View, inbox: &Receiver<Message>, outcome: &mut Outcome) {
         match inbox.try_recv() {
             Ok(Message::Found(Found::Claim(hit))) => view.found(hit),
             Ok(Message::Found(Found::Pricing(path))) => view.pricing(&path),
-            Ok(Message::Found(Found::Priced(priced))) => view.priced(&priced.path, priced.size),
+            Ok(Message::Found(Found::Priced(priced))) => {
+                view.priced(&priced.path, priced.size, priced.shared);
+            }
             Ok(Message::Scanned(walk)) => {
                 outcome.errors.extend(walk.errors);
                 view.scanned();
@@ -930,6 +932,7 @@ fn spawn_pricer(options: &Options, post: Sender<Message>) -> Sender<Vec<PathBuf>
                 let _ = post.send(Message::Found(Found::Priced(Priced {
                     path: path.clone(),
                     size: sized.size,
+                    shared: sized.shared,
                 })));
             }
             // The claims go back with the report, because the view is holding them as "being

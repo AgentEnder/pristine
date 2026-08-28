@@ -188,6 +188,42 @@ tree of dashes answers no question at all.
 A scan that could not read everything it was pointed at says `scan incomplete` and exits
 non-zero, so a listing that is a lower bound never looks — to a script — like the whole truth.
 
+## What a size means
+
+A claim's number is the bytes deleting it returns. That is not the bytes it contains. On a machine
+with a package store the gap is most of the directory.
+
+Two things make a file cost less to delete than it looks. A hard link with another name outside
+the claim keeps every block when the claim goes: the `unlink` drops the link count and frees
+nothing. An extent cloned out of a store is billed to every file that references it and released
+by none of them alone. pnpm clones on APFS, and `cp --reflink` does the same on btrfs and XFS.
+
+Both halves are reported.
+
+```console
+$ pristine ~/repos/pristine --breakdown --no-tui
+   3.5 GiB  target                     Rust Build Artifacts
+            plus 167.8 MiB shared with something else, which would not come back
+  46.8 MiB  node_modules               Node Dependencies
+            plus 115.2 MiB shared with something else, which would not come back
+```
+
+`du` calls that `node_modules` 162 MiB and is right. 46.8 MiB is what deleting it gives back. The
+other 115.2 MiB is in the pnpm store, where `pnpm store prune` releases it.
+
+The two forms are measured separately because they are separate. Hard links come from `st_nlink`:
+an inode whose every name is inside the claim is worth its blocks, one with a name outside is
+worth nothing. Shared extents come from `ATTR_CMNEXT_PRIVATESIZE` on macOS and `FIEMAP` on btrfs,
+XFS and bcachefs. A file with two names and no clone reports its full size as private, so neither
+measurement substitutes for the other.
+
+Where the filesystem cannot answer, a file counts as owning all of its blocks. That is what
+pristine reported before it asked at all. A failed lookup must not make a claim look smaller than
+it is.
+
+The deleter uses the same rule, so the receipt matches the estimate. It has an easier job: at the
+moment of the `unlink` it can read the link count and know whether this name is the last one.
+
 ## How it finds things
 
 Two tiers.

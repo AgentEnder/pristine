@@ -42,6 +42,14 @@ pub struct Node {
     pub parent: Option<NodeId>,
     /// Measured reclaimable bytes in this subtree, this node included.
     pub reclaimable: u64,
+    /// Measured bytes in this subtree that a deletion would leave behind, because something
+    /// outside holds another reference to them. Rolled up exactly as `reclaimable` is, and for
+    /// the same reason: "what does emptying this subtree get me" is asked of a directory.
+    ///
+    /// A subtree with a large `shared` and a small `reclaimable` is the shape of a package
+    /// store's clients. Worth saying on the row, because otherwise it reads as a scan that
+    /// simply failed to find anything.
+    pub shared: u64,
     /// How many claims in this subtree were recorded but not measured, because the scan
     /// pruned at them. A node with `reclaimable == 0` and `unmeasured > 0` is not empty; it
     /// is unpriced, and a breakdown is what puts a number on it.
@@ -175,6 +183,7 @@ impl Tree {
             path: root.clone(),
             parent: None,
             reclaimable: 0,
+            shared: 0,
             unmeasured: 0,
             claims: 0,
             modified: None,
@@ -200,6 +209,7 @@ impl Tree {
         let relative = hit.path.strip_prefix(&self.root).ok()?;
         let bytes = hit.size.bytes().unwrap_or(0);
         let unmeasured = usize::from(hit.size.bytes().is_none());
+        let shared = hit.shared;
         let modified = hit.modified;
 
         let mut parent = self.root();
@@ -208,7 +218,7 @@ impl Tree {
         // nothing: a caller watching the stamp would otherwise rebuild a picture of a tree
         // that had not changed.
         self.changes += 1;
-        self.credit(parent, bytes, unmeasured, modified);
+        self.credit(parent, bytes, shared, unmeasured, modified);
 
         for component in relative.components() {
             let name = component.as_os_str().to_os_string();
@@ -222,6 +232,7 @@ impl Tree {
                     path: path.clone(),
                     parent: Some(parent),
                     reclaimable: 0,
+                    shared: 0,
                     unmeasured: 0,
                     claims: 0,
                     modified: None,
@@ -235,7 +246,7 @@ impl Tree {
                 self.live += 1;
                 id
             };
-            self.credit(id, bytes, unmeasured, modified);
+            self.credit(id, bytes, shared, unmeasured, modified);
             parent = id;
         }
 
@@ -244,10 +255,18 @@ impl Tree {
     }
 
     /// Adds one claim's worth of everything to a node on its ancestor chain.
-    fn credit(&mut self, id: NodeId, bytes: u64, unmeasured: usize, modified: Option<SystemTime>) {
+    fn credit(
+        &mut self,
+        id: NodeId,
+        bytes: u64,
+        shared: u64,
+        unmeasured: usize,
+        modified: Option<SystemTime>,
+    ) {
         let stamp = self.changes;
         let node = &mut self.nodes[id];
         node.reclaimable += bytes;
+        node.shared += shared;
         node.unmeasured += unmeasured;
         node.claims += 1;
         node.modified = node.modified.max(modified);
@@ -265,7 +284,7 @@ impl Tree {
     /// carries a size. Both would be a caller error rather than a fact about the filesystem,
     /// and pricing one claim twice would count its bytes twice — so it is refused rather than
     /// absorbed, exactly as an out-of-root insert is.
-    pub fn price(&mut self, path: &Path, size: Size) -> Option<NodeId> {
+    pub fn price(&mut self, path: &Path, size: Size, shared: u64) -> Option<NodeId> {
         let bytes = size.bytes()?;
         // Resolved in full before anything is written, so a path that turns out not to be a
         // claim cannot leave half the chain updated.
@@ -276,12 +295,14 @@ impl Tree {
             return None;
         }
         hit.size = size;
+        hit.shared = shared;
 
         self.changes += 1;
         let stamp = self.changes;
         for id in chain {
             self.nodes[id].stamp = stamp;
             self.nodes[id].reclaimable += bytes;
+            self.nodes[id].shared += shared;
             // Saturating because the alternative is a silent wrap to `usize::MAX` in release,
             // which would render as an enormous unpriced count. The guard above makes it
             // unreachable: the insert set exactly one on each of these nodes.
@@ -599,6 +620,7 @@ mod tests {
     /// A priced claim with no mtime — most of these tests are about the arithmetic.
     fn hit(path: &str, size: u64) -> Hit {
         Hit {
+            shared: 0,
             modified: None,
             ..fixture::priced(path, size)
         }
@@ -844,7 +866,7 @@ mod tests {
         tree.insert(unpriced);
 
         tree.remove(Path::new("/scan/a/node_modules"));
-        tree.price(Path::new("/scan/b/node_modules"), Size::Measured(70));
+        tree.price(Path::new("/scan/b/node_modules"), Size::Measured(70), 0);
 
         assert_eq!(tree.reclaimable(), 70);
         assert_eq!(tree.unmeasured(), 0);
@@ -866,7 +888,7 @@ mod tests {
         for change in ["price", "shrink", "arrive", "remove"] {
             let root = tree.stamp(tree.root());
             match change {
-                "price" => tree.price(Path::new("/scan/here/node_modules"), Size::Measured(50)),
+                "price" => tree.price(Path::new("/scan/here/node_modules"), Size::Measured(50), 0),
                 "shrink" => tree.shrink(Path::new("/scan/here/node_modules"), 10),
                 // The one that happens 16,013 times over a real scan.
                 "arrive" => tree.insert(hit("/scan/here/again/target", 1)),
@@ -896,7 +918,7 @@ mod tests {
         // whether to spend a megabyte redrawing must not be told otherwise.
         assert!(tree.insert(hit("/elsewhere/node_modules", 1)).is_none());
         assert!(
-            tree.price(Path::new("/scan/nowhere"), Size::Measured(1))
+            tree.price(Path::new("/scan/nowhere"), Size::Measured(1), 0)
                 .is_none()
         );
         assert!(tree.remove(Path::new("/scan/a")).is_none());

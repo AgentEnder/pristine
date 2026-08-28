@@ -1284,3 +1284,87 @@ fn summarise(removed: &Removed) -> (PathBuf, u64, u64, bool) {
         removed.complete,
     )
 }
+
+/// What a removal reports having freed, against what the volume actually got back.
+///
+/// These are the receipt half of the sizing correction. The estimate and the receipt are two
+/// numbers a user compares directly — "it said 21.8 GiB and then it said it freed 21.8 GiB" —
+/// so measuring them differently would be worse than measuring either one wrong.
+#[test]
+fn a_hard_link_whose_other_name_is_outside_the_target_frees_nothing() {
+    let (_tmp, base) = fixture();
+    let store = base.join("store/blob.bin");
+    write(&store, 512 * 1024);
+    let claim = base.join("repo/node_modules");
+    mkdir(&claim);
+    fs::hard_link(&store, claim.join("blob.bin")).unwrap();
+
+    let plan = plan_for(&base, std::slice::from_ref(&claim));
+    let removal = Deleter::new().remove(&plan);
+
+    let removed = &removal.removed[0];
+    assert!(removed.complete);
+    assert_eq!(
+        removed.bytes, 0,
+        "the store still holds every block, so nothing was given back"
+    );
+    assert_eq!(removed.entries, 2, "a directory and a link still went");
+    assert!(store.exists(), "and the blocks are still where they were");
+}
+
+#[test]
+fn a_hard_link_whose_every_name_is_inside_the_target_frees_its_blocks_once() {
+    let (_tmp, base) = fixture();
+    let claim = base.join("repo/node_modules");
+    let first = claim.join("artifact.bin");
+    write(&first, 512 * 1024);
+    fs::hard_link(&first, claim.join("second.name")).unwrap();
+
+    let plan = plan_for(&base, std::slice::from_ref(&claim));
+    let removal = Deleter::new().remove(&plan);
+
+    // Counted when the *last* name goes and not before, which needs no bookkeeping: the
+    // first unlink sees `st_nlink == 2` and is worth nothing, the second sees 1 and is worth
+    // the blocks. Whichever order the two names come in.
+    let removed = &removal.removed[0];
+    assert!(removed.bytes >= 512 * 1024, "{removed:?}");
+    assert!(
+        removed.bytes < 1024 * 1024,
+        "counted once per link: {removed:?}"
+    );
+}
+
+#[test]
+fn a_clone_of_a_file_outside_the_target_frees_nothing_either() {
+    let (_tmp, base) = fixture();
+    let store = base.join("store/blob.bin");
+    write(&store, 512 * 1024);
+    let claim = base.join("repo/node_modules");
+    mkdir(&claim);
+    let cloned = std::process::Command::new("cp")
+        .arg(if cfg!(target_os = "macos") {
+            "-c"
+        } else {
+            "--reflink=always"
+        })
+        .arg(&store)
+        .arg(claim.join("blob.bin"))
+        .status()
+        .is_ok_and(|status| status.success());
+    if !cloned {
+        return; // a filesystem that cannot share extents has nothing to prove here
+    }
+
+    let plan = plan_for(&base, std::slice::from_ref(&claim));
+    let removal = Deleter::new().remove(&plan);
+
+    let removed = &removal.removed[0];
+    if removed.bytes >= 512 * 1024 {
+        return; // cloned, but on a platform this crate cannot ask — the fallback, correctly
+    }
+    assert!(
+        removed.bytes < 512 * 1024,
+        "the store holds the extents, so they did not come back: {removed:?}"
+    );
+    assert!(store.exists());
+}
